@@ -2,7 +2,7 @@
 import argparse
 import shutil
 from functools import cached_property
-from io import BytesIO
+from io import BytesIO, StringIO
 import pickle
 from pprint import pprint
 import time
@@ -18,6 +18,13 @@ from hashlib import md5
 from typing import Union
 
 logger = get_logger('runrun')
+
+
+def pprint_str(*args, **kwargs):
+    sio = StringIO()
+    pprint(*args,  stream=sio, **kwargs)
+    sio.seek(0)
+    return sio.read()
 
 
 @dataclass
@@ -294,14 +301,16 @@ def schedule_task(tasks: Dict[str, TaskSpec]) -> List[List[TaskSpec]]:
 def run_task(tasks: Dict[str, TaskSpec], target=None):
     tg = schedule_task(tasks)
     for task_group in tg:
-        logger.debug(task_group)
+        logger.debug('\n' + pprint_str(task_group))
     for task_group in tg:
+        task_group.sort()
         tg_names = [t.task_name for t in task_group]
         try:
             idx = tg_names.index(target)
             task_group = [task_group[idx]]
         except ValueError as e:
             pass
+        processes = []
         for task in task_group:
             env = dict(os.environ)
             env['PYTHONPATH'] = os.path.abspath(task.task_root)
@@ -317,6 +326,8 @@ def run_task(tasks: Dict[str, TaskSpec], target=None):
                 env=env,
                 cwd=os.path.split(os.path.abspath(task.task_root))[0]
             )
+            processes.append(process)
+        for process in processes:
             ret_status = process.wait()
             if ret_status != 0:
                 logger.error(f"ERROR exit {ret_status}")
