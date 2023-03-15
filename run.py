@@ -311,27 +311,34 @@ def run_task(tasks: Dict[str, TaskSpec], target=None):
         except ValueError as e:
             pass
         processes = []
-        for task in task_group:
-            env = dict(os.environ)
-            env['PYTHONPATH'] = os.path.abspath(task.task_root)
-            process = subprocess.Popen(
-                [
-                    'python',
-                    os.path.split(__file__)[0] + '/worker.py',
-                    task.task_root,
-                    task.code_file,
-                ],
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-                env=env,
-                cwd=os.path.split(os.path.abspath(task.task_root))[0]
-            )
-            processes.append(process)
-        for process in processes:
-            ret_status = process.wait()
-            if ret_status != 0:
-                logger.error(f"ERROR exit {ret_status}")
-                return
+        try:
+            for task in task_group:
+                env = dict(os.environ)
+                env['PYTHONPATH'] = os.path.abspath(task.task_root)
+                process = subprocess.Popen(
+                    [
+                        'python',
+                        os.path.split(__file__)[0] + '/worker.py',
+                        task.task_root,
+                        task.code_file,
+                    ],
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                    env=env,
+                    cwd=os.path.split(os.path.abspath(task.task_root))[0]
+                )
+                processes.append((process, task))
+            for process, task in processes:
+                ret_status = process.wait()
+                if ret_status != 0:
+                    logger.error(f"ERROR exit {ret_status} {task}")
+                    raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            logger.error('terminating processes')
+            for p, _ in processes:
+                p.terminate()
+                p.wait()
+            break
 
 
 def extract_anno(root, file) -> TaskSpec:
