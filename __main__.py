@@ -1,5 +1,6 @@
 from .run import *
 
+
 def _parser():
     parser = argparse.ArgumentParser('RUNRUN')
     _subparser = parser.add_subparsers(
@@ -22,20 +23,24 @@ if __name__ == '__main__':
                 default = par.default if par.default is not inspect.Parameter.empty else None
                 # logger.info(
                 #     f'{func_name} {k_name}, {default} req: {required} {par.annotation}')
-                if required:
-                    parser.add_argument(k_name, default=default,
-                                        type=par.annotation)
-                else:
+                argument_kwargs = {}
+                argument_kwargs['type'] = par.annotation
+                argument_kwargs['default'] = default
+                if par.annotation is bool:
+                    argument_kwargs['action'] = 'store_true'
+                    del argument_kwargs['type']
+                if not required:
+                    argument_kwargs['required'] = False
                     k_name = '-' + k_name
-                    parser.add_argument(k_name, default=default, required=required,
-                                        type=par.annotation)
+                parser.add_argument(k_name,
+                                    **argument_kwargs)
             parser.set_defaults(__func=func)
 
         return wrap
 
     @_command()
-    def run(target: str, task: str = None):
-        run_target(target, task)
+    def run(target: str, task: str = None, debug: bool = False):
+        run_target(target, task, debug=debug)
 
     @_command()
     def clean(target: str):

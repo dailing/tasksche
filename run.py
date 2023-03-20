@@ -127,11 +127,11 @@ class TaskSpec:
 
     @property
     def result_file(self) -> str:
-        return os.path.join(self.task_dir, 'result.pkl')
+        return os.path.join('_output', self.task_dir, 'result.pkl')
 
     @property
     def result_info(self) -> str:
-        return os.path.join(self.task_dir, 'result_info.pkl')
+        return os.path.join('_output', self.task_dir, 'result_info.pkl')
 
     @property
     def dirty(self) -> bool:
@@ -188,7 +188,8 @@ class TaskSpec:
             if not (isinstance(v, str) and v.startswith('$')):
                 kwargs[k] = v
                 continue
-            result_file = os.path.join(self.task_root, v[2:], 'result.pkl')
+            result_file = os.path.join(
+                '_output', self.task_root, v[2:], 'result.pkl')
             result = pickle.load(open(result_file, 'rb'))
             kwargs[k] = result
         # logger.info(kwargs)
@@ -298,7 +299,7 @@ def schedule_task(tasks: Dict[str, TaskSpec]) -> List[List[TaskSpec]]:
     return schedule
 
 
-def run_task(tasks: Dict[str, TaskSpec], target=None):
+def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
     tg = schedule_task(tasks)
     for task_group in tg:
         logger.debug('\n' + pprint_str(task_group))
@@ -315,6 +316,8 @@ def run_task(tasks: Dict[str, TaskSpec], target=None):
             for task in task_group:
                 env = dict(os.environ)
                 env['PYTHONPATH'] = os.path.abspath(task.task_root)
+                if debug:
+                    env['DEBUG'] = 'true'
                 process = subprocess.Popen(
                     [
                         'python',
@@ -328,6 +331,8 @@ def run_task(tasks: Dict[str, TaskSpec], target=None):
                     cwd=os.path.split(os.path.abspath(task.task_root))[0]
                 )
                 processes.append((process, task))
+                if debug:
+                    process.wait()
             for process, task in processes:
                 ret_status = process.wait()
                 if ret_status != 0:
@@ -355,7 +360,11 @@ def extract_anno(root, file) -> TaskSpec:
     task_name = task_name[len(root):]
     if not task_name.startswith('/'):
         task_name = '/' + task_name
-    task_info = yaml.safe_load(BytesIO(payload))
+    try:
+        task_info = yaml.safe_load(BytesIO(payload))
+    except yaml.scanner.ScannerError as e:
+        print(f"ERROR parse {root} {file}")
+        raise e
     task_info['task_root'] = root
     task_info['task_name'] = task_name
     tki = TaskSpec(**task_info)
@@ -395,11 +404,13 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
     return tasks
 
 
-def run_target(target: str, task=None):
+def run_target(target: str, task=None, debug=False):
     logger.info(f'executing on: {target} ...')
+    if debug:
+        logger.info('IN DEBUG MODE')
     tasks = parse_target(target)
     # logger.debug(tasks)
-    run_task(tasks, task)
+    run_task(tasks, task, debug=debug)
 
 
 def clean_target(target: str):
@@ -433,49 +444,3 @@ def run():
 
 '''
             )
-
-
-if __name__ == '__main__':
-    _parsers = _parser()
-
-    def _command(*args, **kwargs):
-        _subparser = _parsers['_subparser']
-
-        def wrap(func):
-            func_name = func.__name__
-            parser: argparse.ArgumentParser = _subparser.add_parser(
-                func_name, *args, **kwargs)
-            for k_name, par in inspect.signature(func).parameters.items():
-                required = par.default is inspect.Parameter.empty
-                default = par.default if par.default is not inspect.Parameter.empty else None
-                logger.info(
-                    f'{func_name} {k_name}, {default} req: {required} {par.annotation}')
-                if required:
-                    parser.add_argument(k_name, default=default,
-                                        type=par.annotation)
-                else:
-                    k_name = '-' + k_name
-                    parser.add_argument(k_name, default=default, required=required,
-                                        type=par.annotation)
-            parser.set_defaults(__func=func)
-
-        return wrap
-
-    @_command()
-    def run(target: str, task: str = None):
-        run_target(target, task)
-
-    @_command()
-    def clean(target: str):
-        clean_target(target)
-
-    @_command()
-    def new(target: str, task: str):
-        new_task(target, task)
-
-    args = _parsers['parser'].parse_args()
-
-    call_args = args.__dict__.copy()
-    del call_args['__func']
-
-    args.__func(**call_args)
