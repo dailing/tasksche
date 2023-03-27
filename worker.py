@@ -3,10 +3,11 @@ import sys
 import importlib
 from run import extract_anno
 import time
-from survivalreg.util.logger import get_logger
+from run import get_logger
 import os
 import contextlib
 import pdb
+import os
 
 
 logger = get_logger('Worker')
@@ -33,8 +34,8 @@ if not os.path.exists(output_dir):
 # logger.info(mod)
 if debug:
     logger.info('IN DEBUG MODE')
-with open(f'{output_dir}/std_out.txt', 'w') as fout, \
-        open(f'{output_dir}/std_err.txt', 'w') as ferr:
+with open(f'{output_dir}/std_out_{os.getpid()}.txt', 'w') as fout, \
+        open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr:
     if debug:
         fout = sys.stdout
         ferr = sys.stderr
