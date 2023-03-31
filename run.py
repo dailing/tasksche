@@ -1,11 +1,12 @@
 # %%
+from collections import defaultdict, namedtuple
 import shutil
 from functools import cached_property
 from io import BytesIO, StringIO
 import pickle
 from pprint import pprint
 import time
-from typing import Dict, List
+from typing import Any, Dict, List, Set, Tuple
 import os
 import sys
 import yaml
@@ -159,6 +160,10 @@ class TaskSpec:
 
     @property
     def dirty(self) -> bool:
+        """
+        Return true if the task has been modified since the last time it was
+        run. Note that this does not count the status of dependent tasks.
+        """
         if self.rerun:
             return True
         code_update = self.code_update_time
@@ -323,7 +328,123 @@ def schedule_task(tasks: Dict[str, TaskSpec]) -> List[List[TaskSpec]]:
     return schedule
 
 
+GraphNode = namedtuple('GraphNode', ['node', 'property'])
+
+
+class Graph():
+    """a graph class to calculate task dependent relationships"""
+
+    def __init__(self, nodes=None, edges=None):
+        self.nodes: Set[str] = set()
+        self.dag: Dict[str, List(str)] = defaultdict(list)
+        self.in_degree: Dict[str, List(str)] = defaultdict(list)
+        self.property: Dict[str:Dict[str, Any]] = defaultdict(dict)
+
+        nodes: List[str] = nodes or []
+        edges: List[Tuple[str, str]] = edges or []
+        for n in nodes:
+            self.add_node(n)
+        for a, b in edges:
+            self.add_edge(a, b)
+
+    def add_node(self, node: str, p=None):
+        p = dict()
+        self.nodes.add(node)
+        self.property[node] = p
+
+    def add_edge(self, a, b):
+        """
+        add an edge from a to b
+        """
+        assert a in self.nodes
+        assert b in self.nodes
+        self.dag[a].append(b)
+        self.in_degree[b].append(a)
+
+    def remove_edge(self, a, b):
+        """
+        remove an edge from a to b
+        """
+        assert a in self.nodes
+        assert b in self.nodes
+        self.dag[a].remove(b)
+        self.in_degree[b].remove(a)
+
+    def _agg(self, map_func, reduce_func, node, result):
+        assert node in self.nodes
+        if node in result:
+            return result[node]
+        self_map = map_func(self.property[node])
+        args = [
+            self._agg(map_func, reduce_func, x, result)
+            for x in self.in_degree[node]
+        ]
+        args.append(self_map)
+        r = reduce_func(args)
+        result[node] = r
+        return r
+
+    def aggragate(self, map_func, reduce_func, nodes=None):
+        """
+        aggregate the property of a node
+        """
+        result = {}
+        if nodes is None:
+            nodes = self.nodes
+        elif isinstance(nodes, str):
+            nodes = [nodes]
+        for node in nodes:
+            self._agg(map_func, reduce_func, node, result)
+        return result
+
+    def any(self, map_func):
+        """
+        return list of nodes if any func(n) is True for n in its child nodes
+        """
+        return self.aggragate(map_func, any)
+
+    def all(self, map_func):
+        """
+        return list of nodes if all func(n) is True for n in its child nodes
+        """
+        return self.aggragate(map_func, all)
+
+    def to_pdf(self, path, node_label=None):
+        """
+        save graph to a pdf file using graphivz
+        """
+        from graphviz import Digraph
+        if node_label is None:
+            node_label = {}
+        dot = Digraph('G', format='pdf', filename=path, graph_attr={'layout': 'dot'})
+        dot.attr(rankdir='LR')
+        for node in self.nodes:
+            dot.node(node, label=f'{node}\n' + str(node_label.get(node, '')))
+        for a, bs in self.dag.items():
+            for b in bs:
+                dot.edge(a, b)
+        dot.render()
+
+    def __item__(self, node):
+        return GraphNode(self.dag[node], self.property[node])
+
+
+class Scheduler():
+    def __init__(self, tasks: Dict[str, TaskSpec]):
+        self.g = Graph()
+        for t in tasks.values():
+            self.g.add_node(t.task_name)
+        for t in tasks.values():
+            for t2 in t.dependent_tasks:
+                self.g.add_edge(t2, t.task_name)
+
+        self.g.to_pdf('scheduler')
+
+
 def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
+    scheduler = Scheduler(tasks)
+
+    # return
     tg = schedule_task(tasks)
     for task_group in tg:
         logger.debug('\n' + pprint_str(task_group))
