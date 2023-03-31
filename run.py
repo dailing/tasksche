@@ -26,7 +26,7 @@ def get_logger(name: str, print_level=logging.DEBUG):
         fmt="%(levelname)6s [%(filename)15s:%(lineno)-3d %(asctime)s] %(message)s",
         datefmt='%H:%M:%S',
     )
-    time_now = datetime.datetime.now().strftime("%Y_%m_%d.%H_%M_%S")
+    # time_now = datetime.datetime.now().strftime("%Y_%m_%d.%H_%M_%S")
     logger = logging.getLogger(name)
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
@@ -320,11 +320,6 @@ def schedule_task(tasks: Dict[str, TaskSpec]) -> List[List[TaskSpec]]:
         if len(running_list) > 0:
             running_list.sort()
             schedule.append(running_list)
-        # logger.info(schedule)
-        # logger.info(scheduled)
-        # logger.info(dirty_set)
-        # logger.info(un_scheduled)
-        # sys.exit(0)
     return schedule
 
 
@@ -384,7 +379,7 @@ class Graph():
         result[node] = r
         return r
 
-    def aggragate(self, map_func, reduce_func, nodes=None):
+    def aggragate(self, map_func, reduce_func, nodes=None, update=None):
         """
         aggregate the property of a node
         """
@@ -395,6 +390,15 @@ class Graph():
             nodes = [nodes]
         for node in nodes:
             self._agg(map_func, reduce_func, node, result)
+        # update property
+        if isinstance(update, str):
+            for k, v in result.items():
+                self.property[k][update] = v
+        # elif isinstance(update, callable):
+        #     for k, v in result.items():
+        #         update(self.property[k], v)
+        else:
+            raise Exception()
         return result
 
     def any(self, map_func):
@@ -409,21 +413,23 @@ class Graph():
         """
         return self.aggragate(map_func, all)
 
-    def to_pdf(self, path, node_label=None):
+    def node_label(self, node: str):
+        return '\n'.join([f'{k}:{v}' for k, v in self.property[node].items()])
+
+    def to_pdf(self, path):
         """
         save graph to a pdf file using graphivz
         """
         from graphviz import Digraph
-        if node_label is None:
-            node_label = {}
-        dot = Digraph('G', format='pdf', filename=path, graph_attr={'layout': 'dot'})
+        dot = Digraph('G', format='pdf', filename=path,
+                      graph_attr={'layout': 'dot'})
         dot.attr(rankdir='LR')
         for node in self.nodes:
-            dot.node(node, label=f'{node}\n' + str(node_label.get(node, '')))
+            dot.node(node, label=f'{node}\n' + self.node_label(node))
         for a, bs in self.dag.items():
             for b in bs:
                 dot.edge(a, b)
-        dot.render()
+        dot.render(cleanup=True)
 
     def __item__(self, node):
         return GraphNode(self.dag[node], self.property[node])
@@ -434,17 +440,58 @@ class Scheduler():
         self.g = Graph()
         for t in tasks.values():
             self.g.add_node(t.task_name)
+            self.g.property[t.task_name]['dirty'] = t.dirty
         for t in tasks.values():
             for t2 in t.dependent_tasks:
                 self.g.add_edge(t2, t.task_name)
 
-        self.g.to_pdf('scheduler')
+        # update dirty map
+        self.g.aggragate(
+            lambda x: x['dirty'],
+            any,
+            update='dirty'
+        )
+        self._update_status()
+
+    def to_pdf(self, path):
+        self.g.to_pdf(path)
+
+    def _update_status(self):
+        def map_func(prop):
+            if 'status' not in prop:
+                if prop['dirty']:
+                    return 'pending'
+                else:
+                    return 'finished'
+            else:
+                return prop['status']
+        
+        def reduce_func(props: List[Dict[str, Any]]):
+            ready = True
+            if props[-1] == 'finished' or props[-1] == 'ready':
+                return props[-1]
+            
+            for s in props[:-1]:
+                if s != 'finished':
+                    ready = False
+            if ready:
+                return 'ready'
+            return 'pending'
+        
+        self.g.aggragate(
+            map_func,
+            reduce_func,
+            update='status'
+        )
 
 
 def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
     scheduler = Scheduler(tasks)
+    scheduler.to_pdf('scheduler')
 
-    # return
+    # scheduler.
+
+    return
     tg = schedule_task(tasks)
     for task_group in tg:
         logger.debug('\n' + pprint_str(task_group))
