@@ -212,7 +212,7 @@ class TaskSpec:
     @property
     def call_arguments(self):
         kwargs = {}
-        logger.info(self.require_dict)
+        # logger.debug(self.require_dict)
         for k, v in self.require_dict.items():
             if not (isinstance(v, str) and v.startswith('$')):
                 kwargs[k] = v
@@ -413,6 +413,33 @@ class Graph():
         """
         return self.aggragate(map_func, all)
 
+    @staticmethod
+    def match_query(prop: Dict[str, Any], query: Dict[str, Any]) -> bool:
+        for k, v in query.items():
+            if k not in prop:
+                return False
+            p = prop[k]
+            if isinstance(v, list):
+                if p not in v:
+                    return False
+            else:
+                if p != v:
+                    return False
+        return True
+
+    def match_one(self, query: Dict[str, Any]):
+        for task_name, prop in self.property.items():
+            if self.match_query(prop, query):
+                return task_name
+        return None
+
+    def match_all(self, query: Dict[str, Any]):
+        matched = []
+        for task_name, prop in self.property.items():
+            if self.match_query(prop, query):
+                matched.append(task_name)
+        return matched
+
     def node_label(self, node: str):
         return '\n'.join([f'{k}:{v}' for k, v in self.property[node].items()])
 
@@ -436,7 +463,7 @@ class Graph():
 
 
 class Scheduler():
-    def __init__(self, tasks: Dict[str, TaskSpec]):
+    def __init__(self, tasks: Dict[str, TaskSpec], targets=None):
         self.g = Graph()
         for t in tasks.values():
             self.g.add_node(t.task_name)
@@ -444,11 +471,14 @@ class Scheduler():
         for t in tasks.values():
             for t2 in t.dependent_tasks:
                 self.g.add_edge(t2, t.task_name)
+        self.targets = targets
+        self.tasks = tasks
 
         # update dirty map
         self.g.aggragate(
             lambda x: x['dirty'],
             any,
+            nodes=self.targets,
             update='dirty'
         )
         self._update_status()
@@ -465,33 +495,108 @@ class Scheduler():
                     return 'finished'
             else:
                 return prop['status']
-        
+
         def reduce_func(props: List[Dict[str, Any]]):
             ready = True
-            if props[-1] == 'finished' or props[-1] == 'ready':
+            if props[-1] != 'pending':
                 return props[-1]
-            
+
             for s in props[:-1]:
                 if s != 'finished':
                     ready = False
             if ready:
                 return 'ready'
             return 'pending'
-        
+
         self.g.aggragate(
             map_func,
             reduce_func,
+            nodes=self.targets,
             update='status'
         )
+        # logger.info(pprint_str(self.g.property))
+
+    def get_ready(self):
+        t = self.g.match_one(dict(status='ready'))
+        return t
+
+    def set_status(self, task, status):
+        self.g.property[task]['status'] = status
+        self._update_status()
+
+    def set_running(self, task):
+        self.set_status(task, 'running')
+
+    def set_finished(self, task):
+        self.set_status(task, 'finished')
+
+    def set_error(self, task):
+        self.set_status(task, 'error')
+
+    def run_once(self):
+        processes:Dict[str, subprocess.Popen] = {}
+        try:
+            while True:
+                finished = True
+                while True:
+                    ready_task = self.get_ready()
+                    if ready_task is None:
+                        # logger.info('no ready task aval')
+                        break
+                    logger.info('running task ' + ready_task)
+                    self.set_running(ready_task)
+                    env = dict(os.environ)
+                    task = self.tasks[ready_task]
+                    env['PYTHONPATH'] = os.path.abspath(task.task_root)
+                    process = subprocess.Popen(
+                        [
+                            'python',
+                            os.path.split(__file__)[0] + '/worker.py',
+                            task.task_root,
+                            task.code_file,
+                        ],
+                        stdout=sys.stdout,
+                        stderr=sys.stderr,
+                        env=env,
+                        cwd=os.path.split(os.path.abspath(task.task_root))[0]
+                    )
+                    processes[ready_task] = process
+
+                while len(processes) > 0:
+                    finished = False
+                    stop = False
+                    for task, process in processes.items():
+                        if process.poll() is not None:
+                            logger.info('task ' + task + ' finished')
+                            # processes.remove((process, task))
+                            del processes[task]
+                            self.set_finished(task)
+                            # logger.info(self.get_ready())
+                            if process.returncode != 0:
+                                logger.error('task' + task + 'failed')
+                            stop = True
+                            break
+                    if stop:
+                        break
+                    time.sleep(0.1)
+                if finished:
+                    break
+        except KeyboardInterrupt:
+            logger.info('Keyboard interrupt')
+            for p in processes.values():
+                p.terminate()
+                p.wait()
+
+    def serve(self):
+        pass
 
 
 def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
-    scheduler = Scheduler(tasks)
+    scheduler = Scheduler(tasks, targets=target)
     scheduler.to_pdf('scheduler')
-
-    # scheduler.
-
+    scheduler.run_once()
     return
+
     tg = schedule_task(tasks)
     for task_group in tg:
         logger.debug('\n' + pprint_str(task_group))

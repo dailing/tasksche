@@ -20,7 +20,7 @@ root, task = sys.argv[1:]
 # logger.info(f'running python path {os.environ.get("PYTHONPATH")}')
 debug = (os.environ.get("DEBUG", None) == 'true')
 task_info = extract_anno(root, task)
-logger.info(f'{task_info}, running {task_info.module_path}',)
+logger.info(f'running {task_info}',)
 
 kwargs = task_info.call_arguments
 
