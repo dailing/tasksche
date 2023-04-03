@@ -34,25 +34,28 @@ if not os.path.exists(output_dir):
 # logger.info(mod)
 if debug:
     logger.info('IN DEBUG MODE')
-with open(f'{output_dir}/std_out_{os.getpid()}.txt', 'w') as fout, \
-        open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr:
-    if debug:
-        fout = sys.stdout
-        ferr = sys.stderr
-    with contextlib.redirect_stderr(ferr), contextlib.redirect_stdout(fout):
-        mod = importlib.import_module(task_info.module_path)
-        mod.__dict__['work_dir'] = os.path.join(output_dir)
-        if isinstance(kwargs, dict):
-            args, kwargs = [], kwargs
-            # output = mod.run(**kwargs)
-        else:
-            args, kwargs = kwargs, {}
-        if debug:
-            pdb.run('output = mod.run(*args, **kwargs)')
-        else:
-            output = mod.run(*args, **kwargs)
-
+try:
+    with open(f'{output_dir}/std_out_{os.getpid()}.txt', 'w') as fout, \
+            open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr:
+        # if debug:
+        #     fout = sys.stdout
+        #     ferr = sys.stderr
+        with contextlib.redirect_stderr(ferr), contextlib.redirect_stdout(fout):
+            mod = importlib.import_module(task_info.module_path)
+            mod.__dict__['work_dir'] = os.path.join(output_dir)
+            if isinstance(kwargs, dict):
+                args, kwargs = [], kwargs
+                # output = mod.run(**kwargs)
+            else:
+                args, kwargs = kwargs, {}
+            if debug:
+                pdb.run('output = mod.run(*args, **kwargs)')
+            else:
+                output = mod.run(*args, **kwargs)
+        task_info.dump_result(output)
+except KeyboardInterrupt:
+    logger.info(f'{task_info.task_name} exiting...')
+    # sys.exit(-1)
 # pickle.dump(output, open(task_info.result_file, 'wb'))
-task_info.dump_result(output)
 
 # DUMP value

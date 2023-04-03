@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from hashlib import md5
 from typing import Union
+import signal
 
 
 import logging
@@ -451,12 +452,25 @@ class Graph():
         dot = Digraph('G', format='pdf', filename=path,
                       graph_attr={'layout': 'dot'})
         dot.attr(rankdir='LR')
+        color_map=dict(
+            ready='orange',
+            finished='lightgreen',
+            pending='red',
+            running='lightblue',
+        )
         for node in self.nodes:
-            dot.node(node, label=f'{node}\n' + self.node_label(node))
+            color = color_map.get(self.property[node].get('status', 'None exist'), 'yellow')
+            dot.node(
+                node,
+                label=f'{node}\n' + self.node_label(node),
+                fillcolor=color,
+                style="filled",
+                color=color,
+                )
         for a, bs in self.dag.items():
             for b in bs:
                 dot.edge(a, b)
-        dot.render(cleanup=True)
+        dot.render(cleanup=False)
 
     def __item__(self, node):
         return GraphNode(self.dag[node], self.property[node])
@@ -468,6 +482,7 @@ class Scheduler():
         for t in tasks.values():
             self.g.add_node(t.task_name)
             self.g.property[t.task_name]['dirty'] = t.dirty
+            self.g.property[t.task_name]['virtual'] = t.virtual
         for t in tasks.values():
             for t2 in t.dependent_tasks:
                 self.g.add_edge(t2, t.task_name)
@@ -488,6 +503,8 @@ class Scheduler():
 
     def _update_status(self):
         def map_func(prop):
+            if prop['virtual']:
+                return 'finished'
             if 'status' not in prop:
                 if prop['dirty']:
                     return 'pending'
@@ -514,6 +531,7 @@ class Scheduler():
             nodes=self.targets,
             update='status'
         )
+        self.to_pdf('scheduler')
         # logger.info(pprint_str(self.g.property))
 
     def get_ready(self):
@@ -534,7 +552,7 @@ class Scheduler():
         self.set_status(task, 'error')
 
     def run_once(self):
-        processes:Dict[str, subprocess.Popen] = {}
+        processes: Dict[str, subprocess.Popen] = {}
         try:
             while True:
                 finished = True
@@ -574,6 +592,7 @@ class Scheduler():
                             # logger.info(self.get_ready())
                             if process.returncode != 0:
                                 logger.error('task' + task + 'failed')
+                                raise KeyboardInterrupt
                             stop = True
                             break
                     if stop:
@@ -593,7 +612,6 @@ class Scheduler():
 
 def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
     scheduler = Scheduler(tasks, targets=target)
-    scheduler.to_pdf('scheduler')
     scheduler.run_once()
     return
 
