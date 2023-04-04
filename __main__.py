@@ -1,6 +1,7 @@
-from .run import *
+from .run import run_target, clean_target, new_task
 import inspect
 import argparse
+
 
 def _parser():
     parser = argparse.ArgumentParser('RUNRUN')
@@ -21,9 +22,9 @@ if __name__ == '__main__':
                 func_name, *args, **kwargs)
             for k_name, par in inspect.signature(func).parameters.items():
                 required = par.default is inspect.Parameter.empty
-                default = par.default if par.default is not inspect.Parameter.empty else None
-                # logger.info(
-                #     f'{func_name} {k_name}, {default} req: {required} {par.annotation}')
+                default = par.default \
+                    if par.default is not inspect.Parameter.empty \
+                    else None
                 argument_kwargs = {}
                 argument_kwargs['type'] = par.annotation
                 argument_kwargs['default'] = default

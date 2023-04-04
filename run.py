@@ -1,6 +1,8 @@
 # %%
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 import shutil
+import logging
+import os.path
 from functools import cached_property
 from io import BytesIO, StringIO
 import pickle
@@ -14,17 +16,12 @@ import subprocess
 from dataclasses import dataclass
 from hashlib import md5
 from typing import Union
-import signal
-
-
-import logging
-import datetime
-import os.path
 
 
 def get_logger(name: str, print_level=logging.DEBUG):
     formatter = logging.Formatter(
-        fmt="%(levelname)6s [%(filename)15s:%(lineno)-3d %(asctime)s] %(message)s",
+        fmt="%(levelname)6s "
+        "[%(filename)15s:%(lineno)-3d %(asctime)s] %(message)s",
         datefmt='%H:%M:%S',
     )
     # time_now = datetime.datetime.now().strftime("%Y_%m_%d.%H_%M_%S")
@@ -98,7 +95,8 @@ class TaskSpec:
         return result
 
     def clean(self):
-        if not (os.path.exists(self.result_file) or os.path.exists(self.result_info)):
+        if not (os.path.exists(self.result_file) or
+                os.path.exists(self.result_info)):
             return True
         try:
             os.remove(self.result_info)
@@ -170,7 +168,8 @@ class TaskSpec:
         code_update = self.code_update_time
         try:
             result_update = os.stat(self.result_file).st_mtime
-            # logger.debug(dict(code_update=code_update, result_update=result_update))
+            # logger.debug(dict(
+            #   code_update=code_update, result_update=result_update))
             if code_update < result_update:
                 return False
             else:
@@ -178,6 +177,7 @@ class TaskSpec:
                 # logger.debug(f'check_hash {code_hash} {self.code_hash}')
                 if code_hash == self.code_hash:
                     return False
+                # TODO touch the result file so no hash check is needed next time
 
         except FileNotFoundError:
             # logger.debug(f'result file Not Fund for {self.task_name}')
@@ -278,53 +278,6 @@ def post_process_anno(anno) -> TaskSpec:
         require[k] = process_reference(v, anno)
         anno.require = require
     return anno
-
-
-def schedule_task(tasks: Dict[str, TaskSpec]) -> List[List[TaskSpec]]:
-    schedule = []
-    un_scheduled = set(tasks.values())
-    scheduled = set()
-    dirty_set = set()
-
-    for t in sorted(list(un_scheduled)):
-        if t.virtual:
-            continue
-        if not t.dirty:
-            continue
-        logger.debug(f'Dirty Task {t}')
-    # pdb.set_trace()
-    while len(un_scheduled) > 0:
-        ready_list = []
-        dirty_list = []
-        for task in list(un_scheduled):
-            ready = True
-            dirty = task.dirty
-            for dep in task.dependent_tasks:
-                dep = tasks[dep]
-                if dep not in scheduled:
-                    ready = False
-                    break
-                if dep in dirty_set:
-                    # logger.debug(f'dep {dep} dirty, {task}')
-                    dirty = True
-            if ready:
-                ready_list.append(task)
-                if dirty:
-                    dirty_list.append(task)
-        for task in ready_list:
-            un_scheduled.remove(task)
-            scheduled.add(task)
-        for task in dirty_list:
-            dirty_set.add(task)
-        running_list = list(filter(lambda x: x in dirty_set, ready_list))
-        running_list = list(filter(lambda x: x.virtual == False, running_list))
-        if len(running_list) > 0:
-            running_list.sort()
-            schedule.append(running_list)
-    return schedule
-
-
-GraphNode = namedtuple('GraphNode', ['node', 'property'])
 
 
 class Graph():
@@ -452,32 +405,31 @@ class Graph():
         dot = Digraph('G', format='pdf', filename=path,
                       graph_attr={'layout': 'dot'})
         dot.attr(rankdir='LR')
-        color_map=dict(
+        color_map = dict(
             ready='orange',
             finished='lightgreen',
             pending='red',
             running='lightblue',
         )
         for node in self.nodes:
-            color = color_map.get(self.property[node].get('status', 'None exist'), 'yellow')
+            color = color_map.get(self.property[node].get(
+                'status', 'None exist'), 'yellow')
             dot.node(
                 node,
                 label=f'{node}\n' + self.node_label(node),
                 fillcolor=color,
                 style="filled",
                 color=color,
-                )
+            )
         for a, bs in self.dag.items():
             for b in bs:
                 dot.edge(a, b)
         dot.render(cleanup=False)
 
-    def __item__(self, node):
-        return GraphNode(self.dag[node], self.property[node])
-
 
 class Scheduler():
-    def __init__(self, tasks: Dict[str, TaskSpec], targets=None):
+    def __init__(self, target: str = None, targets=None):
+        tasks = parse_target(target)
         self.g = Graph()
         for t in tasks.values():
             self.g.add_node(t.task_name)
@@ -497,6 +449,9 @@ class Scheduler():
             update='dirty'
         )
         self._update_status()
+
+    def refresh(self):
+        pass
 
     def to_pdf(self, path):
         self.g.to_pdf(path)
@@ -610,57 +565,6 @@ class Scheduler():
         pass
 
 
-def run_task(tasks: Dict[str, TaskSpec], target=None, debug=False):
-    scheduler = Scheduler(tasks, targets=target)
-    scheduler.run_once()
-    return
-
-    tg = schedule_task(tasks)
-    for task_group in tg:
-        logger.debug('\n' + pprint_str(task_group))
-    for task_group in tg:
-        task_group.sort()
-        tg_names = [t.task_name for t in task_group]
-        try:
-            idx = tg_names.index(target)
-            task_group = [task_group[idx]]
-        except ValueError as e:
-            pass
-        processes = []
-        try:
-            for task in task_group:
-                env = dict(os.environ)
-                env['PYTHONPATH'] = os.path.abspath(task.task_root)
-                if debug:
-                    env['DEBUG'] = 'true'
-                process = subprocess.Popen(
-                    [
-                        'python',
-                        os.path.split(__file__)[0] + '/worker.py',
-                        task.task_root,
-                        task.code_file,
-                    ],
-                    stdout=sys.stdout,
-                    stderr=sys.stderr,
-                    env=env,
-                    cwd=os.path.split(os.path.abspath(task.task_root))[0]
-                )
-                processes.append((process, task))
-                if debug:
-                    process.wait()
-            for process, task in processes:
-                ret_status = process.wait()
-                if ret_status != 0:
-                    logger.error(f"ERROR exit {ret_status} {task}")
-                    raise KeyboardInterrupt
-        except KeyboardInterrupt:
-            logger.error('terminating processes')
-            for p, _ in processes:
-                p.terminate()
-                p.wait()
-            break
-
-
 def extract_anno(root, file) -> TaskSpec:
     payload = bytearray()
     with open(file, 'rb') as f:
@@ -723,9 +627,11 @@ def run_target(target: str, task=None, debug=False):
     logger.info(f'executing on: {target} ...')
     if debug:
         logger.info('IN DEBUG MODE')
-    tasks = parse_target(target)
-    # logger.debug(tasks)
-    run_task(tasks, task, debug=debug)
+    scheduler = Scheduler(target, task)
+    scheduler.run_once()
+    # tasks = parse_target(target)
+    # # logger.debug(tasks)
+    # run_task(tasks, task, debug=debug)
 
 
 def clean_target(target: str):
