@@ -1,17 +1,19 @@
-from .run import run_target, clean_target, new_task
-import inspect
 import argparse
+import inspect
+
+from .run import run_target, clean_target, new_task, serve_target
 
 
 def _parser():
     parser = argparse.ArgumentParser('RUNRUN')
     _subparser = parser.add_subparsers(
-        title='cmd', help='run target', required=True)
+        title='cmd', help='run root', required=True)
     return locals()
 
 
 if __name__ == '__main__':
     _parsers = _parser()
+
 
     def _command(*args, **kwargs):
         _subparser = _parsers['_subparser']
@@ -40,17 +42,26 @@ if __name__ == '__main__':
 
         return wrap
 
+
+    @_command()
+    def serve(target: str, task: str = None):
+        serve_target(target, task)
+
+
     @_command()
     def run(target: str, task: str = None, debug: bool = False):
         run_target(target, task, debug=debug)
+
 
     @_command()
     def clean(target: str):
         clean_target(target)
 
+
     @_command()
     def new(target: str, task: str):
         new_task(target, task)
+
 
     # args = _parsers['parser'].parse_args(['run', 'export'])
     args = _parsers['parser'].parse_args()

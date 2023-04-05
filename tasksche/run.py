@@ -1,31 +1,37 @@
 # %%
-from collections import defaultdict
-import shutil
+import asyncio
 import logging
-import os.path
-from functools import cached_property
-from io import BytesIO, StringIO
-import pickle
-from pprint import pprint
-import time
-from typing import Any, Dict, List, Set, Tuple
 import os
-import sys
-import yaml
+import os.path
+import pickle
+import shutil
 import subprocess
+import sys
+import time
+from collections import defaultdict
 from dataclasses import dataclass
+from functools import cached_property
 from hashlib import md5
+from io import BytesIO, StringIO
+from pprint import pprint
+from typing import Any, Dict, List, Set, Tuple
 from typing import Union
+
+import socketio
+import yaml
+from watchfiles import awatch
+from yaml.scanner import ScannerError
 
 
 def get_logger(name: str, print_level=logging.DEBUG):
     formatter = logging.Formatter(
         fmt="%(levelname)6s "
-        "[%(filename)15s:%(lineno)-3d %(asctime)s] %(message)s",
+            "[%(filename)15s:%(lineno)-3d %(asctime)s]"
+            " %(message)s",
         datefmt='%H:%M:%S',
     )
     # time_now = datetime.datetime.now().strftime("%Y_%m_%d.%H_%M_%S")
-    logger = logging.getLogger(name)
+    logger_obj = logging.getLogger(name)
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(print_level)
@@ -34,10 +40,10 @@ def get_logger(name: str, print_level=logging.DEBUG):
     # file_handler = logging.FileHandler(f'/tmp/log/{time_now}/{name}.log')
     # file_handler.setFormatter(formatter)
     # file_handler.setLevel(logging.DEBUG)
-    logger.addHandler(stream_handler)
+    logger_obj.addHandler(stream_handler)
     # logger.addHandler(file_handler)
-    logger.setLevel(logging.DEBUG)
-    return logger
+    logger_obj.setLevel(logging.DEBUG)
+    return logger_obj
 
 
 logger = get_logger('runrun')
@@ -45,7 +51,7 @@ logger = get_logger('runrun')
 
 def pprint_str(*args, **kwargs):
     sio = StringIO()
-    pprint(*args,  stream=sio, **kwargs)
+    pprint(*args, stream=sio, **kwargs)
     sio.seek(0)
     return sio.read()
 
@@ -79,10 +85,14 @@ class TaskSpec:
         return hash((self.task_root, self.task_name))
 
     def __eq__(self, __o: object) -> bool:
-        return self.task_name == self.task_name
+        if isinstance(__o, TaskSpec):
+            return self.task_name == __o.task_name
+        return False
 
-    def __gt__(self, _o: object) -> bool:
-        return self.task_name > _o.task_name
+    def __gt__(self, __o: object) -> bool:
+        if isinstance(__o, TaskSpec):
+            return self.task_name > __o.task_name
+        return False
 
     @property
     def depend_files(self):
@@ -91,7 +101,7 @@ class TaskSpec:
         result = []
         for dep in self.depend:
             result.append(os.path.join(self.task_root,
-                          process_path(self.task_root, dep)[1:]))
+                                       process_path(self.task_root, dep)[1:]))
         return result
 
     def clean(self):
@@ -177,8 +187,7 @@ class TaskSpec:
                 # logger.debug(f'check_hash {code_hash} {self.code_hash}')
                 if code_hash == self.code_hash:
                     return False
-                # TODO touch the result file so no hash check is needed next time
-
+                os.utime(self.result_file)
         except FileNotFoundError:
             # logger.debug(f'result file Not Fund for {self.task_name}')
             return True
@@ -269,7 +278,6 @@ def post_process_anno(anno) -> TaskSpec:
     require = anno.get('require', {})
     if require is None:
         require = {}
-    it = None
     if isinstance(require, list):
         it = enumerate(require)
     else:
@@ -280,13 +288,13 @@ def post_process_anno(anno) -> TaskSpec:
     return anno
 
 
-class Graph():
+class Graph:
     """a graph class to calculate task dependent relationships"""
 
     def __init__(self, nodes=None, edges=None):
         self.nodes: Set[str] = set()
-        self.dag: Dict[str, List(str)] = defaultdict(list)
-        self.in_degree: Dict[str, List(str)] = defaultdict(list)
+        self.dag: Dict[str, List[str]] = defaultdict(list)
+        self.in_degree: Dict[str, List[str]] = defaultdict(list)
         self.property: Dict[str:Dict[str, Any]] = defaultdict(dict)
 
         nodes: List[str] = nodes or []
@@ -296,10 +304,15 @@ class Graph():
         for a, b in edges:
             self.add_edge(a, b)
 
-    def add_node(self, node: str, p=None):
-        p = dict()
+    def clear(self):
+        self.nodes.clear()
+        self.dag.clear()
+        self.in_degree.clear()
+        self.property.clear()
+
+    def add_node(self, node: str, **kwargs):
         self.nodes.add(node)
-        self.property[node] = p
+        self.property[node] = kwargs
 
     def add_edge(self, a, b):
         """
@@ -399,7 +412,7 @@ class Graph():
 
     def to_pdf(self, path):
         """
-        save graph to a pdf file using graphivz
+        save graph to a pdf file using graphviz
         """
         from graphviz import Digraph
         dot = Digraph('G', format='pdf', filename=path,
@@ -427,22 +440,31 @@ class Graph():
         dot.render(cleanup=False)
 
 
-class Scheduler():
-    def __init__(self, target: str = None, targets=None):
-        tasks = parse_target(target)
-        self.g = Graph()
-        for t in tasks.values():
-            self.g.add_node(t.task_name)
-            self.g.property[t.task_name]['dirty'] = t.dirty
-            self.g.property[t.task_name]['virtual'] = t.virtual
+class Scheduler:
+    def __init__(self, root: str = None, targets=None):
+        self._g = Graph()
+        self.targets = targets
+        self.tasks = None
+        self.root = root
+        self.sio = None
+        self.refresh()
+
+    def refresh(self):
+        """
+            scan files on disk and refresh everything
+        """
+        logger.info('refresh')
+        self._g.clear()
+        tasks = parse_target(self.root)
+        self.tasks = tasks
+        for t in self.tasks.values():
+            self._g.add_node(t.task_name)
+            self._g.property[t.task_name]['dirty'] = t.dirty
+            self._g.property[t.task_name]['virtual'] = t.virtual
         for t in tasks.values():
             for t2 in t.dependent_tasks:
-                self.g.add_edge(t2, t.task_name)
-        self.targets = targets
-        self.tasks = tasks
-
-        # update dirty map
-        self.g.aggragate(
+                self._g.add_edge(t2, t.task_name)
+        self._g.aggragate(
             lambda x: x['dirty'],
             any,
             nodes=self.targets,
@@ -450,11 +472,8 @@ class Scheduler():
         )
         self._update_status()
 
-    def refresh(self):
-        pass
-
     def to_pdf(self, path):
-        self.g.to_pdf(path)
+        self._g.to_pdf(path)
 
     def _update_status(self):
         def map_func(prop):
@@ -480,21 +499,21 @@ class Scheduler():
                 return 'ready'
             return 'pending'
 
-        self.g.aggragate(
+        self._g.aggragate(
             map_func,
             reduce_func,
             nodes=self.targets,
             update='status'
         )
         self.to_pdf('scheduler')
-        # logger.info(pprint_str(self.g.property))
+        # logger.info(pprint_str(self._g.property))
 
     def get_ready(self):
-        t = self.g.match_one(dict(status='ready'))
+        t = self._g.match_one(dict(status='ready'))
         return t
 
     def set_status(self, task, status):
-        self.g.property[task]['status'] = status
+        self._g.property[task]['status'] = status
         self._update_status()
 
     def set_running(self, task):
@@ -561,14 +580,37 @@ class Scheduler():
                 p.terminate()
                 p.wait()
 
-    def serve(self):
+    async def try_available_job(self):
         pass
+
+    async def file_watcher_task(self):
+        logger.info('file watcher started ...')
+        async for changes in awatch(
+                self.root,
+                recursive=True,
+        ):
+            logger.info(changes)
+            self.refresh()
+
+    async def serve_main(self, addr):
+        # connect to sockerIO server for event
+        try:
+            self.sio = socketio.AsyncClient()
+            await self.sio.connect(addr, wait_timeout=3)
+        except ConnectionError:
+            self.sio = None
+        asyncio.create_task(self.file_watcher_task())
+        while True:
+            await asyncio.sleep(10)
+
+    def serve(self, addr='http://localhost:6000'):
+        asyncio.run(self.serve_main(addr))
 
 
 def extract_anno(root, file) -> TaskSpec:
     payload = bytearray()
     with open(file, 'rb') as f:
-        line = f.readline()
+        f.readline()
         while True:
             line = f.readline()
             if line == b'"""\n':
@@ -613,7 +655,6 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                 if inh_task.task_name + '/task.py' not in v.depend:
                     v.depend.append(inh_task.task_name + '/task.py')
                     # logger.debug(f'adding {inh_task.task_name + "/task.py"}')
-                    dep = False
                 if inh_task.depend is not None:
                     for dep in inh_task.depend:
                         if dep not in v.depend:
@@ -629,9 +670,12 @@ def run_target(target: str, task=None, debug=False):
         logger.info('IN DEBUG MODE')
     scheduler = Scheduler(target, task)
     scheduler.run_once()
-    # tasks = parse_target(target)
-    # # logger.debug(tasks)
-    # run_task(tasks, task, debug=debug)
+
+
+def serve_target(target: str, task=None):
+    logger.info(f'serve on: {target} ...')
+    scheduler = Scheduler(target, task)
+    scheduler.serve()
 
 
 def clean_target(target: str):
@@ -644,7 +688,7 @@ def clean_target(target: str):
 def new_task(target: str, task: str):
     logger.info(f'creating new task : {target} {task}')
     if not os.path.exists(target):
-        print("ERROR no such target")
+        print("ERROR no such root")
         return
     if task.startswith('/'):
         task = task[1:]

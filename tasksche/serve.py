@@ -8,7 +8,7 @@ socketio = SocketIO(app)
 
 
 @socketio.on('connect')
-def test_connect(auth):
+def test_connect():
     emit('my message', {'data': 'Connected'})
     print('connected')
 
@@ -19,4 +19,4 @@ def test_disconnect():
 
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    socketio.run(app, debug=True, allow_unsafe_werkzeug=True, port=6000)

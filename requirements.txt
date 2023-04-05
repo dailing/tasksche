@@ -1,0 +1,4 @@
+Flask>=2.2.3
+PyYAML>=6.0
+graphviz
+watchfiles>=0.18.1
