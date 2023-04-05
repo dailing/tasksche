@@ -447,14 +447,22 @@ class Scheduler:
         self.tasks = None
         self.root = root
         self.sio = None
+        self.processes: Dict[str:asyncio.subprocess.Process] = {}
+        self.coroutines_tasks = asyncio.Queue()
+        self.watcher_task = None
+        self.sock_addr = None
+
         self.refresh()
 
     def refresh(self):
         """
-            scan files on disk and refresh everything
+            rescan files on disk and refresh everything
         """
         logger.info('refresh')
+        # stop any running processes
+        self.terminate_all_process()
         self._g.clear()
+        self.processes.clear()
         tasks = parse_target(self.root)
         self.tasks = tasks
         for t in self.tasks.values():
@@ -471,6 +479,15 @@ class Scheduler:
             update='dirty'
         )
         self._update_status()
+
+    def terminate_all_process(self):
+        """
+        terminate processed running
+        terminate coroutines
+        """
+        for v in self.processes.values():
+            v.terminate()
+            asyncio.run(v.wait())
 
     def to_pdf(self, path):
         self._g.to_pdf(path)
@@ -533,7 +550,6 @@ class Scheduler:
                 while True:
                     ready_task = self.get_ready()
                     if ready_task is None:
-                        # logger.info('no ready task aval')
                         break
                     logger.info('running task ' + ready_task)
                     self.set_running(ready_task)
@@ -580,10 +596,54 @@ class Scheduler:
                 p.terminate()
                 p.wait()
 
-    async def try_available_job(self):
-        pass
+    async def create_process(self, ready_task):
+        logger.info('running task ' + ready_task)
+        env = dict(os.environ)
+        task = self.tasks[ready_task]
+        env['PYTHONPATH'] = os.path.abspath(task.task_root)
+        process = await asyncio.create_subprocess_exec(
+            'python',
+            os.path.split(__file__)[0] + '/worker.py',
+            task.task_root,
+            task.code_file,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            env=env,
+            cwd=os.path.split(os.path.abspath(task.task_root))[0]
+        )
+        return process
 
-    async def file_watcher_task(self):
+    def _init_new_job(self):
+        """
+        create a coroutine and make it propagate
+        """
+        asyncio.create_task(self.coroutines_tasks.put(
+            asyncio.create_task(self.try_available_job())
+        ))
+
+    async def try_available_job(self):
+        ready_job = self.get_ready()
+        if ready_job is None:
+            return
+        logger.info(f'running {ready_job}')
+        self.set_running(ready_job)
+        assert ready_job not in self.processes
+        p = await self.create_process(ready_job)
+        self.processes[ready_job] = p
+        # call other jobs if avail
+        self._init_new_job()
+        ret_code = await p.wait()
+        # TODO check if things can run currently
+        if ret_code == 0:
+            self.set_finished(ready_job)
+            self._init_new_job()
+            logger.info(f'task finished {ready_job}')
+        else:
+            self.set_error(ready_job)
+            logger.info(f'error task {ready_job}')
+        del self.processes[ready_job]
+
+    async def async_file_watcher_task(self):
         logger.info('file watcher started ...')
         async for changes in awatch(
                 self.root,
@@ -591,20 +651,29 @@ class Scheduler:
         ):
             logger.info(changes)
             self.refresh()
+            self._init_new_job()
 
-    async def serve_main(self, addr):
+    async def async_serve_main(self):
         # connect to sockerIO server for event
-        try:
-            self.sio = socketio.AsyncClient()
-            await self.sio.connect(addr, wait_timeout=3)
-        except ConnectionError:
-            self.sio = None
-        asyncio.create_task(self.file_watcher_task())
-        while True:
-            await asyncio.sleep(10)
+        if self.sock_addr is not None:
+            try:
+                self.sio = socketio.AsyncClient()
+                await self.sio.connect(self.sock_addr, wait_timeout=3)
+            except ConnectionError:
+                self.sio = None
+        # file watcher task
+        asyncio.create_task(self.async_file_watcher_task())
 
-    def serve(self, addr='http://localhost:6000'):
-        asyncio.run(self.serve_main(addr))
+        # start running
+        self._init_new_job()
+        while True:
+            t = await self.coroutines_tasks.get()
+            if t is None:
+                break
+            await t
+
+    def serve(self):
+        asyncio.run(self.async_serve_main())
 
 
 def extract_anno(root, file) -> TaskSpec:
