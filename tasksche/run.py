@@ -114,13 +114,13 @@ class TaskSpec:
             return True
         except Exception as e:
             logger.info(e)
-        try:
-            output_dir = os.path.join(self.task_dir, '_output')
-            logger.info(f'removing {output_dir}')
-            shutil.rmtree(output_dir, ignore_errors=True)
-            # os.removedirs(os.path.join(self.task_dir, '_output'))
-        except Exception as e:
-            logger.info(e)
+        # try:
+        #     output_dir = os.path.join(self.task_dir, '_output')
+        #     logger.info(f'removing {output_dir}')
+        #     shutil.rmtree(output_dir, ignore_errors=True)
+        #     # os.removedirs(os.path.join(self.task_dir, '_output'))
+        # except Exception as e:
+        #     logger.info(e)
         return False
 
     @property
@@ -241,7 +241,6 @@ class TaskSpec:
         return kwargs
 
     def dump_result(self, result):
-        # file_hash = self.hash
         pickle.dump(result, open(self.result_file, 'wb'))
         pickle.dump((self.code_hash, time.time()),
                     open(self.result_info, 'wb'))
@@ -459,10 +458,9 @@ class Scheduler:
             rescan files on disk and refresh everything
         """
         logger.info('refresh')
-        # stop any running processes
-        self.terminate_all_process()
         self._g.clear()
-        self.processes.clear()
+        assert len(self.processes) == 0
+        # self.processes.clear()
         tasks = parse_target(self.root)
         self.tasks = tasks
         for t in self.tasks.values():
@@ -478,16 +476,26 @@ class Scheduler:
             nodes=self.targets,
             update='dirty'
         )
+        for task_name, prop in self._g.property.items():
+            if prop['dirty']:
+                self.tasks[task_name].clean()
         self._update_status()
 
-    def terminate_all_process(self):
+    async def async_terminate_all_process(self):
         """
         terminate processed running
         terminate coroutines
         """
+        logger.info('terminating processes')
         for v in self.processes.values():
-            v.terminate()
-            asyncio.run(v.wait())
+            try:
+                v.terminate()
+            except ProcessLookupError:
+                # process already ended
+                pass
+            await v.wait()
+        self.processes.clear()
+        logger.info('terminating end')
 
     def to_pdf(self, path):
         self._g.to_pdf(path)
@@ -522,8 +530,8 @@ class Scheduler:
             nodes=self.targets,
             update='status'
         )
-        self.to_pdf('scheduler')
-        # logger.info(pprint_str(self._g.property))
+        self.to_pdf('_output/scheduler')
+        logger.info(pprint_str(self._g.property))
 
     def get_ready(self):
         t = self._g.match_one(dict(status='ready'))
@@ -617,12 +625,14 @@ class Scheduler:
         """
         create a coroutine and make it propagate
         """
+        logger.info('propagate tasks')
         asyncio.create_task(self.coroutines_tasks.put(
             asyncio.create_task(self.try_available_job())
         ))
 
     async def try_available_job(self):
         ready_job = self.get_ready()
+        logger.info(f'trying job {ready_job}')
         if ready_job is None:
             return
         logger.info(f'running {ready_job}')
@@ -633,23 +643,25 @@ class Scheduler:
         # call other jobs if avail
         self._init_new_job()
         ret_code = await p.wait()
-        # TODO check if things can run currently
         if ret_code == 0:
             self.set_finished(ready_job)
             self._init_new_job()
             logger.info(f'task finished {ready_job}')
         else:
             self.set_error(ready_job)
-            logger.info(f'error task {ready_job}')
-        del self.processes[ready_job]
+            logger.info(f'error task {ready_job} {ret_code}')
+        # del self.processes[ready_job]
+        logger.info('exiting job')
 
     async def async_file_watcher_task(self):
         logger.info('file watcher started ...')
         async for changes in awatch(
                 self.root,
                 recursive=True,
+                step=500,
         ):
             logger.info(changes)
+            await self.async_terminate_all_process()
             self.refresh()
             self._init_new_job()
 

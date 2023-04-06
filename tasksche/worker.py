@@ -52,7 +52,7 @@ try:
                 pdb.run('output = mod.run(*args, **kwargs)')
             else:
                 output = mod.run(*args, **kwargs)
-        task_info.dump_result(output)
+            task_info.dump_result(output)
 except KeyboardInterrupt:
     logger.info(f'{task_info.task_name} exiting...')
     # sys.exit(-1)
