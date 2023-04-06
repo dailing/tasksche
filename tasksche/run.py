@@ -4,7 +4,6 @@ import logging
 import os
 import os.path
 import pickle
-import shutil
 import subprocess
 import sys
 import time
@@ -46,7 +45,7 @@ def get_logger(name: str, print_level=logging.DEBUG):
     return logger_obj
 
 
-logger = get_logger('runrun')
+logger = get_logger('runrun', print_level=logging.INFO)
 
 
 def pprint_str(*args, **kwargs):
@@ -61,7 +60,6 @@ class TaskSpec:
     task_root: str
     task_name: str
     require: Union[Dict[str, str], List[str], None] = None
-    exec: str = ''
     inherent: str = None
     virtual: bool = False
     depend: List[str] = None
@@ -69,6 +67,13 @@ class TaskSpec:
 
     def __getitem__(self, item):
         return getattr(self, item)
+
+    def to_json(self):
+        return dict(
+            task_name=self.task_name,
+            dependent_tasks=self.dependent_tasks,
+            inherent=self.inherent,
+        )
 
     def get(self, name, default=None):
         if hasattr(self, name):
@@ -440,16 +445,15 @@ class Graph:
 
 
 class Scheduler:
-    def __init__(self, root: str = None, targets=None):
+    def __init__(self, root: str = None, targets=None, sock_addr=None):
         self._g = Graph()
         self.targets = targets
-        self.tasks = None
+        self.tasks:Dict[str, TaskSpec] = None
         self.root = root
-        self.sio = None
         self.processes: Dict[str:asyncio.subprocess.Process] = {}
         self.coroutines_tasks = asyncio.Queue()
-        self.watcher_task = None
-        self.sock_addr = None
+        self.sock_addr = sock_addr
+        self.sio = None
 
         self.refresh()
 
@@ -457,7 +461,7 @@ class Scheduler:
         """
             rescan files on disk and refresh everything
         """
-        logger.info('refresh')
+        logger.debug('refresh')
         self._g.clear()
         assert len(self.processes) == 0
         # self.processes.clear()
@@ -495,7 +499,7 @@ class Scheduler:
                 pass
             await v.wait()
         self.processes.clear()
-        logger.info('terminating end')
+        # logger.info('terminating end')
 
     def to_pdf(self, path):
         self._g.to_pdf(path)
@@ -531,7 +535,7 @@ class Scheduler:
             update='status'
         )
         self.to_pdf('_output/scheduler')
-        logger.info(pprint_str(self._g.property))
+        logger.debug(pprint_str(self._g.property))
 
     def get_ready(self):
         t = self._g.match_one(dict(status='ready'))
@@ -605,7 +609,7 @@ class Scheduler:
                 p.wait()
 
     async def create_process(self, ready_task):
-        logger.info('running task ' + ready_task)
+        logger.debug('running task ' + ready_task)
         env = dict(os.environ)
         task = self.tasks[ready_task]
         env['PYTHONPATH'] = os.path.abspath(task.task_root)
@@ -632,7 +636,7 @@ class Scheduler:
 
     async def try_available_job(self):
         ready_job = self.get_ready()
-        logger.info(f'trying job {ready_job}')
+        logger.debug(f'trying job {ready_job}')
         if ready_job is None:
             return
         logger.info(f'running {ready_job}')
@@ -646,12 +650,12 @@ class Scheduler:
         if ret_code == 0:
             self.set_finished(ready_job)
             self._init_new_job()
-            logger.info(f'task finished {ready_job}')
+            logger.debug(f'task finished {ready_job}')
         else:
             self.set_error(ready_job)
             logger.info(f'error task {ready_job} {ret_code}')
         # del self.processes[ready_job]
-        logger.info('exiting job')
+        logger.debug('exiting job')
 
     async def async_file_watcher_task(self):
         logger.info('file watcher started ...')
@@ -660,21 +664,43 @@ class Scheduler:
                 recursive=True,
                 step=500,
         ):
-            logger.info(changes)
+            logger.debug(changes)
             await self.async_terminate_all_process()
             self.refresh()
             self._init_new_job()
 
-    async def async_serve_main(self):
-        # connect to sockerIO server for event
+    async def async_socket_on_get_tasks(self):
+        logger.info('on_get_task')
+        result = {}
+        for task_name, task in self.tasks.items():
+            payload = task.to_json()
+            payload['prop'] = self._g.property[task_name]
+            result[task_name] = payload
+        return result
+
+    async def async_socket_on_connect(self):
+        logger.info('connect')
+        result = await self.sio.call('join', data=dict(room=self.root))
+        logger.info(result)
+
+    async def async_socket_task(self):
+        logger.info('socker task started ...')
+        # connect to sockerIO server for event dispatch
         if self.sock_addr is not None:
             try:
                 self.sio = socketio.AsyncClient()
+                self.sio.on('connect', self.async_socket_on_connect)
                 await self.sio.connect(self.sock_addr, wait_timeout=3)
+
+                self.sio.on('get_task', self.async_socket_on_get_tasks)
             except ConnectionError:
                 self.sio = None
+                logger.info('connection error')
+
+    async def async_serve_main(self):
         # file watcher task
         asyncio.create_task(self.async_file_watcher_task())
+        asyncio.create_task(self.async_socket_task())
 
         # start running
         self._init_new_job()
@@ -753,9 +779,9 @@ def run_target(target: str, task=None, debug=False):
     scheduler.run_once()
 
 
-def serve_target(target: str, task=None):
+def serve_target(target: str, task=None, addr=None):
     logger.info(f'serve on: {target} ...')
-    scheduler = Scheduler(target, task)
+    scheduler = Scheduler(target, task, addr)
     scheduler.serve()
 
 

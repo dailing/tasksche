@@ -44,8 +44,8 @@ if __name__ == '__main__':
 
 
     @_command()
-    def serve(target: str, task: str = None):
-        serve_target(target, task)
+    def serve(target: str, task: str = None, addr: str = None):
+        serve_target(target, task, addr)
 
 
     @_command()
