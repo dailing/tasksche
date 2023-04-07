@@ -452,7 +452,7 @@ class Scheduler:
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
         self.processes: Dict[str:asyncio.subprocess.Process] = {}
-        self.coroutines_tasks = asyncio.Queue()
+        self.coroutines_tasks:asyncio.Queue = None
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
 
@@ -694,14 +694,14 @@ class Scheduler:
 
         result = {}
         for task_name, task in self.tasks.items():
-            position_xy = pos[task_name]
+            position_xy = pos.get(task_name, (0,0))
             prop = self._g.property.get(task_name, {})
-            label = task_name+'\n' + '\n'.join(f'{a}:{b}' for a,b in prop.items())
+            label = task_name+'<br>' + '<br>'.join(f'{a}:{b}' for a,b in prop.items())
             bg_color = color_map.get(prop.get('status', None), None)
             elements.append(dict(
                 id=task_name,
-                label=self._g.node_label(task_name),
-                position=dict(y=position_xy[0] * 2, x=-position_xy[1] * 3),
+                label=label,
+                position=dict(y=position_xy[0] * 0.7, x=-position_xy[1] * 3),
                 style={'backgroundColor': bg_color, },
                 sourcePosition='right',
                 targetPosition='left',
@@ -740,6 +740,7 @@ class Scheduler:
 
     async def async_serve_main(self):
         # file watcher task
+        self.coroutines_tasks = asyncio.Queue()
         asyncio.create_task(self.async_file_watcher_task())
         asyncio.create_task(self.async_socket_task())
 
