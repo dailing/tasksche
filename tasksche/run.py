@@ -677,10 +677,11 @@ class Scheduler:
     async def async_socket_on_get_tasks(self):
         elements = []
         color_map = dict(
-            ready='orange',
+            ready='yellow',
             finished='lightgreen',
-            pending='red',
+            pending='orange',
             running='lightblue',
+            error='red',
         )
         from networkx.drawing.nx_agraph import graphviz_layout
         logger.info('on_get_task')

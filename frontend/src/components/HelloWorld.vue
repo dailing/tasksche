@@ -17,7 +17,6 @@ export default {
     data() {
         return {
             element: [],
-            ele_map: {},
         }
     },
     mounted() {
@@ -30,30 +29,24 @@ export default {
                 console.log(resp);
                 let new_map = resp.data;
 
-                // delete none existing keys:
-                let ori_keys = [];
-                for (const k in this.ele_map) {
-                    ori_keys.push(k)
+                // delete none existing keys, updating new keys
+                let ori_keys = new Set();
+                for (const k of this.element) {
+                    ori_keys.add(k.id)
                 }
-                for (const k of ori_keys) {
-                    if (!(k in new_map)) {
-                        delete (this.ele_map[k])
+                for (let i=0; i < this.element.length; i+=1) {
+                    while (!(this.element[i].id in new_map)) {
+                        this.element.splice(i, 1);
                     }
+                    let kk = new_map[this.element[i].id];
+                    delete (kk['position']);
+                    Object.assign(this.element[i], kk);
                 }
-                // updating new keys
+                // adding new elements
                 for (const k in new_map) {
-                    if (k in this.ele_map) {
-                        const kk = new_map[k];
-                        delete (kk['position']);
-                        Object.assign(this.ele_map[k], kk);
-                    } else {
-                        this.ele_map[k] = new_map[k];
+                    if(!ori_keys.has(k)){
+                        this.element.push(new_map[k])
                     }
-                }
-                // update elements
-                this.element = [];
-                for (const k in this.ele_map) {
-                    this.element.push(this.ele_map[k]);
                 }
 
             })
