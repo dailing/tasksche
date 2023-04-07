@@ -1,5 +1,7 @@
-Flask>=2.2.3
-PyYAML>=6.0
+Flask
+PyYAML
 graphviz
-watchfiles>=0.18.1
+watchfiles
 python-socketio
+networkx
+pygraphviz

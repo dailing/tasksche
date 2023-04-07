@@ -16,6 +16,7 @@ from pprint import pprint
 from typing import Any, Dict, List, Set, Tuple
 from typing import Union
 
+import networkx as nx
 import socketio
 import yaml
 from watchfiles import awatch
@@ -448,12 +449,12 @@ class Scheduler:
     def __init__(self, root: str = None, targets=None, sock_addr=None):
         self._g = Graph()
         self.targets = targets
-        self.tasks:Dict[str, TaskSpec] = None
+        self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
         self.processes: Dict[str:asyncio.subprocess.Process] = {}
         self.coroutines_tasks = asyncio.Queue()
         self.sock_addr = sock_addr
-        self.sio = None
+        self.sio: socketio.AsyncClient = socketio.AsyncClient()
 
         self.refresh()
 
@@ -554,59 +555,59 @@ class Scheduler:
     def set_error(self, task):
         self.set_status(task, 'error')
 
-    def run_once(self):
-        processes: Dict[str, subprocess.Popen] = {}
-        try:
-            while True:
-                finished = True
-                while True:
-                    ready_task = self.get_ready()
-                    if ready_task is None:
-                        break
-                    logger.info('running task ' + ready_task)
-                    self.set_running(ready_task)
-                    env = dict(os.environ)
-                    task = self.tasks[ready_task]
-                    env['PYTHONPATH'] = os.path.abspath(task.task_root)
-                    process = subprocess.Popen(
-                        [
-                            'python',
-                            os.path.split(__file__)[0] + '/worker.py',
-                            task.task_root,
-                            task.code_file,
-                        ],
-                        stdout=sys.stdout,
-                        stderr=sys.stderr,
-                        env=env,
-                        cwd=os.path.split(os.path.abspath(task.task_root))[0]
-                    )
-                    processes[ready_task] = process
-
-                while len(processes) > 0:
-                    finished = False
-                    stop = False
-                    for task, process in processes.items():
-                        if process.poll() is not None:
-                            logger.info('task ' + task + ' finished')
-                            # processes.remove((process, task))
-                            del processes[task]
-                            self.set_finished(task)
-                            # logger.info(self.get_ready())
-                            if process.returncode != 0:
-                                logger.error('task' + task + 'failed')
-                                raise KeyboardInterrupt
-                            stop = True
-                            break
-                    if stop:
-                        break
-                    time.sleep(0.1)
-                if finished:
-                    break
-        except KeyboardInterrupt:
-            logger.info('Keyboard interrupt')
-            for p in processes.values():
-                p.terminate()
-                p.wait()
+    # def run_once(self):
+    #     processes: Dict[str, subprocess.Popen] = {}
+    #     try:
+    #         while True:
+    #             finished = True
+    #             while True:
+    #                 ready_task = self.get_ready()
+    #                 if ready_task is None:
+    #                     break
+    #                 logger.info('running task ' + ready_task)
+    #                 self.set_running(ready_task)
+    #                 env = dict(os.environ)
+    #                 task = self.tasks[ready_task]
+    #                 env['PYTHONPATH'] = os.path.abspath(task.task_root)
+    #                 process = subprocess.Popen(
+    #                     [
+    #                         'python',
+    #                         os.path.split(__file__)[0] + '/worker.py',
+    #                         task.task_root,
+    #                         task.code_file,
+    #                     ],
+    #                     stdout=sys.stdout,
+    #                     stderr=sys.stderr,
+    #                     env=env,
+    #                     cwd=os.path.split(os.path.abspath(task.task_root))[0]
+    #                 )
+    #                 processes[ready_task] = process
+    #
+    #             while len(processes) > 0:
+    #                 finished = False
+    #                 stop = False
+    #                 for task, process in processes.items():
+    #                     if process.poll() is not None:
+    #                         logger.info('task ' + task + ' finished')
+    #                         # processes.remove((process, task))
+    #                         del processes[task]
+    #                         self.set_finished(task)
+    #                         # logger.info(self.get_ready())
+    #                         if process.returncode != 0:
+    #                             logger.error('task' + task + 'failed')
+    #                             raise KeyboardInterrupt
+    #                         stop = True
+    #                         break
+    #                 if stop:
+    #                     break
+    #                 time.sleep(0.1)
+    #             if finished:
+    #                 break
+    #     except KeyboardInterrupt:
+    #         logger.info('Keyboard interrupt')
+    #         for p in processes.values():
+    #             p.terminate()
+    #             p.wait()
 
     async def create_process(self, ready_task):
         logger.debug('running task ' + ready_task)
@@ -641,6 +642,8 @@ class Scheduler:
             return
         logger.info(f'running {ready_job}')
         self.set_running(ready_job)
+        if self.sio.connected:
+            await self.sio.emit('graph_change')
         assert ready_job not in self.processes
         p = await self.create_process(ready_job)
         self.processes[ready_job] = p
@@ -654,6 +657,8 @@ class Scheduler:
         else:
             self.set_error(ready_job)
             logger.info(f'error task {ready_job} {ret_code}')
+        if self.sio.connected:
+            await self.sio.emit('graph_change')
         # del self.processes[ready_job]
         logger.debug('exiting job')
 
@@ -670,13 +675,48 @@ class Scheduler:
             self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
+        elements = []
+        color_map = dict(
+            ready='orange',
+            finished='lightgreen',
+            pending='red',
+            running='lightblue',
+        )
+        from networkx.drawing.nx_agraph import graphviz_layout
         logger.info('on_get_task')
+        G = nx.DiGraph()
+        for task_name, task in self.tasks.items():
+            for dep in task.dependent_tasks:
+                G.add_edge(dep, task_name)
+
+        pos = graphviz_layout(G, prog='dot')
+
         result = {}
         for task_name, task in self.tasks.items():
-            payload = task.to_json()
-            payload['prop'] = self._g.property[task_name]
-            result[task_name] = payload
-        return result
+            position_xy = pos[task_name]
+            prop = self._g.property.get(task_name, {})
+            label = task_name+'\n' + '\n'.join(f'{a}:{b}' for a,b in prop.items())
+            bg_color = color_map.get(prop.get('status', None), None)
+            elements.append(dict(
+                id=task_name,
+                label=self._g.node_label(task_name),
+                position=dict(y=position_xy[0] * 2, x=-position_xy[1] * 3),
+                style={'backgroundColor': bg_color, },
+                sourcePosition='right',
+                targetPosition='left',
+            ))
+            for dep_task in task.dependent_tasks:
+                elements.append(dict(
+                    id=f'{dep_task}-{task_name}',
+                    source=dep_task,
+                    target=task_name,
+                    markerEnd='arrowclosed',
+                ))
+            # payload = task.to_json()
+            # payload['prop'] = self._g.property[task_name]
+            # payload['pos'] = pos[task_name]
+            # result[task_name] = payload
+        return {e['id']:e for e in elements}
 
     async def async_socket_on_connect(self):
         logger.info('connect')
@@ -688,13 +728,13 @@ class Scheduler:
         # connect to sockerIO server for event dispatch
         if self.sock_addr is not None:
             try:
-                self.sio = socketio.AsyncClient()
+                # self.sio = socketio.AsyncClient()
                 self.sio.on('connect', self.async_socket_on_connect)
                 await self.sio.connect(self.sock_addr, wait_timeout=3)
 
                 self.sio.on('get_task', self.async_socket_on_get_tasks)
             except ConnectionError:
-                self.sio = None
+                # self.sio = None
                 logger.info('connection error')
 
     async def async_serve_main(self):
