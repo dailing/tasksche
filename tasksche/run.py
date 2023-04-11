@@ -4,7 +4,6 @@ import logging
 import os
 import os.path
 import pickle
-import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -65,6 +64,13 @@ class TaskSpec:
     virtual: bool = False
     depend: List[str] = None
     rerun: bool = False
+
+    def _after__init__(self):
+        m = md5()
+        m.update(open(self.code_file, 'rb').read())
+        for f in self.depend_files:
+            m.update(open(f, 'rb').read())
+        self.code_hash = m.hexdigest()
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -143,15 +149,8 @@ class TaskSpec:
     def code_file(self) -> str:
         return os.path.join(self.task_dir, 'task.py')
 
-    @property
-    def code_hash(self) -> str:
-        m = md5()
-        m.update(open(self.code_file, 'rb').read())
-        # if self.inherent_task is not None:
-        #     m.update(open(self.inherent_task_file, 'rb').read())
-        for f in self.depend_files:
-            m.update(open(f, 'rb').read())
-        return m.hexdigest()
+    # @cached_property
+    # def code_hash(self) -> str:
 
     @property
     def code_update_time(self) -> float:
@@ -279,7 +278,8 @@ def process_reference(ref, task_spec: TaskSpec):
     return ref
 
 
-def post_process_anno(anno) -> TaskSpec:
+def post_process_anno(anno: TaskSpec) -> TaskSpec:
+    anno._after__init__()
     require = anno.get('require', {})
     if require is None:
         require = {}
@@ -452,9 +452,10 @@ class Scheduler:
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
         self.processes: Dict[str:asyncio.subprocess.Process] = {}
-        self.coroutines_tasks:asyncio.Queue = None
+        self.coroutines_tasks: asyncio.Queue = None
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
+        self.stop_new_job = False
 
         self.refresh()
 
@@ -481,25 +482,25 @@ class Scheduler:
             nodes=self.targets,
             update='dirty'
         )
-        for task_name, prop in self._g.property.items():
-            if prop['dirty']:
-                self.tasks[task_name].clean()
+        # for task_name, prop in self._g.property.items():
+        # if prop['dirty']:
+        #     self.tasks[task_name].clean()
         self._update_status()
 
-    async def async_terminate_all_process(self):
+    async def async_terminate_all_process(self, list_of_process: List[asyncio.subprocess.Process]):
         """
         terminate processed running
         terminate coroutines
         """
         logger.info('terminating processes')
-        for v in self.processes.values():
+        for v in list_of_process:
             try:
                 v.terminate()
             except ProcessLookupError:
                 # process already ended
                 pass
             await v.wait()
-        self.processes.clear()
+        # self.processes.clear()
         # logger.info('terminating end')
 
     def to_pdf(self, path):
@@ -535,14 +536,16 @@ class Scheduler:
             nodes=self.targets,
             update='status'
         )
-        self.to_pdf('_output/scheduler')
+        # self.to_pdf('_output/scheduler')
         logger.debug(pprint_str(self._g.property))
 
     def get_ready(self):
         t = self._g.match_one(dict(status='ready'))
         return t
 
-    def set_status(self, task, status):
+    def set_status(self, task: str, status: str):
+        assert isinstance(task, str)
+        assert isinstance(status, str)
         self._g.property[task]['status'] = status
         self._update_status()
 
@@ -555,61 +558,7 @@ class Scheduler:
     def set_error(self, task):
         self.set_status(task, 'error')
 
-    # def run_once(self):
-    #     processes: Dict[str, subprocess.Popen] = {}
-    #     try:
-    #         while True:
-    #             finished = True
-    #             while True:
-    #                 ready_task = self.get_ready()
-    #                 if ready_task is None:
-    #                     break
-    #                 logger.info('running task ' + ready_task)
-    #                 self.set_running(ready_task)
-    #                 env = dict(os.environ)
-    #                 task = self.tasks[ready_task]
-    #                 env['PYTHONPATH'] = os.path.abspath(task.task_root)
-    #                 process = subprocess.Popen(
-    #                     [
-    #                         'python',
-    #                         os.path.split(__file__)[0] + '/worker.py',
-    #                         task.task_root,
-    #                         task.code_file,
-    #                     ],
-    #                     stdout=sys.stdout,
-    #                     stderr=sys.stderr,
-    #                     env=env,
-    #                     cwd=os.path.split(os.path.abspath(task.task_root))[0]
-    #                 )
-    #                 processes[ready_task] = process
-    #
-    #             while len(processes) > 0:
-    #                 finished = False
-    #                 stop = False
-    #                 for task, process in processes.items():
-    #                     if process.poll() is not None:
-    #                         logger.info('task ' + task + ' finished')
-    #                         # processes.remove((process, task))
-    #                         del processes[task]
-    #                         self.set_finished(task)
-    #                         # logger.info(self.get_ready())
-    #                         if process.returncode != 0:
-    #                             logger.error('task' + task + 'failed')
-    #                             raise KeyboardInterrupt
-    #                         stop = True
-    #                         break
-    #                 if stop:
-    #                     break
-    #                 time.sleep(0.1)
-    #             if finished:
-    #                 break
-    #     except KeyboardInterrupt:
-    #         logger.info('Keyboard interrupt')
-    #         for p in processes.values():
-    #             p.terminate()
-    #             p.wait()
-
-    async def create_process(self, ready_task):
+    async def create_process(self, ready_task: str):
         logger.debug('running task ' + ready_task)
         env = dict(os.environ)
         task = self.tasks[ready_task]
@@ -630,13 +579,22 @@ class Scheduler:
         """
         create a coroutine and make it propagate
         """
-        logger.info('propagate tasks')
+        if self.stop_new_job:
+            logger.info('stoped')
+            return
+        logger.debug('propagate tasks')
         asyncio.create_task(self.coroutines_tasks.put(
             asyncio.create_task(self.try_available_job())
         ))
 
     async def try_available_job(self):
+        if self.stop_new_job:
+            logger.info('stoped')
+            return
         ready_job = self.get_ready()
+        if ready_job in self.processes:
+            logger.warning(f'job already running {ready_job}')
+            self.set_running(ready_job)
         logger.debug(f'trying job {ready_job}')
         if ready_job is None:
             return
@@ -670,8 +628,28 @@ class Scheduler:
                 step=500,
         ):
             logger.debug(changes)
-            await self.async_terminate_all_process()
+            self.stop_new_job = True
+            process = self.processes
+            self.processes = {}
+            # await self.async_terminate_all_process()
+            ori_tasks = self.tasks
             self.refresh()
+            end_process = []
+            for k, v in process.items():
+                if (self._g.property[k]['status'] == 'ready'
+                        and self.tasks[k].code_hash == ori_tasks[k].code_hash):
+                    # keep this
+                    self.set_running(k)
+                    self._g.property[k]['status'] = 'running'
+                    self.processes[k] = v
+                    logger.info(f'keeping process {k}')
+                else:
+                    end_process.append(v)
+                    logger.info(
+                        f'killing process:{k} {self._g.property[k]["status"]}')
+            # end unnecessary processes
+            await self.async_terminate_all_process(end_process)
+            self.stop_new_job = False
             self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
@@ -694,9 +672,10 @@ class Scheduler:
 
         result = {}
         for task_name, task in self.tasks.items():
-            position_xy = pos.get(task_name, (0,0))
+            position_xy = pos.get(task_name, (0, 0))
             prop = self._g.property.get(task_name, {})
-            label = task_name+'<br>' + '<br>'.join(f'{a}:{b}' for a,b in prop.items())
+            label = task_name + '<br>' + \
+                '<br>'.join(f'{a}:{b}' for a, b in prop.items())
             bg_color = color_map.get(prop.get('status', None), None)
             elements.append(dict(
                 id=task_name,
@@ -717,12 +696,12 @@ class Scheduler:
             # payload['prop'] = self._g.property[task_name]
             # payload['pos'] = pos[task_name]
             # result[task_name] = payload
-        return {e['id']:e for e in elements}
+        return {e['id']: e for e in elements}
 
     async def async_socket_on_connect(self):
         logger.info('connect')
         result = await self.sio.call('join', data=dict(room=self.root))
-        logger.info(result)
+        logger.info('connected')
 
     async def async_socket_task(self):
         logger.info('socker task started ...')
@@ -786,10 +765,12 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
     for dir_path, _, file_names in os.walk(target):
         for file in file_names:
             if file == 'task.py':
-                # logger.debug(f'parsing {dir_path}')
-                file_path = os.path.join(dir_path, file)
-                task_info = extract_anno(target, file_path)
-                tasks[task_info.task_name] = task_info
+                try:
+                    file_path = os.path.join(dir_path, file)
+                    task_info = extract_anno(target, file_path)
+                    tasks[task_info.task_name] = task_info
+                except IOError as e:
+                    logger.info(e)
     stop = False
     while not stop:
         stop = True
@@ -818,7 +799,7 @@ def run_target(target: str, task=None, debug=False):
     if debug:
         logger.info('IN DEBUG MODE')
     scheduler = Scheduler(target, task)
-    scheduler.run_once()
+    # scheduler.run_once()
 
 
 def serve_target(target: str, task=None, addr=None):
