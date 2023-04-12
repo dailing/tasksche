@@ -191,8 +191,8 @@ class TaskSpec:
                 code_hash, t = pickle.load(open(self.result_info, 'rb'))
                 # logger.debug(f'check_hash {code_hash} {self.code_hash}')
                 if code_hash == self.code_hash:
+                    os.utime(self.result_file)
                     return False
-                os.utime(self.result_file)
         except FileNotFoundError:
             # logger.debug(f'result file Not Fund for {self.task_name}')
             return True
@@ -613,6 +613,7 @@ class Scheduler:
             self._init_new_job()
             logger.debug(f'task finished {ready_job}')
         else:
+            del self.processes[ready_job]
             self.set_error(ready_job)
             logger.info(f'error task {ready_job} {ret_code}')
         if self.sio.connected:
