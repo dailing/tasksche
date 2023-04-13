@@ -31,6 +31,7 @@ if not os.path.exists(output_dir):
 
 
 # logger.info(mod)
+error = False
 if debug:
     logger.info('IN DEBUG MODE')
 try:
@@ -55,10 +56,15 @@ try:
             else:
                 output = mod.run(*args, **kwargs)
                 task_info.dump_result(output)
-    shutil.copy2(f'{output_dir}/std_out_{os.getpid()}.txt', f'{output_dir}/std_out.txt')
 except KeyboardInterrupt:
     logger.info(f'{task_info.task_name} exiting...')
+    error = True
+except Exception as e:
+    logger.error(e, exc_info=e, stack_info=True)
+    error = True
     # sys.exit(-1)
+shutil.copy2(f'{output_dir}/std_out_{os.getpid()}.txt', f'{output_dir}/std_out.txt')
 # pickle.dump(output, open(task_info.result_file, 'wb'))
-
+if error:
+    sys.exit(-1)
 # DUMP value

@@ -1,5 +1,5 @@
 <template>
-    <div style="height: 700px">
+    <div style="height: 1200px; width: 100%">
         <VueFlow v-model="element"/>
     </div>
 </template>

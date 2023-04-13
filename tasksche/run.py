@@ -323,8 +323,11 @@ class Graph:
         """
         add an edge from a to b
         """
-        assert a in self.nodes
-        assert b in self.nodes
+        # assert a in self.nodes
+        # assert b in self.nodes
+        for node in (a, b):
+            if not node in self.nodes:
+                logger.warning(f'node {node} not in nodes')
         self.dag[a].append(b)
         self.in_degree[b].append(a)
 
@@ -611,7 +614,7 @@ class Scheduler:
         if ret_code == 0:
             self.set_finished(ready_job)
             self._init_new_job()
-            logger.debug(f'task finished {ready_job}')
+            logger.info(f'task finished {ready_job}')
         else:
             del self.processes[ready_job]
             self.set_error(ready_job)
@@ -637,7 +640,8 @@ class Scheduler:
             self.refresh()
             end_process = []
             for k, v in process.items():
-                if (self._g.property[k]['status'] == 'ready'
+                if (k in self._g.property
+                        and self._g.property[k]['status'] == 'ready'
                         and self.tasks[k].code_hash == ori_tasks[k].code_hash):
                     # keep this
                     self.set_running(k)
@@ -647,7 +651,7 @@ class Scheduler:
                 else:
                     end_process.append(v)
                     logger.info(
-                        f'killing process:{k} {self._g.property[k]["status"]}')
+                        f'killing process:{k}')
             # end unnecessary processes
             await self.async_terminate_all_process(end_process)
             self.stop_new_job = False
@@ -755,6 +759,8 @@ def extract_anno(root, file) -> TaskSpec:
     except yaml.scanner.ScannerError as e:
         print(f"ERROR parse {root} {file}")
         raise e
+    if task_info is None:
+        task_info = {}
     task_info['task_root'] = root
     task_info['task_name'] = task_name
     tki = TaskSpec(**task_info)
@@ -770,8 +776,9 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                     file_path = os.path.join(dir_path, file)
                     task_info = extract_anno(target, file_path)
                     tasks[task_info.task_name] = task_info
-                except IOError as e:
-                    logger.info(e)
+                except Exception as e:
+                    logger.error(f'Error parsing node {target, file_path}, {e}')
+                    # TODO send message about this error node
     stop = False
     while not stop:
         stop = True
