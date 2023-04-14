@@ -62,7 +62,6 @@ class TaskSpec:
     require: Union[Dict[str, str], List[str], None] = None
     inherent: str = None
     virtual: bool = False
-    depend: List[str] = None
     rerun: bool = False
 
     def _after__init__(self):
@@ -106,14 +105,11 @@ class TaskSpec:
             return self.task_name > __o.task_name
         return False
 
-    @property
+    @cached_property
     def depend_files(self):
-        if self.depend is None:
-            return []
         result = []
-        for dep in self.depend:
-            result.append(os.path.join(self.task_root,
-                                       process_path(self.task_root, dep)[1:]))
+        if self.inherent is not None:
+            result.append(os.path.join(self.task_root, self.inherent_task[1:], 'task.py'))
         return result
 
     def clean(self):
@@ -341,7 +337,8 @@ class Graph:
         self.in_degree[b].remove(a)
 
     def _agg(self, map_func, reduce_func, node, result):
-        assert node in self.nodes
+        if node not in self.nodes:
+            logger.error(f'node {node} not in nodes')
         if node in result:
             return result[node]
         self_map = map_func(self.property[node])
@@ -480,7 +477,7 @@ class Scheduler:
             for t2 in t.dependent_tasks:
                 self._g.add_edge(t2, t.task_name)
         self._g.aggragate(
-            lambda x: x['dirty'],
+            lambda x: x.get('dirty', True),
             any,
             nodes=self.targets,
             update='dirty'
@@ -511,7 +508,7 @@ class Scheduler:
 
     def _update_status(self):
         def map_func(prop):
-            if prop['virtual']:
+            if prop.get('virtual', True):
                 return 'finished'
             if 'status' not in prop:
                 if prop['dirty']:
@@ -777,28 +774,8 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                     task_info = extract_anno(target, file_path)
                     tasks[task_info.task_name] = task_info
                 except Exception as e:
-                    logger.error(f'Error parsing node {target, file_path}, {e}')
+                    logger.error(f'Error parsing node {target, file_path}, {e}', exc_info=e, stack_info=True)
                     # TODO send message about this error node
-    stop = False
-    while not stop:
-        stop = True
-        for k, v in tasks.items():
-            if v.depend is None:
-                v.depend = []
-            if v.inherent_task is not None:
-                if v.inherent_task not in tasks:
-                    logger.error(f'{v.inherent_task} not exist, {v}')
-                    raise FileNotFoundError
-                inh_task = tasks[v.inherent_task]
-                if inh_task.task_name + '/task.py' not in v.depend:
-                    v.depend.append(inh_task.task_name + '/task.py')
-                    # logger.debug(f'adding {inh_task.task_name + "/task.py"}')
-                if inh_task.depend is not None:
-                    for dep in inh_task.depend:
-                        if dep not in v.depend:
-                            # logger.debug(f'adding {dep}')
-                            v.depend.append(dep)
-                            stop = False
     return tasks
 
 
