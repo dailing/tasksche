@@ -63,6 +63,7 @@ class TaskSpec:
     inherent: str = None
     virtual: bool = False
     rerun: bool = False
+    export: bool = False
 
     def _after__init__(self):
         m = md5()
@@ -296,7 +297,7 @@ class Graph:
         self.nodes: Set[str] = set()
         self.dag: Dict[str, List[str]] = defaultdict(list)
         self.in_degree: Dict[str, List[str]] = defaultdict(list)
-        self.property: Dict[str:Dict[str, Any]] = defaultdict(dict)
+        self.property: Dict[str, Dict[str, Any]] = defaultdict(dict)
 
         nodes: List[str] = nodes or []
         edges: List[Tuple[str, str]] = edges or []
@@ -451,7 +452,7 @@ class Scheduler:
         self.targets = targets
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
-        self.processes: Dict[str:asyncio.subprocess.Process] = {}
+        self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self.coroutines_tasks: asyncio.Queue = None
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
@@ -508,8 +509,8 @@ class Scheduler:
 
     def _update_status(self):
         def map_func(prop):
-            if prop.get('virtual', True):
-                return 'finished'
+            if prop.get('virtual', False):
+                return 'virtual'
             if 'status' not in prop:
                 if prop['dirty']:
                     return 'pending'
@@ -518,10 +519,12 @@ class Scheduler:
             else:
                 return prop['status']
 
-        def reduce_func(props: List[Dict[str, Any]]):
+        def reduce_func(props: List[str]):
             ready = True
             if props[-1] != 'pending':
                 return props[-1]
+            if 'virtual' in props:
+                return 'virtual'
 
             for s in props[:-1]:
                 if s != 'finished':
@@ -561,7 +564,9 @@ class Scheduler:
     async def create_process(self, ready_task: str):
         logger.debug('running task ' + ready_task)
         env = dict(os.environ)
-        task = self.tasks[ready_task]
+        task = self.tasks.get(ready_task, None)
+        if task is None:
+            return None
         env['PYTHONPATH'] = os.path.abspath(task.task_root)
         process = await asyncio.create_subprocess_exec(
             'python',
@@ -604,16 +609,16 @@ class Scheduler:
             await self.sio.emit('graph_change')
         assert ready_job not in self.processes
         p = await self.create_process(ready_job)
-        self.processes[ready_job] = p
         # call other jobs if avail
         self._init_new_job()
+        self.processes[ready_job] = p
         ret_code = await p.wait()
         if ret_code == 0:
             self.set_finished(ready_job)
             self._init_new_job()
             logger.info(f'task finished {ready_job}')
         else:
-            del self.processes[ready_job]
+            # del self.processes[ready_job]
             self.set_error(ready_job)
             logger.info(f'error task {ready_job} {ret_code}')
         if self.sio.connected:
@@ -634,6 +639,7 @@ class Scheduler:
             self.processes = {}
             # await self.async_terminate_all_process()
             ori_tasks = self.tasks
+            ori_prop = self._g.property.copy()
             self.refresh()
             end_process = []
             for k, v in process.items():
@@ -649,6 +655,12 @@ class Scheduler:
                     end_process.append(v)
                     logger.info(
                         f'killing process:{k}')
+            # TODO check if previously error run is necessary
+            # if code change or dependent task changes, rerun
+            # for k, prop in ori_prop.items():
+            #     if prop == 'error' and self._g.property.get(k, {}).get('status', '') == 'ready':
+            #         self.set_error(k)
+            #         logger.info(f'{k} omitting originally error but not changed')
             # end unnecessary processes
             await self.async_terminate_all_process(end_process)
             self.stop_new_job = False
@@ -664,7 +676,7 @@ class Scheduler:
             error='red',
         )
         from networkx.drawing.nx_agraph import graphviz_layout
-        logger.info('on_get_task')
+        logger.debug('on_get_task')
         G = nx.DiGraph()
         for task_name, task in self.tasks.items():
             for dep in task.dependent_tasks:
