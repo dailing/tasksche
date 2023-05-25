@@ -453,7 +453,7 @@ class Scheduler:
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
-        self.coroutines_tasks: asyncio.Queue = None
+        self.coroutines_tasks: Dict[str, asyncio.Task] = None
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
         self.stop_new_job = False
@@ -594,7 +594,7 @@ class Scheduler:
 
     async def try_available_job(self):
         if self.stop_new_job:
-            logger.info('stoped')
+            logger.info('stopped')
             return
         ready_job = self.get_ready()
         if ready_job in self.processes:
@@ -610,9 +610,13 @@ class Scheduler:
         assert ready_job not in self.processes
         p = await self.create_process(ready_job)
         # call other jobs if avail
-        self._init_new_job()
         self.processes[ready_job] = p
+        self._init_new_job()
         ret_code = await p.wait()
+        if self.stop_new_job:
+            # if stop_new job is set, then the result should be ignored
+            logger.info('task ignored')
+            return
         if ret_code == 0:
             self.set_finished(ready_job)
             self._init_new_job()
@@ -648,20 +652,13 @@ class Scheduler:
                         and self.tasks[k].code_hash == ori_tasks[k].code_hash):
                     # keep this
                     self.set_running(k)
-                    self._g.property[k]['status'] = 'running'
+                    # self._g.property[k]['status'] = 'running'
                     self.processes[k] = v
                     logger.info(f'keeping process {k}')
                 else:
                     end_process.append(v)
                     logger.info(
                         f'killing process:{k}')
-            # TODO check if previously error run is necessary
-            # if code change or dependent task changes, rerun
-            # for k, prop in ori_prop.items():
-            #     if prop == 'error' and self._g.property.get(k, {}).get('status', '') == 'ready':
-            #         self.set_error(k)
-            #         logger.info(f'{k} omitting originally error but not changed')
-            # end unnecessary processes
             await self.async_terminate_all_process(end_process)
             self.stop_new_job = False
             self._init_new_job()
