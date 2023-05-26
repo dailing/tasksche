@@ -1,9 +1,14 @@
 import pickle
 import sys
 import importlib
-from tasksche.run import extract_anno
-import time
-from tasksche.run import get_logger
+import os
+
+try:
+    from tasksche.run import extract_anno, get_logger
+except ImportError:
+    sys.path.append(os.path.split(os.path.split(__file__)[0])[0])
+    from tasksche.run import extract_anno, get_logger
+
 import os
 import contextlib
 import pdb

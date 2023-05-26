@@ -64,9 +64,13 @@ class TaskSpec:
     virtual: bool = False
     rerun: bool = False
     export: bool = False
+    # interval to run the task if following tasks ends
+    interval: int = -1
+    start_time = -1
 
     def _after__init__(self):
         m = md5()
+        logger.info(str((self, self.code_file, self.task_dir, self.task_name)))
         m.update(open(self.code_file, 'rb').read())
         for f in self.depend_files:
             m.update(open(f, 'rb').read())
@@ -176,6 +180,8 @@ class TaskSpec:
         run. Note that this does not count the status of dependent tasks.
         """
         if self.rerun:
+            return True
+        if self.interval > 0 and (self.start_time + self.interval < time.time()):
             return True
         code_update = self.code_update_time
         try:
@@ -290,6 +296,11 @@ def post_process_anno(anno: TaskSpec) -> TaskSpec:
     return anno
 
 
+class QUERY_EXIST:
+    def __init__(self):
+        raise Exception
+
+
 class Graph:
     """a graph class to calculate task dependent relationships"""
 
@@ -391,6 +402,8 @@ class Graph:
         for k, v in query.items():
             if k not in prop:
                 return False
+            if v is QUERY_EXIST:
+                return True
             p = prop[k]
             if isinstance(v, list):
                 if p not in v:
@@ -405,6 +418,12 @@ class Graph:
             if self.match_query(prop, query):
                 return task_name
         return None
+
+    def check_all(self, query: Dict[str, Any]):
+        for task_name, prop in self.property.items():
+            if not self.match_query(prop, query):
+                return False
+        return True
 
     def match_all(self, query: Dict[str, Any]):
         matched = []
@@ -458,6 +477,9 @@ class Scheduler:
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
         self.stop_new_job = False
 
+        self.finished = True
+
+        self.processes_lock = asyncio.Lock()
         self.refresh()
 
     def refresh(self):
@@ -466,6 +488,7 @@ class Scheduler:
         """
         logger.debug('refresh')
         self._g.clear()
+        self.finished = False
         assert len(self.processes) == 0
         # self.processes.clear()
         tasks = parse_target(self.root)
@@ -474,6 +497,8 @@ class Scheduler:
             self._g.add_node(t.task_name)
             self._g.property[t.task_name]['dirty'] = t.dirty
             self._g.property[t.task_name]['virtual'] = t.virtual
+            if t.interval >= 0:
+                self._g.property[t.task_name]['interval'] = t.interval
         for t in tasks.values():
             for t2 in t.dependent_tasks:
                 self._g.add_edge(t2, t.task_name)
@@ -521,17 +546,23 @@ class Scheduler:
 
         def reduce_func(props: List[str]):
             ready = True
-            if props[-1] != 'pending':
-                return props[-1]
+            # if props[-1] != 'pending':
+            #     return props[-1]
             if 'virtual' in props:
                 return 'virtual'
 
             for s in props[:-1]:
                 if s != 'finished':
                     ready = False
-            if ready:
+            if ready and (props[-1] == 'pending'):
                 return 'ready'
-            return 'pending'
+            if 'error' in props[:-1]:
+                return 'error'
+            if 'pending' in props[:-1]:
+                return 'pending'
+            if 'running' in props[:-1]:
+                return 'pending'
+            return props[-1]
 
         self._g.aggragate(
             map_func,
@@ -567,6 +598,7 @@ class Scheduler:
         task = self.tasks.get(ready_task, None)
         if task is None:
             return None
+        task.start_time = time.time()
         env['PYTHONPATH'] = os.path.abspath(task.task_root)
         process = await asyncio.create_subprocess_exec(
             'python',
@@ -596,39 +628,68 @@ class Scheduler:
         if self.stop_new_job:
             logger.info('stopped')
             return
-        ready_job = self.get_ready()
-        if ready_job in self.processes:
-            logger.warning(f'job already running {ready_job}')
+        async with self.processes_lock:
+            ready_job = self.get_ready()
+            if ready_job in self.processes:
+                logger.error(f'job already running {ready_job}')
+                raise Exception
+            logger.debug(f'trying job {ready_job}')
+            if ready_job is None:
+                return
+            logger.info(f'running {ready_job}')
             self.set_running(ready_job)
-        logger.debug(f'trying job {ready_job}')
-        if ready_job is None:
-            return
-        logger.info(f'running {ready_job}')
-        self.set_running(ready_job)
-        if self.sio.connected:
-            await self.sio.emit('graph_change')
-        assert ready_job not in self.processes
-        p = await self.create_process(ready_job)
-        # call other jobs if avail
-        self.processes[ready_job] = p
-        self._init_new_job()
-        ret_code = await p.wait()
-        if self.stop_new_job:
-            # if stop_new job is set, then the result should be ignored
-            logger.info('task ignored')
-            return
-        if ret_code == 0:
-            self.set_finished(ready_job)
+            p = await self.create_process(ready_job)
+            # call other jobs if avail
+            self.processes[ready_job] = p
             self._init_new_job()
-            logger.info(f'task finished {ready_job}')
-        else:
-            # del self.processes[ready_job]
-            self.set_error(ready_job)
-            logger.info(f'error task {ready_job} {ret_code}')
         if self.sio.connected:
             await self.sio.emit('graph_change')
-        # del self.processes[ready_job]
+        ret_code = await p.wait()
+        async with self.processes_lock:
+            if self.stop_new_job:
+                # if stop_new job is set, then the result should be ignored
+                logger.info('task ignored')
+                return
+            if ret_code == 0:
+                self.set_finished(ready_job)
+                self._init_new_job()
+                logger.info(f'task finished {ready_job}')
+            else:
+                # del self.processes[ready_job]
+                self.set_error(ready_job)
+                logger.info(f'error task {ready_job} {ret_code}')
+            if self.sio.connected:
+                await self.sio.emit('graph_change')
+            del self.processes[ready_job]
+            # check if all jobs finished
+            self.check_finish()
+
+    def check_finish(self):
+        # check if task is finished and lunch finished job
+        if self.finished:
+            return
+        if self._g.check_all(dict(status='finished')):
+            # issue finished task
+            self.finished = True
+            asyncio.create_task(self.on_finished())
         logger.debug('exiting job')
+
+    async def on_finished(self):
+        logger.info('finished all')
+        interval_tasks = self._g.match_all(dict(interval=QUERY_EXIST))
+        # logger.info(interval_tasks)
+        assert len(interval_tasks) <= 1
+        if len(interval_tasks) == 0:
+            return
+        task = self.tasks[interval_tasks[0]]
+        logger.info(f'counting down for task {task} {task.interval}s')
+        while not task.dirty:
+            await asyncio.sleep(task.interval - (time.time() - task.start_time))
+        logger.info('trigger interval task')
+        self.set_status(task.task_name, 'ready')
+        self.finished = False
+        self._update_status()
+        self._init_new_job()
 
     async def async_file_watcher_task(self):
         logger.info('file watcher started ...')
@@ -639,31 +700,33 @@ class Scheduler:
         ):
             logger.debug(changes)
             self.stop_new_job = True
-            process = self.processes
-            self.processes = {}
-            # await self.async_terminate_all_process()
-            ori_tasks = self.tasks
-            ori_prop = self._g.property.copy()
-            self.refresh()
-            end_process = []
-            for k, v in process.items():
-                if (k in self._g.property
-                        and self._g.property[k]['status'] == 'ready'
-                        and self.tasks[k].code_hash == ori_tasks[k].code_hash):
-                    # keep this
-                    self.set_running(k)
-                    # self._g.property[k]['status'] = 'running'
-                    self.processes[k] = v
-                    logger.info(f'keeping process {k}')
-                else:
-                    end_process.append(v)
-                    logger.info(
-                        f'killing process:{k}')
-            await self.async_terminate_all_process(end_process)
+            async with self.processes_lock:
+                process = self.processes
+                self.processes = {}
+                # await self.async_terminate_all_process()
+                ori_tasks = self.tasks
+                ori_prop = self._g.property.copy()
+                self.refresh()
+                end_process = []
+                for k, v in process.items():
+                    if (k in self._g.property
+                            and self._g.property[k]['status'] == 'ready'
+                            and self.tasks[k].code_hash == ori_tasks[k].code_hash):
+                        # keep this
+                        self.set_running(k)
+                        # self._g.property[k]['status'] = 'running'
+                        self.processes[k] = v
+                        logger.info(f'keeping process {k}')
+                    else:
+                        end_process.append(v)
+                        logger.info(
+                            f'killing process:{k}')
+                await self.async_terminate_all_process(end_process)
             self.stop_new_job = False
             self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
+        logger.info('on get task')
         elements = []
         color_map = dict(
             ready='yellow',
@@ -686,7 +749,7 @@ class Scheduler:
             position_xy = pos.get(task_name, (0, 0))
             prop = self._g.property.get(task_name, {})
             label = task_name + '<br>' + \
-                '<br>'.join(f'{a}:{b}' for a, b in prop.items())
+                    '<br>'.join(f'{a}:{b}' for a, b in prop.items())
             bg_color = color_map.get(prop.get('status', None), None)
             elements.append(dict(
                 id=task_name,
@@ -715,7 +778,7 @@ class Scheduler:
         logger.info('connected')
 
     async def async_socket_task(self):
-        logger.info('socker task started ...')
+        logger.info('socket task started ...')
         # connect to sockerIO server for event dispatch
         if self.sock_addr is not None:
             try:
@@ -733,7 +796,7 @@ class Scheduler:
         self.coroutines_tasks = asyncio.Queue()
         asyncio.create_task(self.async_file_watcher_task())
         asyncio.create_task(self.async_socket_task())
-
+        self.check_finish()
         # start running
         self._init_new_job()
         while True:
@@ -783,8 +846,12 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                     task_info = extract_anno(target, file_path)
                     tasks[task_info.task_name] = task_info
                 except Exception as e:
-                    logger.error(f'Error parsing node {target, file_path}, {e}', exc_info=e, stack_info=True)
+                    logger.error(f'{task_info.code_file} {task_info.task_dir} {task_info.task_name}')
+                    logger.error(f'Error parsing node {target}, {file_path}, {e}', exc_info=e, stack_info=True)
+                    logger.error(str(os.stat(file_path)))
+                    logger.error(os.path.abspath('.'))
                     # TODO send message about this error node
+                    raise e
     return tasks
 
 

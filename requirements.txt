@@ -5,3 +5,4 @@ watchfiles
 python-socketio
 networkx
 pygraphviz
+aiohttp
