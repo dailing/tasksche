@@ -6,3 +6,7 @@ python-socketio
 networkx
 pygraphviz
 aiohttp
+requests
+beautifulsoup4
+pymongo
+ratelimit

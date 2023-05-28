@@ -45,7 +45,7 @@ def get_logger(name: str, print_level=logging.DEBUG):
     return logger_obj
 
 
-logger = get_logger('runrun', print_level=logging.INFO)
+logger = get_logger('runner', print_level=logging.INFO)
 
 
 def pprint_str(*args, **kwargs):
@@ -56,7 +56,7 @@ def pprint_str(*args, **kwargs):
 
 
 @dataclass
-class TaskSpec:
+class _TaskSpec:
     task_root: str
     task_name: str
     require: Union[Dict[str, str], List[str], None] = None
@@ -64,17 +64,34 @@ class TaskSpec:
     virtual: bool = False
     rerun: bool = False
     export: bool = False
-    # interval to run the task if following tasks ends
-    interval: int = -1
-    start_time = -1
+    # expire to run the task if following tasks ends
+    expire: int = -1
+    end_time = -1
 
-    def _after__init__(self):
+
+class TaskSpec(_TaskSpec):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.code_hash = self._get_hash()
+
+        require = self.get('require', {})
+        if require is None:
+            require = {}
+        if isinstance(require, list):
+            it = enumerate(require)
+        else:
+            it = require.items()
+        for k, v in it:
+            require[k] = process_reference(v, self)
+            self.require = require
+
+    def _get_hash(self) -> str:
         m = md5()
         logger.info(str((self, self.code_file, self.task_dir, self.task_name)))
         m.update(open(self.code_file, 'rb').read())
         for f in self.depend_files:
             m.update(open(f, 'rb').read())
-        self.code_hash = m.hexdigest()
+        return m.hexdigest()
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -181,7 +198,7 @@ class TaskSpec:
         """
         if self.rerun:
             return True
-        if self.interval > 0 and (self.start_time + self.interval < time.time()):
+        if self.expire > 0 and (self.end_time + self.expire < time.time()):
             return True
         code_update = self.code_update_time
         try:
@@ -281,21 +298,6 @@ def process_reference(ref, task_spec: TaskSpec):
     return ref
 
 
-def post_process_anno(anno: TaskSpec) -> TaskSpec:
-    anno._after__init__()
-    require = anno.get('require', {})
-    if require is None:
-        require = {}
-    if isinstance(require, list):
-        it = enumerate(require)
-    else:
-        it = require.items()
-    for k, v in it:
-        require[k] = process_reference(v, anno)
-        anno.require = require
-    return anno
-
-
 class QUERY_EXIST:
     def __init__(self):
         raise Exception
@@ -306,8 +308,8 @@ class Graph:
 
     def __init__(self, nodes=None, edges=None):
         self.nodes: Set[str] = set()
-        self.dag: Dict[str, List[str]] = defaultdict(list)
-        self.in_degree: Dict[str, List[str]] = defaultdict(list)
+        self.dag: Dict[str, Set[str]] = defaultdict(set)
+        self.in_degree: Dict[str, Set[str]] = defaultdict(set)
         self.property: Dict[str, Dict[str, Any]] = defaultdict(dict)
 
         nodes: List[str] = nodes or []
@@ -331,13 +333,11 @@ class Graph:
         """
         add an edge from a to b
         """
-        # assert a in self.nodes
-        # assert b in self.nodes
         for node in (a, b):
-            if not node in self.nodes:
+            if node not in self.nodes:
                 logger.warning(f'node {node} not in nodes')
-        self.dag[a].append(b)
-        self.in_degree[b].append(a)
+        self.dag[a].add(b)
+        self.in_degree[b].add(a)
 
     def remove_edge(self, a, b):
         """
@@ -347,6 +347,18 @@ class Graph:
         assert b in self.nodes
         self.dag[a].remove(b)
         self.in_degree[b].remove(a)
+
+    def remove_node(self, n):
+        """
+        remove node n from the graph
+        """
+        assert n in self.nodes
+        for t in self.dag[n]:
+            self.in_degree[t].remove(n)
+        if n in self.dag:
+            del self.dag[n]
+        del self.property[n]
+        self.nodes.remove(n)
 
     def _agg(self, map_func, reduce_func, node, result):
         if node not in self.nodes:
@@ -363,7 +375,7 @@ class Graph:
         result[node] = r
         return r
 
-    def aggragate(self, map_func, reduce_func, nodes=None, update=None):
+    def aggregate(self, map_func, reduce_func, nodes=None, update=None):
         """
         aggregate the property of a node
         """
@@ -389,13 +401,13 @@ class Graph:
         """
         return list of nodes if any func(n) is True for n in its child nodes
         """
-        return self.aggragate(map_func, any)
+        return self.aggregate(map_func, any)
 
     def all(self, map_func):
         """
         return list of nodes if all func(n) is True for n in its child nodes
         """
-        return self.aggragate(map_func, all)
+        return self.aggregate(map_func, all)
 
     @staticmethod
     def match_query(prop: Dict[str, Any], query: Dict[str, Any]) -> bool:
@@ -471,16 +483,36 @@ class Scheduler:
         self.targets = targets
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
-        self.processes: Dict[str, asyncio.subprocess.Process] = {}
-        self.coroutines_tasks: Dict[str, asyncio.Task] = None
+        self.processes: Dict[str, Tuple[asyncio.subprocess.Process, asyncio.Task]] = {}
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
         self.stop_new_job = False
 
         self.finished = True
 
-        self.processes_lock = asyncio.Lock()
+        self.processes_lock: asyncio.Lock = None
+        self.new_task_lock: asyncio.Lock = None
         self.refresh()
+
+    def add_tasks(self, tasks: List[TaskSpec]):
+        for t in tasks:
+            assert t.task_name not in self.tasks
+            self.tasks[t.task_name] = t
+            self._g.add_node(t.task_name)
+            self._g.property[t.task_name]['dirty'] = t.dirty
+            self._g.property[t.task_name]['virtual'] = t.virtual
+            if t.expire >= 0:
+                self._g.property[t.task_name]['expire'] = t.expire
+        for t in tasks:
+            for t2 in t.dependent_tasks:
+                self._g.add_edge(t2, t.task_name)
+        self._g.aggregate(
+            lambda x: x.get('dirty', True),
+            any,
+            nodes=self.targets,
+            update='dirty'
+        )
+        self._update_status()
 
     def refresh(self):
         """
@@ -492,26 +524,7 @@ class Scheduler:
         assert len(self.processes) == 0
         # self.processes.clear()
         tasks = parse_target(self.root)
-        self.tasks = tasks
-        for t in self.tasks.values():
-            self._g.add_node(t.task_name)
-            self._g.property[t.task_name]['dirty'] = t.dirty
-            self._g.property[t.task_name]['virtual'] = t.virtual
-            if t.interval >= 0:
-                self._g.property[t.task_name]['interval'] = t.interval
-        for t in tasks.values():
-            for t2 in t.dependent_tasks:
-                self._g.add_edge(t2, t.task_name)
-        self._g.aggragate(
-            lambda x: x.get('dirty', True),
-            any,
-            nodes=self.targets,
-            update='dirty'
-        )
-        # for task_name, prop in self._g.property.items():
-        # if prop['dirty']:
-        #     self.tasks[task_name].clean()
-        self._update_status()
+        self.add_tasks(list(tasks.values()))
 
     async def async_terminate_all_process(self, list_of_process: List[asyncio.subprocess.Process]):
         """
@@ -564,7 +577,7 @@ class Scheduler:
                 return 'pending'
             return props[-1]
 
-        self._g.aggragate(
+        self._g.aggregate(
             map_func,
             reduce_func,
             nodes=self.targets,
@@ -598,7 +611,6 @@ class Scheduler:
         task = self.tasks.get(ready_task, None)
         if task is None:
             return None
-        task.start_time = time.time()
         env['PYTHONPATH'] = os.path.abspath(task.task_root)
         process = await asyncio.create_subprocess_exec(
             'python',
@@ -617,18 +629,16 @@ class Scheduler:
         create a coroutine and make it propagate
         """
         if self.stop_new_job:
-            logger.info('stoped')
-            return
-        logger.debug('propagate tasks')
-        asyncio.create_task(self.coroutines_tasks.put(
-            asyncio.create_task(self.try_available_job())
-        ))
-
-    async def try_available_job(self):
-        if self.stop_new_job:
             logger.info('stopped')
             return
-        async with self.processes_lock:
+        logger.debug('propagate tasks')
+        asyncio.create_task(self.try_available_job())
+
+    async def try_available_job(self):
+        if self.new_task_lock.locked():
+            logger.info('stopped')
+            return
+        async with self.new_task_lock, self.processes_lock:
             ready_job = self.get_ready()
             if ready_job in self.processes:
                 logger.error(f'job already running {ready_job}')
@@ -640,7 +650,7 @@ class Scheduler:
             self.set_running(ready_job)
             p = await self.create_process(ready_job)
             # call other jobs if avail
-            self.processes[ready_job] = p
+            self.processes[ready_job] = (p, asyncio.current_task())
             self._init_new_job()
         if self.sio.connected:
             await self.sio.emit('graph_change')
@@ -651,6 +661,7 @@ class Scheduler:
                 logger.info('task ignored')
                 return
             if ret_code == 0:
+                self.tasks[ready_job].end_time = time.time()
                 self.set_finished(ready_job)
                 self._init_new_job()
                 logger.info(f'task finished {ready_job}')
@@ -658,11 +669,11 @@ class Scheduler:
                 # del self.processes[ready_job]
                 self.set_error(ready_job)
                 logger.info(f'error task {ready_job} {ret_code}')
-            if self.sio.connected:
-                await self.sio.emit('graph_change')
             del self.processes[ready_job]
             # check if all jobs finished
             self.check_finish()
+        if self.sio.connected:
+            await self.sio.emit('graph_change')
 
     def check_finish(self):
         # check if task is finished and lunch finished job
@@ -676,16 +687,17 @@ class Scheduler:
 
     async def on_finished(self):
         logger.info('finished all')
-        interval_tasks = self._g.match_all(dict(interval=QUERY_EXIST))
-        # logger.info(interval_tasks)
-        assert len(interval_tasks) <= 1
-        if len(interval_tasks) == 0:
+        expire_task_names = self._g.match_all(dict(expire=QUERY_EXIST))
+        if len(expire_task_names) == 0:
             return
-        task = self.tasks[interval_tasks[0]]
-        logger.info(f'counting down for task {task} {task.interval}s')
+        expire_tasks = [self.tasks[i] for i in expire_task_names]
+        now = time.time()
+        expire_times = [t.expire - (now - t.end_time) for t in expire_tasks]
+        task = expire_tasks[expire_times.index(min(expire_times))]
+        logger.info(f'counting down for task {task} {task.expire}s')
         while not task.dirty:
-            await asyncio.sleep(task.interval - (time.time() - task.start_time))
-        logger.info('trigger interval task')
+            await asyncio.sleep(task.expire - (time.time() - task.end_time))
+        logger.info('trigger expire task')
         self.set_status(task.task_name, 'ready')
         self.finished = False
         self._update_status()
@@ -693,40 +705,51 @@ class Scheduler:
 
     async def async_file_watcher_task(self):
         logger.info('file watcher started ...')
+        logger.info(self.root)
         async for changes in awatch(
                 self.root,
                 recursive=True,
                 step=500,
         ):
             logger.debug(changes)
-            self.stop_new_job = True
-            async with self.processes_lock:
-                process = self.processes
-                self.processes = {}
-                # await self.async_terminate_all_process()
-                ori_tasks = self.tasks
-                ori_prop = self._g.property.copy()
-                self.refresh()
-                end_process = []
-                for k, v in process.items():
-                    if (k in self._g.property
-                            and self._g.property[k]['status'] == 'ready'
-                            and self.tasks[k].code_hash == ori_tasks[k].code_hash):
-                        # keep this
-                        self.set_running(k)
-                        # self._g.property[k]['status'] = 'running'
-                        self.processes[k] = v
-                        logger.info(f'keeping process {k}')
-                    else:
-                        end_process.append(v)
-                        logger.info(
-                            f'killing process:{k}')
-                await self.async_terminate_all_process(end_process)
-            self.stop_new_job = False
-            self._init_new_job()
+            # TODO rewrite logic here
+            async with self.new_task_lock:
+                tasks = parse_target(self.root)
+
+                removed_keys = list(self.tasks.keys()) - set(tasks.keys())
+                added_keys = list(tasks.keys()) - set(self.tasks.keys())
+                changed_hash_keys = []
+
+                for key in set(tasks.keys()) & set(self.tasks.keys()):
+                    if tasks[key].code_hash != self.tasks[key].code_hash:
+                        changed_hash_keys.append(key)
+
+                # terminate all tasks if needed
+                process_to_end = []
+                async with self.processes_lock:
+                    for task_name in changed_hash_keys + removed_keys:
+                        if task_name in self.processes:
+                            process_to_end.append(task_name)
+                logger.info(process_to_end)
+                for task_name in process_to_end:
+                    if task_name not in self.processes:
+                        continue
+                    p, cr = self.processes[task_name]
+                    p.terminate()
+                    await cr
+
+                # update status, and other things here
+                async with self.processes_lock:
+                    # remove nodes
+                    for r in removed_keys + changed_hash_keys:
+                        del self.tasks[r]
+                        self._g.remove_node(r)
+                    # add new Nodes
+                    task_to_add = [tasks[i] for i in (changed_hash_keys + added_keys)]
+                    self.add_tasks(task_to_add)
+
 
     async def async_socket_on_get_tasks(self):
-        logger.info('on get task')
         elements = []
         color_map = dict(
             ready='yellow',
@@ -737,19 +760,18 @@ class Scheduler:
         )
         from networkx.drawing.nx_agraph import graphviz_layout
         logger.debug('on_get_task')
-        G = nx.DiGraph()
+        g = nx.DiGraph()
         for task_name, task in self.tasks.items():
             for dep in task.dependent_tasks:
-                G.add_edge(dep, task_name)
+                g.add_edge(dep, task_name)
 
-        pos = graphviz_layout(G, prog='dot')
+        pos = graphviz_layout(g, prog='dot')
 
-        result = {}
         for task_name, task in self.tasks.items():
             position_xy = pos.get(task_name, (0, 0))
             prop = self._g.property.get(task_name, {})
-            label = task_name + '<br>' + \
-                    '<br>'.join(f'{a}:{b}' for a, b in prop.items())
+            label = (task_name + '<br>' +
+                     '<br>'.join(f'{a}:{b}' for a, b in prop.items()))
             bg_color = color_map.get(prop.get('status', None), None)
             elements.append(dict(
                 id=task_name,
@@ -775,7 +797,7 @@ class Scheduler:
     async def async_socket_on_connect(self):
         logger.info('connect')
         result = await self.sio.call('join', data=dict(room=self.root))
-        logger.info('connected')
+        logger.info(f'connected, {result}')
 
     async def async_socket_task(self):
         logger.info('socket task started ...')
@@ -793,17 +815,15 @@ class Scheduler:
 
     async def async_serve_main(self):
         # file watcher task
-        self.coroutines_tasks = asyncio.Queue()
+        self.processes_lock = asyncio.Lock()
+        self.new_task_lock = asyncio.Lock()
         asyncio.create_task(self.async_file_watcher_task())
         asyncio.create_task(self.async_socket_task())
         self.check_finish()
         # start running
         self._init_new_job()
         while True:
-            t = await self.coroutines_tasks.get()
-            if t is None:
-                break
-            await t
+            await asyncio.sleep(10)
 
     def serve(self):
         asyncio.run(self.async_serve_main())
@@ -833,7 +853,7 @@ def extract_anno(root, file) -> TaskSpec:
     task_info['task_root'] = root
     task_info['task_name'] = task_name
     tki = TaskSpec(**task_info)
-    return post_process_anno(tki)
+    return tki
 
 
 def parse_target(target: str) -> Dict[str, TaskSpec]:
@@ -841,12 +861,11 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
     for dir_path, _, file_names in os.walk(target):
         for file in file_names:
             if file == 'task.py':
+                file_path = os.path.join(dir_path, file)
                 try:
-                    file_path = os.path.join(dir_path, file)
                     task_info = extract_anno(target, file_path)
                     tasks[task_info.task_name] = task_info
                 except Exception as e:
-                    logger.error(f'{task_info.code_file} {task_info.task_dir} {task_info.task_name}')
                     logger.error(f'Error parsing node {target}, {file_path}, {e}', exc_info=e, stack_info=True)
                     logger.error(str(os.stat(file_path)))
                     logger.error(os.path.abspath('.'))
