@@ -87,7 +87,7 @@ class TaskSpec(_TaskSpec):
 
     def _get_hash(self) -> str:
         m = md5()
-        logger.info(str((self, self.code_file, self.task_dir, self.task_name)))
+        # logger.info(str((self, self.code_file, self.task_dir, self.task_name)))
         m.update(open(self.code_file, 'rb').read())
         for f in self.depend_files:
             m.update(open(f, 'rb').read())
@@ -716,18 +716,18 @@ class Scheduler:
             async with self.new_task_lock:
                 tasks = parse_target(self.root)
 
-                removed_keys = list(self.tasks.keys()) - set(tasks.keys())
-                added_keys = list(tasks.keys()) - set(self.tasks.keys())
-                changed_hash_keys = []
+                removed_keys = set(self.tasks.keys()) - set(tasks.keys())
+                added_keys = set(tasks.keys()) - set(self.tasks.keys())
+                changed_hash_keys = set()
 
                 for key in set(tasks.keys()) & set(self.tasks.keys()):
                     if tasks[key].code_hash != self.tasks[key].code_hash:
-                        changed_hash_keys.append(key)
+                        changed_hash_keys.add(key)
 
                 # terminate all tasks if needed
                 process_to_end = []
                 async with self.processes_lock:
-                    for task_name in changed_hash_keys + removed_keys:
+                    for task_name in (changed_hash_keys | removed_keys):
                         if task_name in self.processes:
                             process_to_end.append(task_name)
                 logger.info(process_to_end)
@@ -741,11 +741,11 @@ class Scheduler:
                 # update status, and other things here
                 async with self.processes_lock:
                     # remove nodes
-                    for r in removed_keys + changed_hash_keys:
+                    for r in (removed_keys | changed_hash_keys):
                         del self.tasks[r]
                         self._g.remove_node(r)
                     # add new Nodes
-                    task_to_add = [tasks[i] for i in (changed_hash_keys + added_keys)]
+                    task_to_add = [tasks[i] for i in (changed_hash_keys | added_keys)]
                     self.add_tasks(task_to_add)
 
 
