@@ -1,11 +1,11 @@
 import argparse
 import inspect
 
-from .run import run_target, clean_target, new_task, serve_target
+from .run import clean_target, new_task, serve_target
 
 
 def _parser():
-    parser = argparse.ArgumentParser('RUNRUN')
+    parser = argparse.ArgumentParser('RUN_RUN')
     _subparser = parser.add_subparsers(
         title='cmd', help='run root', required=True)
     return locals()
@@ -15,21 +15,19 @@ if __name__ == '__main__':
     _parsers = _parser()
 
 
-    def _command(*args, **kwargs):
+    def _command(*_args, **kwargs):
         _subparser = _parsers['_subparser']
 
         def wrap(func):
             func_name = func.__name__
             parser: argparse.ArgumentParser = _subparser.add_parser(
-                func_name, *args, **kwargs)
+                func_name, *_args, **kwargs)
             for k_name, par in inspect.signature(func).parameters.items():
                 required = par.default is inspect.Parameter.empty
                 default = par.default \
                     if par.default is not inspect.Parameter.empty \
                     else None
-                argument_kwargs = {}
-                argument_kwargs['type'] = par.annotation
-                argument_kwargs['default'] = default
+                argument_kwargs = {'type': par.annotation, 'default': default}
                 if par.annotation is bool:
                     argument_kwargs['action'] = 'store_true'
                     del argument_kwargs['type']
@@ -49,11 +47,6 @@ if __name__ == '__main__':
 
 
     @_command()
-    def run(target: str, task: str = None, debug: bool = False):
-        run_target(target, task, debug=debug)
-
-
-    @_command()
     def clean(target: str):
         clean_target(target)
 
@@ -63,7 +56,7 @@ if __name__ == '__main__':
         new_task(target, task)
 
 
-    # args = _parsers['parser'].parse_args(['run', 'export'])
+    # _args = _parsers['parser'].parse_args(['run', 'export'])
     args = _parsers['parser'].parse_args()
 
     call_args = args.__dict__.copy()

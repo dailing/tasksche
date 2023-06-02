@@ -144,13 +144,6 @@ class TaskSpec(_TaskSpec):
             return True
         except Exception as e:
             logger.info(e)
-        # try:
-        #     output_dir = os.path.join(self.task_dir, '_output')
-        #     logger.info(f'removing {output_dir}')
-        #     shutil.rmtree(output_dir, ignore_errors=True)
-        #     # os.removedirs(os.path.join(self.task_dir, '_output'))
-        # except Exception as e:
-        #     logger.info(e)
         return False
 
     @property
@@ -203,18 +196,14 @@ class TaskSpec(_TaskSpec):
         code_update = self.code_update_time
         try:
             result_update = os.stat(self.result_file).st_mtime
-            # logger.debug(dict(
-            #   code_update=code_update, result_update=result_update))
             if code_update < result_update:
                 return False
             else:
                 code_hash, t = pickle.load(open(self.result_info, 'rb'))
-                # logger.debug(f'check_hash {code_hash} {self.code_hash}')
                 if code_hash == self.code_hash:
                     os.utime(self.result_file)
                     return False
         except FileNotFoundError:
-            # logger.debug(f'result file Not Fund for {self.task_name}')
             return True
         return True
 
@@ -260,7 +249,6 @@ class TaskSpec(_TaskSpec):
         if isinstance(self.require, list):
             args = [None] * len(kwargs)
             for k, v in kwargs.items():
-                # logger.info(f'setting key {k} ')
                 args[k] = v
             return args
         return kwargs
@@ -275,13 +263,13 @@ def process_path(task_name, path):
     if not path.startswith('/'):
         path = os.path.join(task_name, path)
     path_filtered = []
-    for subpath in path.split('/'):
-        if subpath == '.':
+    for sub_path in path.split('/'):
+        if sub_path == '.':
             continue
-        if subpath == '..':
+        if sub_path == '..':
             path_filtered.pop()
             continue
-        path_filtered.append(subpath)
+        path_filtered.append(sub_path)
     if path_filtered[0] != '':
         path_filtered = task_name.split('/') + path_filtered
     path_new = '/'.join(path_filtered)
@@ -490,8 +478,8 @@ class Scheduler:
 
         self.finished = True
 
-        self.processes_lock: asyncio.Lock = None
-        self.new_task_lock: asyncio.Lock = None
+        self.processes_lock: Union[asyncio.Lock, None] = None
+        self.new_task_lock: Union[asyncio.Lock, None] = None
         self.refresh()
 
     def add_tasks(self, tasks: List[TaskSpec]):
@@ -525,22 +513,6 @@ class Scheduler:
         # self.processes.clear()
         tasks = parse_target(self.root)
         self.add_tasks(list(tasks.values()))
-
-    async def async_terminate_all_process(self, list_of_process: List[asyncio.subprocess.Process]):
-        """
-        terminate processed running
-        terminate coroutines
-        """
-        logger.info('terminating processes')
-        for v in list_of_process:
-            try:
-                v.terminate()
-            except ProcessLookupError:
-                # process already ended
-                pass
-            await v.wait()
-        # self.processes.clear()
-        # logger.info('terminating end')
 
     def to_pdf(self, path):
         self._g.to_pdf(path)
@@ -747,7 +719,7 @@ class Scheduler:
                     # add new Nodes
                     task_to_add = [tasks[i] for i in (changed_hash_keys | added_keys)]
                     self.add_tasks(task_to_add)
-
+            self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
         elements = []
@@ -872,14 +844,6 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                     # TODO send message about this error node
                     raise e
     return tasks
-
-
-def run_target(target: str, task=None, debug=False):
-    logger.info(f'executing on: {target} ...')
-    if debug:
-        logger.info('IN DEBUG MODE')
-    scheduler = Scheduler(target, task)
-    # scheduler.run_once()
 
 
 def serve_target(target: str, task=None, addr=None):
