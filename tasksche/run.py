@@ -166,9 +166,6 @@ class TaskSpec(_TaskSpec):
     @property
     def code_update_time(self) -> float:
         code_update = os.stat(self.code_file).st_mtime
-        # if self.inherent_task is not None:
-        #     code_update = max(code_update, os.stat(
-        #         self.inherent_task_file).st_mtime)
         for dep in self.depend_files:
             code_update = max(
                 code_update,
@@ -257,6 +254,25 @@ class TaskSpec(_TaskSpec):
         pickle.dump(result, open(self.result_file, 'wb'))
         pickle.dump((self.code_hash, time.time()),
                     open(self.result_info, 'wb'))
+
+
+class TaskSpecEndTask(TaskSpec):
+    task_name = '_end'
+
+    def __init__(self, dependent_tasks):
+        super().__init__(task_name=self.task_name, task_root=None)
+        self._dependent_tasks = dependent_tasks
+
+    @property
+    def dirty(self) -> bool:
+        return True
+
+    def _get_hash(self) -> str:
+        return '0' * 32
+
+    @property
+    def dependent_tasks(self):
+        return self._dependent_tasks
 
 
 def process_path(task_name, path):
@@ -381,7 +397,10 @@ class Graph:
         # elif isinstance(update, callable):
         #     for k, v in result.items():
         #         update(self.property[k], v)
+        elif update is None:
+            pass
         else:
+            logger.error(f'error update value {update}')
             raise Exception()
         return result
 
@@ -476,22 +495,40 @@ class Scheduler:
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
         self.stop_new_job = False
 
-        self.finished = True
+        self.finished = False
 
         self.processes_lock: Union[asyncio.Lock, None] = None
         self.new_task_lock: Union[asyncio.Lock, None] = None
-        self.refresh()
+        tasks = parse_target(self.root)
+        self.add_tasks(list(tasks.values()))
 
     def add_tasks(self, tasks: List[TaskSpec]):
+        if '_end' in self._g.nodes:
+            self._g.remove_node('_end')
+        out_degree = defaultdict(lambda: 0)
         for t in tasks:
             assert t.task_name not in self.tasks
             self.tasks[t.task_name] = t
+        targets = self.targets
+        if targets is None:
+            targets = self.tasks.keys()
+        for t in targets:
+            for dep_task in self.tasks[t].dependent_tasks:
+                out_degree[dep_task] += 1
+        sink_nodes = []
+        for t in targets:
+            if t not in out_degree and not self.tasks[t].virtual:
+                sink_nodes.append(t)
+        task_end = TaskSpecEndTask(sink_nodes)
+        self.tasks[task_end.task_name] = task_end
+        all_task = tasks + [task_end]
+        for t in all_task:
             self._g.add_node(t.task_name)
             self._g.property[t.task_name]['dirty'] = t.dirty
             self._g.property[t.task_name]['virtual'] = t.virtual
             if t.expire >= 0:
                 self._g.property[t.task_name]['expire'] = t.expire
-        for t in tasks:
+        for t in all_task:
             for t2 in t.dependent_tasks:
                 self._g.add_edge(t2, t.task_name)
         self._g.aggregate(
@@ -500,19 +537,8 @@ class Scheduler:
             nodes=self.targets,
             update='dirty'
         )
-        self._update_status()
 
-    def refresh(self):
-        """
-            rescan files on disk and refresh everything
-        """
-        logger.debug('refresh')
-        self._g.clear()
-        self.finished = False
-        assert len(self.processes) == 0
-        # self.processes.clear()
-        tasks = parse_target(self.root)
-        self.add_tasks(list(tasks.values()))
+        self._update_status()
 
     def to_pdf(self, path):
         self._g.to_pdf(path)
@@ -600,9 +626,6 @@ class Scheduler:
         """
         create a coroutine and make it propagate
         """
-        if self.stop_new_job:
-            logger.info('stopped')
-            return
         logger.debug('propagate tasks')
         asyncio.create_task(self.try_available_job())
 
@@ -612,9 +635,13 @@ class Scheduler:
             return
         async with self.new_task_lock, self.processes_lock:
             ready_job = self.get_ready()
+            if ready_job == TaskSpecEndTask.task_name:
+                # end of tasks
+                asyncio.create_task(self.on_finished())
+                return
             if ready_job in self.processes:
                 logger.error(f'job already running {ready_job}')
-                raise Exception
+                raise Exception()
             logger.debug(f'trying job {ready_job}')
             if ready_job is None:
                 return
@@ -628,10 +655,6 @@ class Scheduler:
             await self.sio.emit('graph_change')
         ret_code = await p.wait()
         async with self.processes_lock:
-            if self.stop_new_job:
-                # if stop_new job is set, then the result should be ignored
-                logger.info('task ignored')
-                return
             if ret_code == 0:
                 self.tasks[ready_job].end_time = time.time()
                 self.set_finished(ready_job)
@@ -643,36 +666,27 @@ class Scheduler:
                 logger.info(f'error task {ready_job} {ret_code}')
             del self.processes[ready_job]
             # check if all jobs finished
-            self.check_finish()
+            # self.check_finish()
         if self.sio.connected:
             await self.sio.emit('graph_change')
 
-    def check_finish(self):
-        # check if task is finished and lunch finished job
-        if self.finished:
-            return
-        if self._g.check_all(dict(status='finished')):
-            # issue finished task
-            self.finished = True
-            asyncio.create_task(self.on_finished())
-        logger.debug('exiting job')
-
     async def on_finished(self):
-        logger.info('finished all')
-        expire_task_names = self._g.match_all(dict(expire=QUERY_EXIST))
-        if len(expire_task_names) == 0:
-            return
-        expire_tasks = [self.tasks[i] for i in expire_task_names]
-        now = time.time()
-        expire_times = [t.expire - (now - t.end_time) for t in expire_tasks]
-        task = expire_tasks[expire_times.index(min(expire_times))]
-        logger.info(f'counting down for task {task} {task.expire}s')
-        while not task.dirty:
-            await asyncio.sleep(task.expire - (time.time() - task.end_time))
-        logger.info('trigger expire task')
-        self.set_status(task.task_name, 'ready')
-        self.finished = False
-        self._update_status()
+        async with self.processes_lock, self.new_task_lock:
+            logger.info('finished all')
+            expire_task_names = self._g.match_all(dict(expire=QUERY_EXIST))
+            if len(expire_task_names) == 0:
+                return
+            expire_tasks = [self.tasks[i] for i in expire_task_names]
+            now = time.time()
+            expire_times = [t.expire - (now - t.end_time) for t in expire_tasks]
+            task = expire_tasks[expire_times.index(min(expire_times))]
+            logger.info(f'counting down for task {task} {task.expire}s')
+            while not task.dirty:
+                await asyncio.sleep(task.expire - (time.time() - task.end_time))
+            logger.info('trigger expire task')
+            self.set_status(task.task_name, 'ready')
+            self.finished = False
+            self._update_status()
         self._init_new_job()
 
     async def async_file_watcher_task(self):
@@ -684,7 +698,6 @@ class Scheduler:
                 step=500,
         ):
             logger.debug(changes)
-            # TODO rewrite logic here
             async with self.new_task_lock:
                 tasks = parse_target(self.root)
 
@@ -791,7 +804,7 @@ class Scheduler:
         self.new_task_lock = asyncio.Lock()
         asyncio.create_task(self.async_file_watcher_task())
         asyncio.create_task(self.async_socket_task())
-        self.check_finish()
+        # self.check_finish()
         # start running
         self._init_new_job()
         while True:
@@ -838,7 +851,8 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
                     task_info = extract_anno(target, file_path)
                     tasks[task_info.task_name] = task_info
                 except Exception as e:
-                    logger.error(f'Error parsing node {target}, {file_path}, {e}', exc_info=e, stack_info=True)
+                    logger.error(f'Error parsing node {target}, {file_path}, {e}',
+                                 exc_info=e, stack_info=True)
                     logger.error(str(os.stat(file_path)))
                     logger.error(os.path.abspath('.'))
                     # TODO send message about this error node

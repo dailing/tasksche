@@ -1,4 +1,7 @@
 <template>
+    <input type="text" placeholder="'name" v-model="task_name">
+    <input type="button" v-on:click="click" value="refresh">
+
     <div style="height: 1200px; width: 100%">
         <VueFlow v-model="element"/>
     </div>
@@ -17,6 +20,7 @@ export default {
     data() {
         return {
             element: [],
+            task_name: 'export',
         }
     },
     mounted() {
@@ -24,8 +28,12 @@ export default {
     },
     computed: {},
     methods: {
+        click(){
+            console.log('fuck');
+            this.refresh_graph();
+        },
         refresh_graph() {
-            axios.get('/client/tasks/export').then((resp) => {
+            axios.get('/client/tasks/'+this.task_name).then((resp) => {
                 console.log(resp);
                 let new_map = resp.data;
 
@@ -34,7 +42,7 @@ export default {
                 for (const k of this.element) {
                     ori_keys.add(k.id)
                 }
-                for (let i=0; i < this.element.length; i+=1) {
+                for (let i = 0; i < this.element.length; i += 1) {
                     while (!(this.element[i].id in new_map)) {
                         this.element.splice(i, 1);
                     }
@@ -44,7 +52,7 @@ export default {
                 }
                 // adding new elements
                 for (const k in new_map) {
-                    if(!ori_keys.has(k)){
+                    if (!ori_keys.has(k)) {
                         this.element.push(new_map[k])
                     }
                 }
