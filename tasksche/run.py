@@ -526,9 +526,10 @@ class Scheduler:
             self._g.add_node(t.task_name)
             self._g.property[t.task_name]['dirty'] = t.dirty
             self._g.property[t.task_name]['virtual'] = t.virtual
+            self._g.property[t.task_name]['name'] = t.task_name
             if t.expire >= 0:
                 self._g.property[t.task_name]['expire'] = t.expire
-        for t in all_task:
+        for t in self.tasks.values():
             for t2 in t.dependent_tasks:
                 self._g.add_edge(t2, t.task_name)
         self._g.aggregate(
@@ -573,6 +574,8 @@ class Scheduler:
                 return 'pending'
             if 'running' in props[:-1]:
                 return 'pending'
+            if 'ready' in props[:-1]:
+                return 'pending'
             return props[-1]
 
         self._g.aggregate(
@@ -588,10 +591,12 @@ class Scheduler:
         t = self._g.match_one(dict(status='ready'))
         return t
 
-    def set_status(self, task: str, status: str):
+    def set_status(self, task: str, status: Union[str, None]):
         assert isinstance(task, str)
-        assert isinstance(status, str)
-        self._g.property[task]['status'] = status
+        if status is None and 'status' in self._g.property[task]:
+            del self._g.property[task]['status']
+        if isinstance(status, str):
+            self._g.property[task]['status'] = status
         self._update_status()
 
     def set_running(self, task):
@@ -677,6 +682,9 @@ class Scheduler:
             if len(expire_task_names) == 0:
                 return
             expire_tasks = [self.tasks[i] for i in expire_task_names]
+            expire_tasks = list(filter(lambda x: not x.virtual, expire_tasks))
+            if len(expire_tasks) == 0:
+                return
             now = time.time()
             expire_times = [t.expire - (now - t.end_time) for t in expire_tasks]
             task = expire_tasks[expire_times.index(min(expire_times))]
@@ -710,10 +718,14 @@ class Scheduler:
                         changed_hash_keys.add(key)
 
                 # terminate all tasks if needed
-                process_to_end = []
                 async with self.processes_lock:
-                    for task_name in (changed_hash_keys | removed_keys):
-                        if task_name in self.processes:
+                    agg_res = self._g.aggregate(
+                        lambda x: x['name'] in (changed_hash_keys | removed_keys),
+                        any
+                    )
+                    process_to_end = []
+                    for task_name, changed in agg_res.items():
+                        if changed:
                             process_to_end.append(task_name)
                 logger.info(process_to_end)
                 for task_name in process_to_end:
@@ -732,6 +744,12 @@ class Scheduler:
                     # add new Nodes
                     task_to_add = [tasks[i] for i in (changed_hash_keys | added_keys)]
                     self.add_tasks(task_to_add)
+                    for p in process_to_end:
+                        if p in self.tasks:
+                            self.set_status(p, 'pending')
+                    self._update_status()
+                    pprint(self._g.property)
+                    pprint(self._g.in_degree)
             self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
@@ -862,6 +880,8 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
 
 def serve_target(target: str, task=None, addr=None):
     logger.info(f'serve on: {target} ...')
+    if task is not None:
+        task = [task]
     scheduler = Scheduler(target, task, addr)
     scheduler.serve()
 
