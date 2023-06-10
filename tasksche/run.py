@@ -748,8 +748,6 @@ class Scheduler:
                         if p in self.tasks:
                             self.set_status(p, 'pending')
                     self._update_status()
-                    pprint(self._g.property)
-                    pprint(self._g.in_degree)
             self._init_new_job()
 
     async def async_socket_on_get_tasks(self):
