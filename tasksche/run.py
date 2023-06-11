@@ -4,6 +4,7 @@ import logging
 import os
 import os.path
 import pickle
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -732,7 +733,8 @@ class Scheduler:
                     if task_name not in self.processes:
                         continue
                     p, cr = self.processes[task_name]
-                    p.terminate()
+                    p.send_signal(signal.SIGINT)
+                    # p.terminate()
                     await cr
 
                 # update status, and other things here
@@ -745,7 +747,7 @@ class Scheduler:
                     task_to_add = [tasks[i] for i in (changed_hash_keys | added_keys)]
                     self.add_tasks(task_to_add)
                     for p in process_to_end:
-                        if p in self.tasks:
+                        if p in self.tasks and p in self._g.property and 'status' in self._g.property[p]:
                             self.set_status(p, 'pending')
                     self._update_status()
             self._init_new_job()
@@ -774,6 +776,8 @@ class Scheduler:
             label = (task_name + '<br>' +
                      '<br>'.join(f'{a}:{b}' for a, b in prop.items()))
             bg_color = color_map.get(prop.get('status', None), None)
+            if task_name == '_end':
+                bg_color = 'gray'
             elements.append(dict(
                 id=task_name,
                 label=label,
@@ -827,7 +831,11 @@ class Scheduler:
             await asyncio.sleep(10)
 
     def serve(self):
-        asyncio.run(self.async_serve_main())
+        try:
+            asyncio.run(self.async_serve_main())
+        except KeyboardInterrupt:
+            print("END")
+            raise Exception()
 
 
 def extract_anno(root, file) -> TaskSpec:

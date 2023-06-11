@@ -70,7 +70,7 @@ try:
     os.utime(std_rd_file)
 except KeyboardInterrupt:
     logger.info(f'{task_info.task_name} exiting...')
-    error = True
+    sys.exit(-2)
 except Exception as e:
     logger.error(e, exc_info=e, stack_info=True)
     error = True
