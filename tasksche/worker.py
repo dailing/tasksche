@@ -1,7 +1,7 @@
-import pickle
-import sys
 import importlib
 import os
+import pickle
+import sys
 
 try:
     from tasksche.run import extract_anno, get_logger
@@ -9,14 +9,11 @@ except ImportError:
     sys.path.append(os.path.split(os.path.split(__file__)[0])[0])
     from tasksche.run import extract_anno, get_logger
 
-import os
 import contextlib
 import pdb
 import os
-import shutil
 
 logger = get_logger('Worker')
-
 
 root, task = sys.argv[1:]
 
@@ -25,7 +22,7 @@ root, task = sys.argv[1:]
 # logger.info(f'running python path {os.environ.get("PYTHONPATH")}')
 debug = (os.environ.get("DEBUG", None) == 'true')
 task_info = extract_anno(root, task)
-logger.info(f'running {task_info}',)
+logger.info(f'running {task_info}', )
 
 kwargs = task_info.call_arguments
 
@@ -36,6 +33,22 @@ os.makedirs(output_dir, exist_ok=True)
 os.makedirs(std_out_dir, exist_ok=True)
 
 
+def remove_all(directory):
+    # Iterate over all the entries in the directory
+    for entry in os.listdir(directory):
+        entry_path = os.path.join(directory, entry)
+        if os.path.isfile(entry_path):
+            # Remove file
+            os.remove(entry_path)
+        elif os.path.isdir(entry_path):
+            # Remove directory recursively
+            remove_all(entry_path)
+            os.rmdir(entry_path)
+
+
+if task_info.remove and os.path.exists(output_dir):
+    remove_all(output_dir)
+
 # logger.info(mod)
 error = False
 if debug:
@@ -44,7 +57,7 @@ try:
     std_out_file = f'{std_out_dir}/std_out_{os.getpid()}.txt'
     std_rd_file = f'{output_dir}/std_out.txt'
     with (open(std_out_file, 'w') as fout,
-            # open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr
+          # open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr
           ):
         if os.path.exists(std_rd_file):
             os.remove(std_rd_file)
@@ -54,7 +67,7 @@ try:
         #     ferr = sys.stderr
         with (
             # contextlib.redirect_stderr(ferr),
-                contextlib.redirect_stdout(fout)):
+            contextlib.redirect_stdout(fout)):
             mod = importlib.import_module(task_info.module_path)
             mod.__dict__['work_dir'] = os.path.join(output_dir)
             if isinstance(kwargs, dict):

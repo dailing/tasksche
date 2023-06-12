@@ -68,6 +68,7 @@ class _TaskSpec:
     # expire to run the task if following tasks ends
     expire: int = -1
     end_time = -1
+    remove = False
 
 
 class TaskSpec(_TaskSpec):
