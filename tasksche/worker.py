@@ -17,9 +17,6 @@ logger = get_logger('Worker')
 
 root, task = sys.argv[1:]
 
-# logger.info(f'running {root} {task}, {os.path.abspath(".")}')
-# env['PYTHONPATH']
-# logger.info(f'running python path {os.environ.get("PYTHONPATH")}')
 debug = (os.environ.get("DEBUG", None) == 'true')
 task_info = extract_anno(root, task)
 logger.info(f'running {task_info}', )
@@ -56,18 +53,11 @@ if debug:
 try:
     std_out_file = f'{std_out_dir}/std_out_{os.getpid()}.txt'
     std_rd_file = f'{output_dir}/std_out.txt'
-    with (open(std_out_file, 'w') as fout,
-          # open(f'{output_dir}/std_err_{os.getpid()}.txt', 'w') as ferr
-          ):
+    with (open(std_out_file, 'w') as f_out):
         if os.path.exists(std_rd_file):
             os.remove(std_rd_file)
         os.link(std_out_file, std_rd_file, )
-        # if debug:
-        #     fout = sys.stdout
-        #     ferr = sys.stderr
-        with (
-            # contextlib.redirect_stderr(ferr),
-            contextlib.redirect_stdout(fout)):
+        with (contextlib.redirect_stdout(f_out)):
             mod = importlib.import_module(task_info.module_path)
             mod.__dict__['work_dir'] = os.path.join(output_dir)
             if isinstance(kwargs, dict):
