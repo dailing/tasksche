@@ -1,5 +1,6 @@
 import argparse
 import inspect
+from typing import List, get_args, get_origin
 
 from .run import clean_target, new_task, serve_target
 
@@ -31,6 +32,13 @@ if __name__ == '__main__':
                 if par.annotation is bool:
                     argument_kwargs['action'] = 'store_true'
                     del argument_kwargs['type']
+                elif par.annotation is str:
+                    pass
+                elif get_origin(par.annotation) is list:
+                    argument_kwargs['nargs'] = '+'
+                    argument_kwargs['type'] = get_args(par.annotation)[0]
+                else:
+                    raise TypeError("Should Not Be here")
                 if not required:
                     argument_kwargs['required'] = False
                     k_name = '-' + k_name
@@ -42,7 +50,7 @@ if __name__ == '__main__':
 
 
     @_command()
-    def serve(target: str, task: str = None, addr: str = None):
+    def serve(target: str, task: List[str] = None, addr: str = None):
         serve_target(target, task, addr)
 
 

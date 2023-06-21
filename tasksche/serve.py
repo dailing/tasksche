@@ -1,5 +1,5 @@
 import flask_socketio
-from flask import Flask, request
+from flask import Flask, request, redirect
 from flask_socketio import SocketIO
 
 from tasksche.run import get_logger
@@ -52,7 +52,7 @@ def client_rooms_get():
 
 @app.route('/')
 def index():
-    return "FUCK"
+    return redirect('/static/index.html')
 
 
 @app.route('/client/tasks/<task_name>')

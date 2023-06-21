@@ -886,9 +886,9 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
 
 
 def serve_target(target: str, task=None, addr=None):
-    logger.info(f'serve on: {target} ...')
-    if task is not None:
+    if task is not None and isinstance(task, str):
         task = [task]
+    logger.info(f'serve on: {target}, tasks: {task} ...')
     scheduler = Scheduler(target, task, addr)
     scheduler.serve()
 
