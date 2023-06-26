@@ -15,6 +15,7 @@ from io import BytesIO, StringIO
 from pprint import pprint
 from typing import Any, Dict, List, Set, Tuple
 from typing import Union
+from queue import Queue
 
 import networkx as nx
 import socketio
@@ -133,7 +134,8 @@ class TaskSpec(_TaskSpec):
     def depend_files(self):
         result = []
         if self.inherent is not None:
-            result.append(os.path.join(self.task_root, self.inherent_task[1:], 'task.py'))
+            result.append(os.path.join(self.task_root,
+                          self.inherent_task[1:], 'task.py'))
         return result
 
     def clean(self):
@@ -486,13 +488,49 @@ class Graph:
         dot.render(cleanup=False)
 
 
+def match_targets(strs: List[str], patterns: List[str]):
+    """
+    return list of tasks that can match any of the patterns
+    each pattern is a str of wildcards with * to match any number of characters
+    """
+    matches = set()
+    for pattern in patterns:
+        for s in strs:
+            if s in matches:
+                continue
+            if len(s) < len(pattern):
+                continue
+            i, j = 0, 0
+            while i < len(s) and j < len(pattern):
+                if pattern[j] == '*':
+                    while j < len(pattern) and pattern[j] == '*':
+                        j += 1
+                    if j == len(pattern):
+                        matches.add(s)
+                        break
+                    while i < len(s) and s[i] != pattern[j]:
+                        i += 1
+                elif pattern[j] == '?' or pattern[j] == s[i]:
+                    i += 1
+                    j += 1
+                else:
+                    break
+                if j == len(pattern) and i == len(s):
+                    matches.add(s)
+    return list(matches)
+
+
 class Scheduler:
-    def __init__(self, root: str = None, targets=None, sock_addr=None):
+    def __init__(self, root: str = 'None', targets=Union[str, List[str], None], sock_addr=None):
         self._g = Graph()
-        self.targets = targets
+        if isinstance(targets, str):
+            targets = [targets]
+        self._targets = targets
+        self.targets = None
         self.tasks: Dict[str, TaskSpec] = {}
         self.root = root
-        self.processes: Dict[str, Tuple[asyncio.subprocess.Process, asyncio.Task]] = {}
+        self.processes: Dict[str,
+                             Tuple[asyncio.subprocess.Process, asyncio.Task]] = {}
         self.sock_addr = sock_addr
         self.sio: socketio.AsyncClient = socketio.AsyncClient()
         self.stop_new_job = False
@@ -511,16 +549,33 @@ class Scheduler:
         for t in tasks:
             assert t.task_name not in self.tasks
             self.tasks[t.task_name] = t
-        targets = self.targets
+        targets = self._targets
         if targets is None:
             targets = self.tasks.keys()
+        elif isinstance(targets, list):
+            targets = match_targets(list(self.tasks.keys()), targets)
+        else:
+            raise TypeError(
+                f'targets must be a list or None, not type {type(targets)}')
+        bfs_queue = Queue()
+        running_tasks = set()
         for t in targets:
-            for dep_task in self.tasks[t].dependent_tasks:
+            bfs_queue.put(t)
+        while not bfs_queue.empty():
+            cur_task = bfs_queue.get()
+            if cur_task in running_tasks:
+                continue
+            running_tasks.add(cur_task)
+            for dep_task in self.tasks[cur_task].dependent_tasks:
                 out_degree[dep_task] += 1
+                bfs_queue.put(dep_task)
+        running_tasks.add('_end')
         sink_nodes = []
         for t in targets:
             if t not in out_degree and not self.tasks[t].virtual:
                 sink_nodes.append(t)
+        self.targets = sink_nodes
+        logger.info(f'adding target {sink_nodes}')
         task_end = TaskSpecEndTask(sink_nodes)
         self.tasks[task_end.task_name] = task_end
         all_task = tasks + [task_end]
@@ -529,6 +584,8 @@ class Scheduler:
             self._g.property[t.task_name]['dirty'] = t.dirty
             self._g.property[t.task_name]['virtual'] = t.virtual
             self._g.property[t.task_name]['name'] = t.task_name
+            self._g.property[t.task_name]['ignore'] = \
+                t.task_name not in running_tasks
             if t.expire >= 0:
                 self._g.property[t.task_name]['expire'] = t.expire
         for t in self.tasks.values():
@@ -688,7 +745,8 @@ class Scheduler:
             if len(expire_tasks) == 0:
                 return
             now = time.time()
-            expire_times = [t.expire - (now - t.end_time) for t in expire_tasks]
+            expire_times = [t.expire - (now - t.end_time)
+                            for t in expire_tasks]
             task = expire_tasks[expire_times.index(min(expire_times))]
             logger.info(f'counting down for task {task} {task.expire}s')
             while not task.dirty:
@@ -722,7 +780,8 @@ class Scheduler:
                 # terminate all tasks if needed
                 async with self.processes_lock:
                     agg_res = self._g.aggregate(
-                        lambda x: x['name'] in (changed_hash_keys | removed_keys),
+                        lambda x: x['name'] in (
+                            changed_hash_keys | removed_keys),
                         any
                     )
                     process_to_end = []
@@ -745,7 +804,8 @@ class Scheduler:
                         del self.tasks[r]
                         self._g.remove_node(r)
                     # add new Nodes
-                    task_to_add = [tasks[i] for i in (changed_hash_keys | added_keys)]
+                    task_to_add = [tasks[i]
+                                   for i in (changed_hash_keys | added_keys)]
                     self.add_tasks(task_to_add)
                     for p in process_to_end:
                         if p in self.tasks and p in self._g.property and 'status' in self._g.property[p]:
@@ -766,12 +826,16 @@ class Scheduler:
         logger.debug('on_get_task')
         g = nx.DiGraph()
         for task_name, task in self.tasks.items():
+            if self._g.property[task_name]['ignore']:
+                continue
             for dep in task.dependent_tasks:
                 g.add_edge(dep, task_name)
 
         pos = graphviz_layout(g, prog='dot')
 
         for task_name, task in self.tasks.items():
+            if self._g.property[task_name]['ignore']:
+                continue
             position_xy = pos.get(task_name, (0, 0))
             prop = self._g.property.get(task_name, {})
             label = (task_name + '<br>' +
@@ -885,7 +949,7 @@ def parse_target(target: str) -> Dict[str, TaskSpec]:
     return tasks
 
 
-def serve_target(target: str, task=None, addr=None):
+def serve_target(target: str, task: Union[str, List[str]] = None, addr=None):
     if task is not None and isinstance(task, str):
         task = [task]
     logger.info(f'serve on: {target}, tasks: {task} ...')

@@ -3,12 +3,12 @@
     <input type="button" v-on:click="click" value="refresh">
 
     <div style="height: 1200px; width: 100%">
-        <VueFlow v-model="element"/>
+        <VueFlow v-model="element" @node:selected="onNodeSelected" />
     </div>
 </template>
 
 <script>
-import {VueFlow} from '@vue-flow/core'
+import { VueFlow } from '@vue-flow/core'
 import axios from "axios";
 
 export default {
@@ -28,12 +28,21 @@ export default {
     },
     computed: {},
     methods: {
-        click(){
+        click() {
             console.log('fuck');
             this.refresh_graph();
         },
+        onNodeSelected(node) {
+            node.style = {
+                ...node.style,
+                backgroundColor: 'yellow',
+                fontWeight: 'bold',
+                lineWidth: 3,
+            };
+            console.log(node.id);
+        },
         refresh_graph() {
-            axios.get('/client/tasks/'+this.task_name).then((resp) => {
+            axios.get('/client/tasks/' + this.task_name).then((resp) => {
                 console.log(resp);
                 let new_map = resp.data;
 
@@ -71,6 +80,4 @@ export default {
 </script>
 
 <!-- Add "scoped" attribute to limit CSS to this component only -->
-<style scoped>
-
-</style>
+<style scoped></style>
