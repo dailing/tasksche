@@ -70,6 +70,7 @@ class _TaskSpec:
     expire: int = -1
     end_time = -1
     remove = False
+    depend: Union[List[str], None] = None
 
 
 class TaskSpec(_TaskSpec):
@@ -136,6 +137,16 @@ class TaskSpec(_TaskSpec):
         if self.inherent is not None:
             result.append(os.path.join(self.task_root,
                           self.inherent_task[1:], 'task.py'))
+        if self.depend is not None:
+            for dep in self.depend:
+                if not os.path.exists(dep):
+                    # regard it as a task file
+                    dep = process_path(self.task_name, dep)
+                    dep = os.path.join(self.task_root, dep[1:], 'task.py')
+                    if not os.path.exists(dep):
+                        logger.error(f"Dependency {dep} does not exist.")
+                        raise Exception(f"Dependency {dep} does not exist.")
+                result.append(dep)
         return result
 
     def clean(self):
