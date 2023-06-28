@@ -15,7 +15,6 @@ def _parser():
 if __name__ == '__main__':
     _parsers = _parser()
 
-
     def _command(*_args, **kwargs):
         _subparser = _parsers['_subparser']
 
@@ -48,21 +47,21 @@ if __name__ == '__main__':
 
         return wrap
 
-
     @_command()
     def serve(target: str, task: List[str] = None, addr: str = None):
         serve_target(target, task, addr)
 
+    @_command()
+    def run(target: str, task: List[str] = None, addr: str = None):
+        serve_target(target, task, addr, exit=True)
 
     @_command()
     def clean(target: str):
         clean_target(target)
 
-
     @_command()
     def new(target: str, task: str):
         new_task(target, task)
-
 
     # _args = _parsers['parser'].parse_args(['run', 'export'])
     args = _parsers['parser'].parse_args()

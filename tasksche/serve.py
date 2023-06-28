@@ -59,7 +59,12 @@ def index():
 def client_tasks_get(task_name):
     logger.info(task_name)
     logger.info(str(list_rooms))
-    return flask_socketio.call('get_task', to=list_rooms[task_name], timeout=1, namespace=None)
+    return flask_socketio.call(
+        'get_task',
+        to=list_rooms[task_name],
+        timeout=1,
+        namespace=None,
+    )
 
 
 if __name__ == '__main__':
