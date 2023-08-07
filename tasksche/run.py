@@ -68,7 +68,7 @@ class _TaskSpec:
     # expire to run the task if following tasks ends
     expire: int = -1
     end_time = -1
-    remove = False
+    remove: bool = False
     depend: Union[List[str], None] = None
 
 
@@ -913,14 +913,16 @@ class Scheduler:
         # start running
         self._init_new_job()
         while True:
+            new_task_exist = not self.task_queue.empty()
             while not self.task_queue.empty():
                 t = self.task_queue.get()
                 await asyncio.wait_for(t, None)
-            logger.info('end')
+            # logger.info('end')
             # call end task
             if exit:
                 break
-            self.create_process(self.async_on_finished())
+            if new_task_exist:
+                asyncio.create_task(self.async_on_finished())
             await asyncio.sleep(10)
 
     def serve(self, exit=False):

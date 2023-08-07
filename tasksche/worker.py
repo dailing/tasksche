@@ -25,10 +25,8 @@ kwargs = task_info.call_arguments
 
 error = None
 output_dir = os.path.join('_output', task_info.task_dir)
+output_dir_export = os.path.join('_export', task_info.task_dir)
 std_out_dir = os.path.join(output_dir, 'stdout')
-os.makedirs(output_dir, exist_ok=True)
-os.makedirs(std_out_dir, exist_ok=True)
-
 
 def remove_all(directory):
     # Iterate over all the entries in the directory
@@ -45,6 +43,12 @@ def remove_all(directory):
 
 if task_info.remove and os.path.exists(output_dir):
     remove_all(output_dir)
+
+
+
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(std_out_dir, exist_ok=True)
+
 
 # logger.info(mod)
 error = False
@@ -81,7 +85,7 @@ if error:
     sys.exit(-1)
 
 if task_info.export:
-    export_dir = os.path.join(output_dir, 'export')
+    export_dir = os.path.join(output_dir_export, 'export')
     os.makedirs(export_dir, exist_ok=True)
     logger.info(f'export task results to: {export_dir}')
     pickle.dump((args, kwargs), open(

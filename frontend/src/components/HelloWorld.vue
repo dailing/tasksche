@@ -1,14 +1,35 @@
 <template>
-    <input type="text" placeholder="'name" v-model="task_name">
-    <input type="button" v-on:click="click" value="refresh">
+    <a-layout has-sider>
+        <a-layout-sider
+                :style="{ overflow: 'auto', height: '100vh', position: 'fixed', left: 0, top: 0, bottom: 0 }"
+        >
+            <a-menu v-model:selectedKeys="selectedKeys" theme="dark" mode="inline">
+                <a-menu-item key="1">
+                    <user-outlined/>
+                    <span class="nav-text">nav 1</span>
+                </a-menu-item>
+                <a-menu-item key="2">
+                    <video-camera-outlined/>
+                    <span class="nav-text">nav 2</span>
+                </a-menu-item>
+            </a-menu>
+        </a-layout-sider>
+        <a-layout :style="{ marginLeft: '200px' }">
+<!--            <a-layout-header :style="{ background: '#fff', padding: 0 }"/>-->
+            <a-layout-content :style="{ margin: '0px 0px 0', overflow: 'initial' }">
+                <input type="text" placeholder="'name" v-model="task_name">
+                <input type="button" v-on:click="click" value="refresh">
 
-    <div style="height: 1200px; width: 100%">
-        <VueFlow v-model="element" @node:selected="onNodeSelected" />
-    </div>
+                <div style="height: 1200px; width: 100%">
+                    <VueFlow v-model="element" @node:selected="onNodeSelected"/>
+                </div>
+            </a-layout-content>
+        </a-layout>
+    </a-layout>
 </template>
 
 <script>
-import { VueFlow } from '@vue-flow/core'
+import {VueFlow} from '@vue-flow/core'
 import axios from "axios";
 
 export default {
