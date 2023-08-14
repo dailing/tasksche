@@ -51,6 +51,7 @@ os.makedirs(std_out_dir, exist_ok=True)
 
 
 # logger.info(mod)
+# TODO move as much as functional code to run.py for decouple
 error = False
 if debug:
     logger.info('IN DEBUG MODE')

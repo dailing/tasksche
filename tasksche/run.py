@@ -13,14 +13,20 @@ from functools import cached_property
 from hashlib import md5
 from io import BytesIO, StringIO
 from pprint import pprint
-from typing import Any, Dict, List, Set, Tuple
-from typing import Union
 from queue import Queue
+from typing import Any, Callable, Dict, List, Set, Tuple
+from typing_extensions import Self
+from typing import Union
+from enum import Enum
 
-import networkx as nx
-import socketio
 import yaml
-from watchfiles import awatch
+
+try:
+    import networkx as nx
+    import socketio
+    from watchfiles import awatch
+except ImportError:
+    pass
 
 
 def get_logger(name: str, print_level=logging.DEBUG):
@@ -56,6 +62,14 @@ def pprint_str(*args, **kwargs):
     return sio.read()
 
 
+class Status(Enum):
+    STATUS_READY = 'ready'
+    STATUS_FINISHED = 'finished'
+    STATUS_ERROR = 'error'
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+
+
 @dataclass
 class _TaskSpec:
     task_root: str
@@ -70,6 +84,222 @@ class _TaskSpec:
     end_time = -1
     remove: bool = False
     depend: Union[List[str], None] = None
+
+
+class TaskSpec2:
+    def __init__(self, root: str, task_name: str, task_dict: Dict[str, Self]):
+        self.root = root
+        self.task_name = task_name
+        self.task_dict = task_dict
+        self._status = None
+
+    @staticmethod
+    def _get_output_folder(root, taskname):
+        """
+        Get the path of the output directory.
+
+        Args:
+            root (str): The root directory.
+            taskname (str): The name of the task.
+
+        Returns:
+            str: The path of the output directory.
+        """
+        return os.path.join(os.path.dirname(root), '_output', taskname[1:])
+
+    def _update_status(self):
+        pass
+
+    @property
+    def status(self):
+        if self._status is None:
+            self._update_status()
+        return self.status
+
+    @status.setter
+    def status(self, value):
+        if self._status is None:
+            self._status = Status.STATUS_PENDING
+
+    @cached_property
+    def _task_file(self):
+        assert self.task_name.startswith('/')
+        return os.path.join(self.root, self.task_name[1:], 'task.py')
+
+    @cached_property
+    def _cfg_dict(self) -> Dict[str, Any]:
+        payload = bytearray()
+        with open(self._task_file, 'rb') as f:
+            f.readline()
+            while True:
+                line = f.readline()
+                if line == b'"""\n' or line == b'"""':
+                    break
+                payload.extend(line)
+        try:
+            task_info = yaml.safe_load(BytesIO(payload))
+        except yaml.scanner.ScannerError as e:
+            logger.error(f"ERROR parse {self._task_file}")
+            raise e
+        if task_info is None:
+            task_info = {}
+        return task_info
+
+    @cached_property
+    def _require_map(self) -> Dict[Union[int, str], str]:
+        """
+        Generates a dictionary that maps integers or strings to strings
+        based on the 'require' key in the '_cfg_dict' attribute.
+
+        This is the raw requirement dictionary parsed from the task,
+        the required tasks are regulated to the relative path from root 
+
+        Returns:
+            Dict[Union[int, str], str]: The generated dictionary.
+
+        Raises:
+            Exception: If 'require' is neither a list nor a dictionary.
+        """
+        require: Dict[Union[int, str], str] = \
+            self._cfg_dict.get('require', {})
+        if isinstance(require, dict):
+            pass
+        elif isinstance(require, list):
+            require = {i: v for i, v in enumerate(require)}
+        else:
+            raise Exception('require not list or dict')
+        for k, v in require.items():
+            if isinstance(v, str) and v.startswith('$'):
+                task_path = v[1:]
+                task_path = process_path(self.task_name, task_path)
+                require[k] = f'${task_path}'
+        return require
+
+    @cached_property
+    def depend_task(self) -> List[str]:
+        """
+        A list of dependency taskname, without the '$' indicator.
+        Returns:
+            List[str]: A list of dependency tasks.
+        """
+        return list(
+            map(
+                lambda x: x[1:],
+                filter(
+                    lambda x: isinstance(x, str) and x.startswith('$'),
+                    self._require_map.values()
+                )
+            )
+        )
+
+    @cached_property
+    def depend_by(self) -> List[str]:
+        """
+        Get the tasks that directly depend on the current task.
+
+        Returns:
+            List[str]: A list of task names that depend on the current task.
+        """
+        child_tasks = []
+        for task_name, task_spec in self.task_dict.items():
+            if self.task_name in task_spec.depend_task:
+                child_tasks.append(task_name)
+        return child_tasks
+
+    @cached_property
+    def _all_child_task(self):
+        """
+        Get all child tasks of the current task using BFS.
+
+        Returns:
+            List[str]: A list of unique task names.
+        """
+        visited = set()
+        queue = [self.task_name]
+        while len(queue) > 0:
+            task_name = queue.pop(0)
+            if task_name not in visited:
+                visited.add(task_name)
+                task_spec = self.task_dict[task_name]
+                queue.extend(task_spec.depend_by)
+        return list(visited-set([self.task_name]))
+
+    def __repr__(self) -> str:
+        return f"<Task:{self.task_name}>"
+
+
+def search_for_root(base):
+    path = os.path.abspath(base)
+    while path != '/':
+        if os.path.exists(os.path.join(path, '.root')):
+            return path
+        path = os.path.split(path)[0]
+    return None
+
+
+def _dfs_build_exe_graph(
+        root: str,
+        task_names: List[str],
+        task_dict: Dict[str, TaskSpec2] = None
+):
+    """
+    This function builds the execution graph for the given root and task names.
+
+    Args:
+        root (str): The root directory.
+        task_names (List[str]): The list of task names.
+        task_dict (Dict[str, TaskSpec2], optional): The dictionary of task
+            specifications. Defaults to None.
+    """
+    if task_dict is None:
+        task_dict = {}
+    t_to_add = []
+    for task_name in task_names:
+        if task_name in task_dict:
+            continue
+        t_to_add.append(task_name)
+        task_spec = TaskSpec2(root, task_name, task_dict)
+        task_dict[task_name] = task_spec
+        _dfs_build_exe_graph(root, task_spec.depend_task, task_dict)
+
+
+def build_exe_graph(tasks: List[str], root=None):
+    """
+    Build the execution graph for the given tasks.
+    NOTE: tasks are path of tasks in FS, not the tasks names
+
+    Args:
+        tasks (List[str]): A list of task names.
+        root (str, optional): The root directory of the tasks. If not provided,
+            it will be searched for automatically.
+
+    Raises:
+        Exception: If the task root cannot be found.
+    """
+    if root is None:
+        root = search_for_root(tasks[0])
+    if root is None:
+        raise Exception('Cannot find task root!')
+    # do a bfs to build TaskSpec graph
+    target_task_name = []
+    for t in tasks:
+        t = os.path.abspath(t)
+        assert t.startswith(root)
+        assert os.path.exists(t)
+        task_name = t[len(root):]
+        target_task_name.append(task_name)
+    logger.info(target_task_name)
+    task_dict: Dict[str, TaskSpec2] = {}
+    _dfs_build_exe_graph(root, target_task_name, task_dict)
+    logger.info(task_dict)
+    for spec in task_dict.values():
+        print(spec, spec._all_child_task)
+
+
+def serve_target2(tasks: List[dir]):
+    logger.info(tasks)
+    build_exe_graph(tasks)
+    pass
 
 
 class TaskSpec(_TaskSpec):
@@ -134,7 +364,7 @@ class TaskSpec(_TaskSpec):
         result = []
         if self.inherent is not None:
             result.append(os.path.join(self.task_root,
-                          self.inherent_task[1:], 'task.py'))
+                                       self.inherent_task[1:], 'task.py'))
         if self.depend is not None:
             for dep in self.depend:
                 if not os.path.exists(dep):
@@ -531,7 +761,7 @@ def match_targets(strs: List[str], patterns: List[str]):
 
 class Scheduler:
     def __init__(
-        self,
+            self,
             root: str = 'None',
             targets=Union[str, List[str], None],
             sock_addr=None,
