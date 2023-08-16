@@ -1,4 +1,3 @@
-# %%
 import asyncio
 import logging
 import os
@@ -14,10 +13,11 @@ from hashlib import md5
 from io import BytesIO, StringIO
 from pprint import pprint
 from queue import Queue
-from typing import Any, Callable, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 from typing_extensions import Self
 from typing import Union
 from enum import Enum
+from itertools import zip_longest
 
 import yaml
 
@@ -71,6 +71,13 @@ class Status(Enum):
 
 
 @dataclass
+class ResultDump:
+    output: Any
+    time: float
+    outputmd5: str
+
+
+@dataclass
 class _TaskSpec:
     task_root: str
     task_name: str
@@ -81,20 +88,21 @@ class _TaskSpec:
     export: bool = False
     # expire to run the task if following tasks ends
     expire: int = -1
-    end_time = -1
+    end_time: int = -1
     remove: bool = False
     depend: Union[List[str], None] = None
 
 
 class TaskSpec2:
-    def __init__(self, root: str, task_name: str, task_dict: Dict[str, Self]):
+    def __init__(self, root: str, task_name: str, task_dict: Dict[str, Self]=None) -> None:
         self.root = root
         self.task_name = task_name
         self.task_dict = task_dict
         self._status = None
+        self._dirty = None
 
     @staticmethod
-    def _get_output_folder(root, taskname):
+    def _get_output_folder(root, taskname: str):
         """
         Get the path of the output directory.
 
@@ -105,21 +113,69 @@ class TaskSpec2:
         Returns:
             str: The path of the output directory.
         """
-        return os.path.join(os.path.dirname(root), '_output', taskname[1:])
+        taskname = taskname[1:].replace('/', '.')
+        return os.path.join(os.path.dirname(root), '_output', taskname)
+
+    @staticmethod
+    def _get_dump_file(root: str, taskname: str):
+        return os.path.join(
+            TaskSpec2._get_output_folder(root, taskname),
+            'dump.pkl'
+        )
+
+    @cached_property
+    def output_dump_folder(self):
+        return self._get_output_folder(self.root, self.task_name)
+
+    @cached_property
+    def output_dump_file(self):
+        return self._get_dump_file(self.root, self.task_name)
 
     def _update_status(self):
-        pass
+        # update status and propagate to child tasks
+        # TODO Testit
+
+        parent_status = [self.task_dict[t].status for t in self.depend_task]
+        if all(status == Status.STATUS_READY for status in parent_status):
+            if self.status == Status.STATUS_PENDING:
+                self.status = Status.STATUS_READY
+        elif Status.STATUS_ERROR in parent_status:
+            self.status = Status.STATUS_ERROR
+        elif Status.STATUS_PENDING in parent_status:
+            self.status = Status.STATUS_PENDING
+        elif Status.STATUS_RUNNING in parent_status:
+            self.status = Status.STATUS_PENDING
 
     @property
     def status(self):
         if self._status is None:
             self._update_status()
-        return self.status
+        return self._status
 
     @status.setter
-    def status(self, value):
+    def status(self, value: Status):
+        """
+        Set the status of the current node and update the status of all its
+        child nodes.
+
+        Args:
+            value (Status): The new status value.
+        """
         if self._status is None:
-            self._status = Status.STATUS_PENDING
+            self._status = value
+        for t in self._all_child_task:
+            self.task_dict[t]._update_status()
+
+    def _check_self_dirty(self) -> bool:
+        pass
+
+    @property
+    def dirty(self):
+        pass
+
+    @dirty.setter
+    def dirty(self, value):
+        pass
 
     @cached_property
     def _task_file(self):
@@ -128,6 +184,12 @@ class TaskSpec2:
 
     @cached_property
     def _cfg_dict(self) -> Dict[str, Any]:
+        """
+        Loads the raw YAML content of the task file into a dictionary.
+
+        Returns:
+            Dict[str, Any]: The dictionary containing the YAML content.
+        """
         payload = bytearray()
         with open(self._task_file, 'rb') as f:
             f.readline()
@@ -152,7 +214,10 @@ class TaskSpec2:
         based on the 'require' key in the '_cfg_dict' attribute.
 
         This is the raw requirement dictionary parsed from the task,
-        the required tasks are regulated to the relative path from root 
+        the required tasks are regulated to the relative path from root.
+
+        NOTE: task requirement are marked with $ sign
+        TODO: use $$ to represent original $
 
         Returns:
             Dict[Union[int, str], str]: The generated dictionary.
@@ -178,7 +243,7 @@ class TaskSpec2:
     @cached_property
     def depend_task(self) -> List[str]:
         """
-        A list of dependency taskname, without the '$' indicator.
+        A list of dependency taskname.
         Returns:
             List[str]: A list of dependency tasks.
         """
@@ -195,10 +260,10 @@ class TaskSpec2:
     @cached_property
     def depend_by(self) -> List[str]:
         """
-        Get the tasks that directly depend on the current task.
+        Get the tasks that directly depend on this task.
 
         Returns:
-            List[str]: A list of task names that depend on the current task.
+            List[str]: A list of task names that directly depend on this task.
         """
         child_tasks = []
         for task_name, task_spec in self.task_dict.items():
@@ -207,25 +272,119 @@ class TaskSpec2:
         return child_tasks
 
     @cached_property
-    def _all_child_task(self):
+    def _all_child_task(self) -> List[str]:
         """
-        Get all child tasks of the current task using BFS.
+        Get all child tasks of this task using BFS.
+        NOTE: the output follows the hierarchical order, i.e. the child
+        task is put after the parent task
 
         Returns:
             List[str]: A list of unique task names.
         """
         visited = set()
         queue = [self.task_name]
-        while len(queue) > 0:
-            task_name = queue.pop(0)
+        queue_idx = 0
+        while len(queue) > queue_idx:
+            task_name = queue[queue_idx]
+            queue_idx += 1
             if task_name not in visited:
                 visited.add(task_name)
                 task_spec = self.task_dict[task_name]
-                queue.extend(task_spec.depend_by)
-        return list(visited-set([self.task_name]))
+                queue.extend([
+                    task for task in task_spec.depend_task
+                    if task not in visited
+                ])
+        return queue[1:]
 
     def __repr__(self) -> str:
-        return f"<Task:{self.task_name}>"
+        lines = ''
+        lines = lines + f"<Task:{self.task_name}>\n"
+        for parent, me, child in zip_longest(
+            self.depend_task,
+            [self.task_name],
+            self.depend_by, fillvalue=''
+        ):
+            lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
+        return lines
+
+    def _dump_result(self, output: Any):
+        h = md5()
+        h.update(open(self._task_file, 'rb').read())
+        payload = ResultDump(
+            output=output,
+            time=time.time(),
+            outputmd5=h.hexdigest(),
+        )
+        if not os.path.exists(os.path.dirname(self.output_dump_file)):
+            os.makedirs(os.path.dirname(self.output_dump_file))
+
+        pickle.dump(payload, open(self.output_dump_file, 'wb'))
+
+    def _prepare_args(
+            self,
+            arg: Any,
+            update_hash_map: Union[Dict[str, str], None] = None
+    ) -> Any:
+        if isinstance(arg, str) and arg.startswith('$'):
+            task_name = arg[1:]
+            dump_file = self._get_dump_file(self.root, task_name)
+            assert os.path.exists(dump_file)
+            if update_hash_map:
+                h = md5()
+                h.update(open(dump_file, 'rb'))
+                update_hash_map[task_name] = h.hexdigest()
+            with open(dump_file, 'rb') as f:
+                result_dump = pickle.load(f)
+            return result_dump.output
+        else:
+            return arg
+
+    def _load_input(self) -> Tuple[List[Any], Dict[str, Any]]:
+        arg_keys = [key for key in self._require_map.keys()
+                    if isinstance(key, int)]
+        args = []
+        if len(arg_keys) > 0:
+            args = [None] * max(arg_keys)
+            for k in arg_keys:
+                args[k] = self._prepare_args(
+                    self._require_map[k]
+                )
+        kwargs = {k: self._prepare_args(v)
+                  for k, v in self._require_map.items()
+                  if isinstance(k, str)}
+        return args, kwargs
+
+    @cached_property
+    def task_module_path(self):
+        return self.task_name[1:].replace('/', '.') + '.task'
+
+    def execute(self):
+        """
+        Execute the task by importing the task module and calling the
+        'run' function.
+
+        NOTE: this function should only be called when all dependent
+        task finished. No dirty check or dependency check will be invoked
+        in this function.
+
+        Returns:
+            None
+        """
+        sys.path.append(self.root)
+        import importlib
+        mod = importlib.import_module(self.task_module_path)
+        mod.__dict__['work_dir'] = self.output_dump_folder
+        if not hasattr(mod, 'run'):
+            logger.error(f'run not defined in {self.task_name}')
+            return False
+        try:
+            args, kwargs = self._load_input()
+            output = mod.run(*args, **kwargs)
+        except Exception as e:
+            logger.error(f'error task {self.task_name} {e}', stack_info=True)
+            return False
+        self._dump_result(output)
+        return True
 
 
 def search_for_root(base):
@@ -293,13 +452,18 @@ def build_exe_graph(tasks: List[str], root=None):
     _dfs_build_exe_graph(root, target_task_name, task_dict)
     logger.info(task_dict)
     for spec in task_dict.values():
-        print(spec, spec._all_child_task)
+        logger.info(spec)
 
 
 def serve_target2(tasks: List[dir]):
     logger.info(tasks)
     build_exe_graph(tasks)
     pass
+
+
+def exec_task(task_root, task_name):
+    task_spec = TaskSpec2(task_root, task_name)
+    task_spec.execute()
 
 
 class TaskSpec(_TaskSpec):
@@ -1159,7 +1323,7 @@ class Scheduler:
         try:
             asyncio.run(self.async_serve_main(exit=exit))
         except KeyboardInterrupt:
-            print("END")
+            logger.info("END")
             raise Exception()
 
 
@@ -1180,7 +1344,7 @@ def extract_anno(root, file) -> TaskSpec:
     try:
         task_info = yaml.safe_load(BytesIO(payload))
     except yaml.scanner.ScannerError as e:
-        print(f"ERROR parse {root} {file}")
+        logger.info(f"ERROR parse {root} {file}")
         raise e
     if task_info is None:
         task_info = {}
@@ -1233,7 +1397,7 @@ def clean_target(target: str):
 def new_task(target: str, task: str):
     logger.info(f'creating new task : {target} {task}')
     if not os.path.exists(target):
-        print("ERROR no such root")
+        logger.info("ERROR no such root")
         return
     if task.startswith('/'):
         task = task[1:]

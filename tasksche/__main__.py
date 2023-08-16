@@ -2,7 +2,7 @@ import argparse
 import inspect
 from typing import List, get_args, get_origin
 
-from .run import clean_target, new_task, serve_target, serve_target2
+from .run import clean_target, new_task, serve_target, serve_target2, exec_task
 
 
 def _parser():
@@ -64,8 +64,12 @@ if __name__ == '__main__':
         new_task(target, task)
 
     @_command()
-    def sv2(task: List[str] = None, include_subdir:bool=True):
+    def sv2(task: List[str] = None, include_subdir: bool = True):
         serve_target2(task)
+
+    @_command()
+    def exec(task_root: str, task_name: str):
+        exec_task(task_root, task_name)
 
     # _args = _parsers['parser'].parse_args(['run', 'export'])
     args = _parsers['parser'].parse_args()
