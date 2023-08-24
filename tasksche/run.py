@@ -71,10 +71,10 @@ class Status(Enum):
 
 
 @dataclass
-class ResultDump:
-    output: Any
+class ExecInfo:
     time: float
-    outputmd5: str
+    code_hash: str
+    depend_hash: Dict[str, str]
 
 
 @dataclass
@@ -93,15 +93,82 @@ class _TaskSpec:
     depend: Union[List[str], None] = None
 
 
+class DumpedType():
+    def __init__(self, file_name=None, field_name=None, cache=True) -> None:
+        self.file_name = file_name
+        self.field_name = field_name
+        self.cache = cache
+
+    def __get__(self, instance, owner):
+        """
+        Get the value of the descriptor.
+
+        This method is used to get the value of the descriptor when accessed
+        through an instance or a class.
+
+        Parameters:
+        - instance: The instance of the class that the descriptor is accessed
+            through.
+        - owner: The class that owns the descriptor.
+
+        Returns:
+        - The value of the descriptor.
+        """
+        if instance is None:
+            return self
+        if self.cache and hasattr(instance, self.field_name):
+            return getattr(instance, self.field_name)
+        else:
+            file_name = os.path.join(
+                getattr(instance, 'output_dump_folder'), self.file_name)
+            if not os.path.exists(file_name):
+                return None
+            with open(file_name, 'rb') as f:
+                result = pickle.load(f)
+                if self.cache:
+                    setattr(instance, self.field_name, result)
+            return result
+
+    def __set__(self, instance, value):
+        """
+        Set the value of the descriptor attribute.
+
+        Args:
+            instance: The instance of the class that the descriptor is being
+                set on.
+            value: The new value to set for the descriptor attribute.
+
+        Returns:
+            None
+        """
+        if self.cache:
+            setattr(instance, self.field_name, value)
+        file_name = os.path.join(
+            getattr(instance, 'output_dump_folder'), self.file_name)
+        with open(file_name, 'wb') as f:
+            pickle.dump(value, f)
+
+
 class TaskSpec2:
-    def __init__(self, root: str, task_name: str, task_dict: Dict[str, Self]=None) -> None:
+
+    _exec_info: ExecInfo = DumpedType(file_name='exec_info.pkl',
+                                      field_name='__exec_info')
+    _exec_result = DumpedType(file_name='exec_result.pkl',
+                              field_name='__exec_result')
+
+    def __init__(
+            self,
+            root: str,
+            task_name: str,
+            task_dict: Dict[str, Self] = None
+    ) -> None:
         self.root = root
         self.task_name = task_name
         self.task_dict = task_dict
         self._status = None
         self._dirty = None
 
-    @staticmethod
+    @ staticmethod
     def _get_output_folder(root, taskname: str):
         """
         Get the path of the output directory.
@@ -116,7 +183,7 @@ class TaskSpec2:
         taskname = taskname[1:].replace('/', '.')
         return os.path.join(os.path.dirname(root), '_output', taskname)
 
-    @staticmethod
+    @ staticmethod
     def _get_dump_file(root: str, taskname: str):
         return os.path.join(
             TaskSpec2._get_output_folder(root, taskname),
@@ -166,19 +233,86 @@ class TaskSpec2:
         for t in self._all_child_task:
             self.task_dict[t]._update_status()
 
-    def _check_self_dirty(self) -> bool:
-        pass
+    def _hash(self):
+        """
+        Calculate the MD5 hash of the code file and return the hex digest
+        string.
+
+        TODO: add other dependency too·
+
+        Returns:
+            str: The hex digest string of the MD5 hash.
+        """
+        code_file = self._task_file
+        with open(code_file, 'rb') as f:
+            code = f.read()
+        md5_hash = md5(code)
+        return md5_hash.hexdigest()
+
+    @property
+    def _dependent_hash(self):
+        depend_hash = {
+            task_name: self.task_dict[task_name]._hash()
+            for task_name in self._all_parent_task
+        }
+        return depend_hash
+
+    def _check_dirty(self) -> bool:
+        """
+        Check if the current task is dirty by comparing the code hash with
+        the last saved dump, as well as the dependency hash.
+
+        TODO: finish this
+
+        Returns:
+            bool: True if the task is dirty, False otherwise.
+        """
+        parent_dirty = [self.task_dict[t].dirty for t in self.depend_task]
+        if any(parent_dirty):
+            self._dirty = True
+            return self._dirty
+        if self._exec_info is None:
+            self._dirty = True
+            return self._dirty
+        exec_info: ExecInfo = self._exec_info
+        self._dirty = False
+        if exec_info.code_hash != self._hash():
+            self._dirty = True
+        for t in self.depend_task:
+            if not self._dirty and self.task_dict[t]._hash() != exec_info.depend_hash[t]:
+                self._dirty = True
+        for t in self.depend_task:
+            if self.task_dict[t]._hash() != self._exec_info.code_hash[t]:
+                logger.info(f'{t} updated hash mismatch')
+                self._dirty = True
+        return self._dirty
 
     @property
     def dirty(self):
-        pass
+        if self._dirty is not None:
+            return self._dirty
+        return self._check_dirty()
 
     @dirty.setter
-    def dirty(self, value):
-        pass
+    def dirty(self, value: bool):
+        assert isinstance(value, bool)
+        prev_value = self._dirty
+        self._dirty = value
+        if prev_value is None:
+            return
+        if prev_value != value and value is True:
+            # Propagate dirty to dependent tasks
+            for t in self.depend_by:
+                self.task_dict[t].dirty = True
 
     @cached_property
     def _task_file(self):
+        """
+        Get the path of the task file.
+
+        Returns:
+            str: The path of the task file.
+        """
         assert self.task_name.startswith('/')
         return os.path.join(self.root, self.task_name[1:], 'task.py')
 
@@ -296,6 +430,31 @@ class TaskSpec2:
                 ])
         return queue[1:]
 
+    @cached_property
+    def _all_parent_task(self) -> List[str]:
+        """
+        Get all parent tasks of this task using BFS.
+        NOTE: the output are sorted by name to keep consistent on each run.
+
+        Returns:
+            List[str]: A list of unique task names.
+        """
+        visited = set()
+        queue = [self.task_name]
+        queue_idx = 0
+        while len(queue) > queue_idx:
+            task_name = queue[queue_idx]
+            queue_idx += 1
+            if task_name not in visited:
+                visited.add(task_name)
+                task_spec = self.task_dict[task_name]
+                queue.extend([
+                    task for task in task_spec.depend_by
+                    if task not in visited
+                ])
+        queue = queue[1:]
+        return sorted(queue)
+
     def __repr__(self) -> str:
         lines = ''
         lines = lines + f"<Task:{self.task_name}>\n"
@@ -308,38 +467,41 @@ class TaskSpec2:
         return lines
 
     def _dump_result(self, output: Any):
-        h = md5()
-        h.update(open(self._task_file, 'rb').read())
-        payload = ResultDump(
-            output=output,
-            time=time.time(),
-            outputmd5=h.hexdigest(),
-        )
+        """
+        Dump the result of the task to the output dump file.
+        NOTE: this function should only be called by @execute
+
+        Args:
+            output (Any): The output of the task.
+
+        Returns:
+            None
+        """
+        payload = output
         if not os.path.exists(os.path.dirname(self.output_dump_file)):
             os.makedirs(os.path.dirname(self.output_dump_file))
-
         pickle.dump(payload, open(self.output_dump_file, 'wb'))
 
     def _prepare_args(
             self,
             arg: Any,
-            update_hash_map: Union[Dict[str, str], None] = None
     ) -> Any:
         if isinstance(arg, str) and arg.startswith('$'):
             task_name = arg[1:]
-            dump_file = self._get_dump_file(self.root, task_name)
-            assert os.path.exists(dump_file)
-            if update_hash_map:
-                h = md5()
-                h.update(open(dump_file, 'rb'))
-                update_hash_map[task_name] = h.hexdigest()
-            with open(dump_file, 'rb') as f:
-                result_dump = pickle.load(f)
-            return result_dump.output
+            result_dump = TaskSpec2(self.root, task_name)._exec_result
+            return result_dump
         else:
             return arg
 
     def _load_input(self) -> Tuple[List[Any], Dict[str, Any]]:
+        """
+        Load the input arguments for the task.
+        NOTE: this function should only be called by @execute
+
+        Returns:
+            Tuple[List[Any], Dict[str, Any]]: A tuple containing the list of
+                positional arguments and the dictionary of keyword arguments.
+        """
         arg_keys = [key for key in self._require_map.keys()
                     if isinstance(key, int)]
         args = []
@@ -352,6 +514,7 @@ class TaskSpec2:
         kwargs = {k: self._prepare_args(v)
                   for k, v in self._require_map.items()
                   if isinstance(k, str)}
+
         return args, kwargs
 
     @cached_property
@@ -370,21 +533,46 @@ class TaskSpec2:
         Returns:
             None
         """
+        logger.info(f'executing {self.task_name}@{self.root}')
         sys.path.append(self.root)
         import importlib
         mod = importlib.import_module(self.task_module_path)
         mod.__dict__['work_dir'] = self.output_dump_folder
         if not hasattr(mod, 'run'):
-            logger.error(f'run not defined in {self.task_name}')
-            return False
-        try:
-            args, kwargs = self._load_input()
-            output = mod.run(*args, **kwargs)
-        except Exception as e:
-            logger.error(f'error task {self.task_name} {e}', stack_info=True)
-            return False
-        self._dump_result(output)
+            raise NotImplementedError()
+        args, kwargs = self._load_input()
+        output = mod.run(*args, **kwargs)
+        self._exec_result = output
         return True
+
+    @property
+    def exec_info(self) -> ExecInfo:
+        pass
+
+
+def task_dict_to_pdf(task_dict: Dict[str, TaskSpec2]):
+    """
+    save graph to a pdf file using graphviz
+    """
+    from graphviz import Digraph
+    dot = Digraph('G', format='pdf', filename='./export',
+                  graph_attr={'layout': 'dot'})
+    dot.attr(rankdir='LR')
+    color_map = dict(
+        ready='orange',
+        finished='lightgreen',
+        pending='red',
+        running='lightblue',
+    )
+    for k in task_dict.keys():
+        dot.node(
+            k,
+            label=k,
+        )
+    for node, spec in task_dict.items():
+        for b in spec.depend_task:
+            dot.edge(b, node)
+    dot.render(cleanup=True)
 
 
 def search_for_root(base):
@@ -443,16 +631,30 @@ def build_exe_graph(tasks: List[str], root=None):
     target_task_name = []
     for t in tasks:
         t = os.path.abspath(t)
+        if os.path.isfile(t):
+            t = os.path.dirname(t)
+        if not os.path.exists(os.path.join(t, 'task.py')):
+            logger.warn(f'{t} is not a task')
+            continue
         assert t.startswith(root)
         assert os.path.exists(t)
         task_name = t[len(root):]
-        target_task_name.append(task_name)
-    logger.info(target_task_name)
+        if task_name == '':
+            task_name = '/'
+        if task_name not in target_task_name:
+            target_task_name.append(task_name)
+    # logger.info(target_task_name)
     task_dict: Dict[str, TaskSpec2] = {}
     _dfs_build_exe_graph(root, target_task_name, task_dict)
-    logger.info(task_dict)
-    for spec in task_dict.values():
-        logger.info(spec)
+    # logger.info(task_dict)
+    # for spec in task_dict.values():
+    #     logger.info(spec)
+    return target_task_name, task_dict
+
+
+class TaskSche2():
+    def __init__(self, target) -> None:
+        self.target, self.task_dict = build_exe_graph(target)
 
 
 def serve_target2(tasks: List[dir]):
@@ -566,9 +768,6 @@ class TaskSpec(_TaskSpec):
     @property
     def code_file(self) -> str:
         return os.path.join(self.task_dir, 'task.py')
-
-    # @cached_property
-    # def code_hash(self) -> str:
 
     @property
     def code_update_time(self) -> float:
