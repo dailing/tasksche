@@ -31,23 +31,16 @@ except ImportError:
 
 def get_logger(name: str, print_level=logging.DEBUG):
     formatter = logging.Formatter(
-        fmt="%(levelname)6s "
+        fmt="%(levelname)10s "
             "[%(filename)15s:%(lineno)-3d %(asctime)s]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )
-    # time_now = datetime.datetime.now().strftime("%Y_%m_%d.%H_%M_%S")
     logger_obj = logging.getLogger(name)
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(print_level)
-    # if not os.path.exists(f'/tmp//tmp/log/{time_now}/'):
-    #     os.makedirs(f'/tmp/log/{time_now}/', exist_ok=True)
-    # file_handler = logging.FileHandler(f'/tmp/log/{time_now}/{name}.log')
-    # file_handler.setFormatter(formatter)
-    # file_handler.setLevel(logging.DEBUG)
     logger_obj.addHandler(stream_handler)
-    # logger.addHandler(file_handler)
     logger_obj.setLevel(logging.DEBUG)
     return logger_obj
 
@@ -199,19 +192,20 @@ class TaskSpec2:
         return self._get_dump_file(self.root, self.task_name)
 
     def _update_status(self):
-        # update status and propagate to child tasks
-        # TODO Testit
-
+        if not self.dirty:
+            self._status = Status.STATUS_FINISHED
+            return
+        self.status = Status.STATUS_PENDING
         parent_status = [self.task_dict[t].status for t in self.depend_task]
-        if all(status == Status.STATUS_READY for status in parent_status):
+        if all(status == Status.STATUS_FINISHED for status in parent_status):
             if self.status == Status.STATUS_PENDING:
-                self.status = Status.STATUS_READY
+                self._status = Status.STATUS_READY
         elif Status.STATUS_ERROR in parent_status:
-            self.status = Status.STATUS_ERROR
+            self._status = Status.STATUS_ERROR
         elif Status.STATUS_PENDING in parent_status:
-            self.status = Status.STATUS_PENDING
+            self._status = Status.STATUS_PENDING
         elif Status.STATUS_RUNNING in parent_status:
-            self.status = Status.STATUS_PENDING
+            self._status = Status.STATUS_PENDING
 
     @property
     def status(self):
@@ -228,9 +222,13 @@ class TaskSpec2:
         Args:
             value (Status): The new status value.
         """
+        if value == self._status:
+            return
         if self._status is None:
             self._status = value
-        for t in self._all_child_task:
+            return
+        self._status = value
+        for t in self._all_task_depend_me:
             self.task_dict[t]._update_status()
 
     def _hash(self):
@@ -253,7 +251,7 @@ class TaskSpec2:
     def _dependent_hash(self):
         depend_hash = {
             task_name: self.task_dict[task_name]._hash()
-            for task_name in self._all_parent_task
+            for task_name in self._all_dependent_tasks
         }
         return depend_hash
 
@@ -406,7 +404,7 @@ class TaskSpec2:
         return child_tasks
 
     @cached_property
-    def _all_child_task(self) -> List[str]:
+    def _all_dependent_tasks(self) -> List[str]:
         """
         Get all child tasks of this task using BFS.
         NOTE: the output follows the hierarchical order, i.e. the child
@@ -431,7 +429,7 @@ class TaskSpec2:
         return queue[1:]
 
     @cached_property
-    def _all_parent_task(self) -> List[str]:
+    def _all_task_depend_me(self) -> List[str]:
         """
         Get all parent tasks of this task using BFS.
         NOTE: the output are sorted by name to keep consistent on each run.
@@ -634,7 +632,7 @@ def build_exe_graph(tasks: List[str], root=None):
         if os.path.isfile(t):
             t = os.path.dirname(t)
         if not os.path.exists(os.path.join(t, 'task.py')):
-            logger.warn(f'{t} is not a task')
+            logger.warning(f'{t} is not a task')
             continue
         assert t.startswith(root)
         assert os.path.exists(t)
@@ -655,6 +653,43 @@ def build_exe_graph(tasks: List[str], root=None):
 class TaskSche2():
     def __init__(self, target) -> None:
         self.target, self.task_dict = build_exe_graph(target)
+        for t in self.task_dict.values():
+            t.inherent = True
+
+    def _get_ready(self) -> Union[str, None]:
+        """
+        Get a task that is ready to be executed.
+
+        :return: Union of string or None.
+        """
+        for task in self.task_dict.values():
+            if task.status == Status.STATUS_READY:
+                return task.task_name
+        return None
+
+    def get_ready_set_running(self):
+        ready_task = self._get_ready()
+        if ready_task:
+            self.set_running(ready_task)
+        return ready_task
+
+    def set_status(self, task: str, status: str):
+        assert isinstance(task, str), task
+        assert task in self.task_dict, f'{task} is not a valid task'
+        self.task_dict[task].status = status
+
+    def set_finished(self, task: str):
+        self.set_status(task, Status.STATUS_FINISHED)
+
+    def set_error(self, task: str):
+        self.set_status(task, Status.STATUS_ERROR)
+
+    def set_running(self, task: str):
+        self.set_status(task, Status.STATUS_RUNNING)
+
+    def print_status(self):
+        for t in self.task_dict.values():
+            print(f'{t.task_name}: {t.status}')
 
 
 def serve_target2(tasks: List[dir]):
