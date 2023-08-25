@@ -1,3 +1,4 @@
+from enum import Enum, auto
 import asyncio
 import logging
 import os
@@ -13,10 +14,9 @@ from hashlib import md5
 from io import BytesIO, StringIO
 from pprint import pprint
 from queue import Queue
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, List, Set, Tuple
 from typing_extensions import Self
 from typing import Union
-from enum import Enum
 from itertools import zip_longest
 
 import yaml
@@ -136,8 +136,11 @@ class DumpedType():
         """
         if self.cache:
             setattr(instance, self.field_name, value)
+        dump_folder = getattr(instance, 'output_dump_folder')
+        if not os.path.exists(dump_folder):
+            os.makedirs(dump_folder, exist_ok=True)
         file_name = os.path.join(
-            getattr(instance, 'output_dump_folder'), self.file_name)
+            dump_folder, self.file_name)
         with open(file_name, 'wb') as f:
             pickle.dump(value, f)
 
@@ -277,7 +280,10 @@ class TaskSpec2:
         if exec_info.code_hash != self._hash():
             self._dirty = True
         for t in self.depend_task:
-            if not self._dirty and self.task_dict[t]._hash() != exec_info.depend_hash[t]:
+            if (
+                    not self._dirty
+                    and self.task_dict[t]._hash() != exec_info.depend_hash[t]
+            ):
                 self._dirty = True
         for t in self.depend_task:
             if self.task_dict[t]._hash() != self._exec_info.code_hash[t]:
@@ -517,7 +523,8 @@ class TaskSpec2:
 
     @cached_property
     def task_module_path(self):
-        return self.task_name[1:].replace('/', '.') + '.task'
+        task_path = os.path.join(self.task_name, 'task')
+        return task_path[1:].replace('/', '.')
 
     def execute(self):
         """
@@ -548,6 +555,26 @@ class TaskSpec2:
         pass
 
 
+class EndTask(TaskSpec2):
+    def __init__(
+            self,
+            task_dict: Dict[str, Self],
+            depend_task: List[str]
+    ):
+        super().__init__(None, "_END_", task_dict)
+        self._status = Status.STATUS_PENDING
+        self._dirty = True
+        self._depend_task = depend_task
+
+    @property
+    def depend_task(self) -> List[str]:
+        return self._depend_task
+
+    @property
+    def depend_by(self) -> List[str]:
+        return []
+
+
 def task_dict_to_pdf(task_dict: Dict[str, TaskSpec2]):
     """
     save graph to a pdf file using graphviz
@@ -556,12 +583,6 @@ def task_dict_to_pdf(task_dict: Dict[str, TaskSpec2]):
     dot = Digraph('G', format='pdf', filename='./export',
                   graph_attr={'layout': 'dot'})
     dot.attr(rankdir='LR')
-    color_map = dict(
-        ready='orange',
-        finished='lightgreen',
-        pending='red',
-        running='lightblue',
-    )
     for k in task_dict.keys():
         dot.node(
             k,
@@ -644,17 +665,59 @@ def build_exe_graph(tasks: List[str], root=None):
     # logger.info(target_task_name)
     task_dict: Dict[str, TaskSpec2] = {}
     _dfs_build_exe_graph(root, target_task_name, task_dict)
+    task_dict['_END_'] = EndTask(task_dict, target_task_name)
     # logger.info(task_dict)
     # for spec in task_dict.values():
     #     logger.info(spec)
     return target_task_name, task_dict
 
 
+class EventType(Enum):
+    def _generate_next_value_(name, start, count, last_values):
+        return name
+
+    TASK_FINISHED = auto()
+    TASK_ERROR = auto()
+    TASK_INTERRUPT = auto()
+
+
+@dataclass
+class SchedulerEvent:
+    event_type: EventType
+    task_name: str
+    task_root: str
+
+    def __repr__(self) -> str:
+        return f'<{self.event_type}: {self.task_name}@{self.task_root}>'
+
+
+class Runner():
+    def __init__(self, event_queue: Queue) -> None:
+        self.event_queue = event_queue
+
+    def add_task(self, task_root: str, task_name: str) -> None:
+        """
+        Add a task to the task list.
+
+        Args:
+            task_root (str): The root directory of the task.
+            task_name (str): The name of the task.
+
+        Returns:
+            None
+        """
+        task_spec = TaskSpec2(task_root, task_name)
+        task_spec.execute()
+        self.event_queue.put(SchedulerEvent(
+            EventType.TASK_FINISHED, task_name, task_root))
+
+
 class TaskSche2():
-    def __init__(self, target) -> None:
+    def __init__(self, target, get_runner: Callable[[Queue], Runner]) -> None:
         self.target, self.task_dict = build_exe_graph(target)
-        for t in self.task_dict.values():
-            t.inherent = True
+        self.event_queue = Queue()
+        if get_runner is not None:
+            self.runner = get_runner(self.event_queue)
 
     def _get_ready(self) -> Union[str, None]:
         """
@@ -690,6 +753,30 @@ class TaskSche2():
     def print_status(self):
         for t in self.task_dict.values():
             print(f'{t.task_name}: {t.status}')
+
+    def run(self):
+        logger.info('running...')
+        while True:
+            ready_task = self.get_ready_set_running()
+            if ready_task is None:
+                event = self.event_queue.get()
+                logger.info(f'got event:{event}')
+                if event.event_type == EventType.TASK_FINISHED:
+                    self.set_finished(event.task_name)
+                elif event.event_type == EventType.TASK_ERROR:
+                    self.set_error(event.task_name)
+                elif event.event_type == EventType.TASK_INTERRUPT:
+                    self.set_error(event.task_name)
+                else:
+                    raise NotImplementedError()
+            else:
+                logger.info(f'got ready task:{ready_task}')
+                if ready_task == '_END_':
+                    logger.info('all tasks are finished')
+                    break
+                task_spec = self.task_dict[ready_task]
+                self.runner.add_task(task_spec.root, task_spec.task_name)
+        logger.info('done...')
 
 
 def serve_target2(tasks: List[dir]):
