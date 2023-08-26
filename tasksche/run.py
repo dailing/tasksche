@@ -1,4 +1,3 @@
-from enum import Enum, auto
 import asyncio
 import logging
 import os
@@ -9,17 +8,18 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum, auto
 from functools import cached_property
 from hashlib import md5
 from io import BytesIO, StringIO
+from itertools import zip_longest
 from pprint import pprint
 from queue import Queue
 from typing import Any, Callable, Dict, List, Set, Tuple
-from typing_extensions import Self
 from typing import Union
-from itertools import zip_longest
 
 import yaml
+from typing_extensions import Self
 
 try:
     import networkx as nx
@@ -86,7 +86,11 @@ class _TaskSpec:
     depend: Union[List[str], None] = None
 
 
-class DumpedType():
+class DumpedTypeOperation(Enum):
+    DELETE = 'DELETE'
+
+
+class DumpedType:
     def __init__(self, file_name=None, field_name=None, cache=True) -> None:
         self.file_name = file_name
         self.field_name = field_name
@@ -141,14 +145,19 @@ class DumpedType():
             os.makedirs(dump_folder, exist_ok=True)
         file_name = os.path.join(
             dump_folder, self.file_name)
-        with open(file_name, 'wb') as f:
-            pickle.dump(value, f)
+        if value is DumpedTypeOperation.DELETE:
+            if os.path.exists(file_name):
+                os.remove(file_name)
+            if hasattr(instance, self.field_name):
+                delattr(instance, self.field_name)
+        else:
+            with open(file_name, 'wb') as f:
+                pickle.dump(value, f)
 
 
 class TaskSpec2:
-
-    _exec_info: ExecInfo = DumpedType(file_name='exec_info.pkl',
-                                      field_name='__exec_info')
+    _exec_info_dump: ExecInfo = DumpedType(file_name='exec_info.pkl',
+                                           field_name='__exec_info')
     _exec_result = DumpedType(file_name='exec_result.pkl',
                               field_name='__exec_result')
 
@@ -164,22 +173,22 @@ class TaskSpec2:
         self._status = None
         self._dirty = None
 
-    @ staticmethod
-    def _get_output_folder(root, taskname: str):
+    @staticmethod
+    def _get_output_folder(root, task_name: str):
         """
         Get the path of the output directory.
 
         Args:
             root (str): The root directory.
-            taskname (str): The name of the task.
+            task_name (str): The name of the task.
 
         Returns:
             str: The path of the output directory.
         """
-        taskname = taskname[1:].replace('/', '.')
-        return os.path.join(os.path.dirname(root), '_output', taskname)
+        task_name = task_name[1:].replace('/', '.')
+        return os.path.join(os.path.dirname(root), '_output', task_name)
 
-    @ staticmethod
+    @staticmethod
     def _get_dump_file(root: str, taskname: str):
         return os.path.join(
             TaskSpec2._get_output_folder(root, taskname),
@@ -272,10 +281,10 @@ class TaskSpec2:
         if any(parent_dirty):
             self._dirty = True
             return self._dirty
-        if self._exec_info is None:
+        if self._exec_info_dump is None:
             self._dirty = True
             return self._dirty
-        exec_info: ExecInfo = self._exec_info
+        exec_info: ExecInfo = self._exec_info_dump
         self._dirty = False
         if exec_info.code_hash != self._hash():
             self._dirty = True
@@ -285,10 +294,7 @@ class TaskSpec2:
                     and self.task_dict[t]._hash() != exec_info.depend_hash[t]
             ):
                 self._dirty = True
-        for t in self.depend_task:
-            if self.task_dict[t]._hash() != self._exec_info.code_hash[t]:
-                logger.info(f'{t} updated hash mismatch')
-                self._dirty = True
+                break
         return self._dirty
 
     @property
@@ -381,7 +387,7 @@ class TaskSpec2:
     @cached_property
     def depend_task(self) -> List[str]:
         """
-        A list of dependency taskname.
+        A list of dependency task_name.
         Returns:
             List[str]: A list of dependency tasks.
         """
@@ -463,9 +469,9 @@ class TaskSpec2:
         lines = ''
         lines = lines + f"<Task:{self.task_name}>\n"
         for parent, me, child in zip_longest(
-            self.depend_task,
-            [self.task_name],
-            self.depend_by, fillvalue=''
+                self.depend_task,
+                [self.task_name],
+                self.depend_by, fillvalue=''
         ):
             lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
         return lines
@@ -551,8 +557,33 @@ class TaskSpec2:
         return True
 
     @property
-    def exec_info(self) -> ExecInfo:
-        pass
+    def _exec_info(self) -> ExecInfo:
+        """
+        Returns the execution information for the current execution.
+
+        :return: An instance of the ExecInfo class.
+        :rtype: ExecInfo
+        """
+        depend_hash = {
+            task_name: self.task_dict[task_name]._hash()
+            for task_name in self._all_dependent_tasks
+        }
+        exec_info = ExecInfo(
+            time=time.time(),
+            code_hash=self._hash(),
+            depend_hash=depend_hash
+        )
+        return exec_info
+
+    def dump_exec_info(self, exec_info=None):
+        if exec_info is None:
+            exec_info = self._exec_info
+        self._exec_info_dump = exec_info
+
+    def clear(self):
+        self._exec_info_dump = DumpedTypeOperation.DELETE
+        self._exec_result = DumpedTypeOperation.DELETE
+        self.status = None
 
 
 class EndTask(TaskSpec2):
@@ -562,7 +593,6 @@ class EndTask(TaskSpec2):
             depend_task: List[str]
     ):
         super().__init__(None, "_END_", task_dict)
-        self._status = Status.STATUS_PENDING
         self._dirty = True
         self._depend_task = depend_task
 
@@ -573,6 +603,9 @@ class EndTask(TaskSpec2):
     @property
     def depend_by(self) -> List[str]:
         return []
+
+    def clear(self):
+        pass
 
 
 def task_dict_to_pdf(task_dict: Dict[str, TaskSpec2]):
@@ -736,7 +769,7 @@ class TaskSche2():
             self.set_running(ready_task)
         return ready_task
 
-    def set_status(self, task: str, status: str):
+    def set_status(self, task: str, status: Status):
         assert isinstance(task, str), task
         assert task in self.task_dict, f'{task} is not a valid task'
         self.task_dict[task].status = status
@@ -754,29 +787,51 @@ class TaskSche2():
         for t in self.task_dict.values():
             print(f'{t.task_name}: {t.status}')
 
+    def clear(self, tasks: List[str]):
+        if tasks is None:
+            tasks = self.task_dict.keys()
+        for task in tasks:
+            self.task_dict[task].clear()
+
     def run(self):
+        """
+        Runs the main loop of the program. This function continuously checks
+        for ready tasks and executes them. If there are no ready tasks, it
+        waits for an event from the event queue. When an event is received,
+        it checks the event type and performs the corresponding action.
+
+        If the ready task is "_END_", it indicates that all tasks have
+        finished and the function breaks out of the loop. Otherwise, it
+        retrieves the task specification for the ready task and adds it to
+        the task runner for execution.
+
+        Returns:
+            None
+        """
         logger.info('running...')
         while True:
             ready_task = self.get_ready_set_running()
             if ready_task is None:
                 event = self.event_queue.get()
-                logger.info(f'got event:{event}')
+                logger.debug(f'got event:{event}')
                 if event.event_type == EventType.TASK_FINISHED:
                     self.set_finished(event.task_name)
+                    # dump exec_info
+                    self.task_dict[event.task_name].dump_exec_info()
                 elif event.event_type == EventType.TASK_ERROR:
                     self.set_error(event.task_name)
+                    logger.info(f'task:{event.task_name} is errored')
                 elif event.event_type == EventType.TASK_INTERRUPT:
                     self.set_error(event.task_name)
                 else:
                     raise NotImplementedError()
             else:
-                logger.info(f'got ready task:{ready_task}')
+                logger.debug(f'got ready task:{ready_task}')
                 if ready_task == '_END_':
                     logger.info('all tasks are finished')
                     break
                 task_spec = self.task_dict[ready_task]
                 self.runner.add_task(task_spec.root, task_spec.task_name)
-        logger.info('done...')
 
 
 def serve_target2(tasks: List[dir]):
@@ -1514,7 +1569,7 @@ class Scheduler:
                 async with self.processes_lock:
                     agg_res = self._g.aggregate(
                         lambda x: x['name'] in (
-                            changed_hash_keys | removed_keys),
+                                changed_hash_keys | removed_keys),
                         any
                     )
                     process_to_end = []

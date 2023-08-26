@@ -1,6 +1,6 @@
 from tasksche.run import (
     Runner, Status, TaskSche2,
-    build_exe_graph, task_dict_to_pdf)
+    build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
 import unittest
 from pathlib import Path
 
@@ -10,17 +10,18 @@ class TestTaskSche(unittest.TestCase):
     def task_path(self):
         current_file_path = Path(__file__)
         parent_path = current_file_path.parent / 'test_task_set'
-
         return [parent_path]
 
-    @property
-    def task_dict(self):
+    def get_task_dict(self, clear=True):
         _, task_dict = build_exe_graph(self.task_path)
+        if clear:
+            for v in task_dict.values():
+                v.clear()
         task_dict_to_pdf(task_dict)
         return task_dict
 
     def test_build_graph(self):
-        d = self.task_dict
+        d = self.get_task_dict()
         for k, v in d.items():
             v.dirty = False
             self.assertFalse(v.dirty)
@@ -31,7 +32,7 @@ class TestTaskSche(unittest.TestCase):
         self.assertTrue(d['/'].dirty)
 
     def test_status(self):
-        d = self.task_dict
+        d = self.get_task_dict()
         self.assertEqual(d['/task1'].status, Status.STATUS_READY)
         self.assertEqual(d['/task2'].status, Status.STATUS_READY)
         self.assertEqual(d['/task3'].status, Status.STATUS_PENDING)
@@ -75,9 +76,15 @@ class TestTaskSche(unittest.TestCase):
         self.assertEqual(ready_task, '_END_')
 
     def test_run_basic_runner(self):
+        self.get_task_dict(clear=True)
         sche = TaskSche2(self.task_path, Runner)
         sche.run()
+        sche = TaskSche2(self.task_path, Runner)
+        self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
+        sche.run()
 
+    def test_enum_property(self):
+        self.assertFalse(DumpedTypeOperation.DELETE == "DELETE")
 
 if __name__ == '__main__':
     unittest.main()
