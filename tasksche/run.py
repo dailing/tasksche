@@ -155,6 +155,24 @@ class DumpedType:
                 pickle.dump(value, f)
 
 
+class ExecEnv:
+    def __init__(self, pythonpath=None, cwd=None):
+        self.pythonpath = pythonpath
+        self.cwd = cwd
+        self.previous_dir = os.getcwd()
+
+    def __enter__(self):
+        if self.pythonpath:
+            sys.path.insert(0, self.pythonpath)
+        if self.cwd:
+            os.chdir(self.cwd)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.cwd:
+            os.chdir(self.previous_dir)
+        if self.pythonpath:
+            sys.path.remove(self.pythonpath)
+
 class TaskSpec2:
     _exec_info_dump: ExecInfo = DumpedType(file_name='exec_info.pkl',
                                            field_name='__exec_info')
@@ -172,6 +190,10 @@ class TaskSpec2:
         self.task_dict = task_dict
         self._status = None
         self._dirty = None
+
+    @cached_property
+    def _exec_env(self)->ExecEnv:
+        return ExecEnv(self.root, self.output_dump_folder)
 
     @staticmethod
     def _get_output_folder(root, task_name: str):
@@ -545,15 +567,15 @@ class TaskSpec2:
             None
         """
         logger.info(f'executing {self.task_name}@{self.root}')
-        sys.path.append(self.root)
-        import importlib
-        mod = importlib.import_module(self.task_module_path)
-        mod.__dict__['work_dir'] = self.output_dump_folder
-        if not hasattr(mod, 'run'):
-            raise NotImplementedError()
-        args, kwargs = self._load_input()
-        output = mod.run(*args, **kwargs)
-        self._exec_result = output
+        with self._exec_env:
+            import importlib
+            mod = importlib.import_module(self.task_module_path)
+            mod.__dict__['work_dir'] = self.output_dump_folder
+            if not hasattr(mod, 'run'):
+                raise NotImplementedError()
+            args, kwargs = self._load_input()
+            output = mod.run(*args, **kwargs)
+            self._exec_result = output
         return True
 
     @property
