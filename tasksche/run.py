@@ -173,6 +173,7 @@ class ExecEnv:
         if self.pythonpath:
             sys.path.remove(self.pythonpath)
 
+
 class TaskSpec2:
     _exec_info_dump: ExecInfo = DumpedType(file_name='exec_info.pkl',
                                            field_name='__exec_info')
@@ -192,7 +193,7 @@ class TaskSpec2:
         self._dirty = None
 
     @cached_property
-    def _exec_env(self)->ExecEnv:
+    def _exec_env(self) -> ExecEnv:
         return ExecEnv(self.root, self.output_dump_folder)
 
     @staticmethod
@@ -538,7 +539,7 @@ class TaskSpec2:
                     if isinstance(key, int)]
         args = []
         if len(arg_keys) > 0:
-            args = [None] * max(arg_keys)
+            args = [None] * (max(arg_keys)+1)
             for k in arg_keys:
                 args[k] = self._prepare_args(
                     self._require_map[k]
@@ -658,30 +659,79 @@ def search_for_root(base):
     return None
 
 
+def path_to_taskSpec(tasks: List[str], root=None) -> Dict[str, TaskSpec2]:
+    """
+    Convert the paths specified by the tasks argument into TaskSpec objects.
+
+    Args:
+        tasks (List[str]): A list of task paths.
+        root (str, optional): The root directory of the tasks. If not provided,
+            it will be searched for automatically.
+
+    Returns:
+        Dict[str, TaskSpec2]: A dictionary of TaskSpec2 objects,
+            where the keys are task names.
+
+    Raises:
+        Exception: If the task root cannot be found.
+    """
+    if root is None:
+        root = search_for_root(tasks[0])
+    if root is None:
+        raise Exception('Cannot find task root!')
+
+    task_names = []
+    for task_path in tasks:
+        task_path = os.path.abspath(task_path)
+        if os.path.isfile(task_path):
+            task_path = os.path.dirname(task_path)
+        if not os.path.exists(os.path.join(task_path, 'task.py')):
+            logger.warning(f'{task_path} is not a task')
+            continue
+        assert task_path.startswith(root)
+        assert os.path.exists(task_path)
+        task_name = task_path[len(root):]
+        if task_name == '':
+            task_name = '/'
+        if task_name not in task_names:
+            task_names.append(task_name)
+
+    task_dict: Dict[str, TaskSpec2] = {}
+    for task_name in task_names:
+        task_dict[task_name] = TaskSpec2(root, task_name, task_dict=task_dict)
+
+    return task_dict
+
+
 def _dfs_build_exe_graph(
-        root: str,
-        task_names: List[str],
+        task_specs: List[TaskSpec2],
         task_dict: Dict[str, TaskSpec2] = None
 ):
     """
-    This function builds the execution graph for the given root and task names.
+    Recursively builds an execution graph for the given task specifications.
+    All dependent tasks are added to the execution graph.
 
     Args:
-        root (str): The root directory.
-        task_names (List[str]): The list of task names.
-        task_dict (Dict[str, TaskSpec2], optional): The dictionary of task
-            specifications. Defaults to None.
+        task_specs (List[TaskSpec2]): A list of task specifications.
+        task_dict (Dict[str, TaskSpec2]): A dictionary representing the task
+            specifications.
+
+    Returns:
+        None
     """
     if task_dict is None:
         task_dict = {}
-    t_to_add = []
-    for task_name in task_names:
-        if task_name in task_dict:
-            continue
-        t_to_add.append(task_name)
-        task_spec = TaskSpec2(root, task_name, task_dict)
-        task_dict[task_name] = task_spec
-        _dfs_build_exe_graph(root, task_spec.depend_task, task_dict)
+    for task_spec in task_specs:
+        for depend_task_name in task_spec.depend_task:
+            if depend_task_name in task_dict:
+                continue
+            depend_task_spec = TaskSpec2(
+                root=task_spec.root,
+                task_name=depend_task_name,
+                task_dict=task_dict
+            )
+            task_dict[depend_task_name] = depend_task_spec
+            _dfs_build_exe_graph([depend_task_spec], task_dict)
 
 
 def build_exe_graph(tasks: List[str], root=None):
@@ -697,33 +747,11 @@ def build_exe_graph(tasks: List[str], root=None):
     Raises:
         Exception: If the task root cannot be found.
     """
-    if root is None:
-        root = search_for_root(tasks[0])
-    if root is None:
-        raise Exception('Cannot find task root!')
-    # do a bfs to build TaskSpec graph
-    target_task_name = []
-    for t in tasks:
-        t = os.path.abspath(t)
-        if os.path.isfile(t):
-            t = os.path.dirname(t)
-        if not os.path.exists(os.path.join(t, 'task.py')):
-            logger.warning(f'{t} is not a task')
-            continue
-        assert t.startswith(root)
-        assert os.path.exists(t)
-        task_name = t[len(root):]
-        if task_name == '':
-            task_name = '/'
-        if task_name not in target_task_name:
-            target_task_name.append(task_name)
-    # logger.info(target_task_name)
-    task_dict: Dict[str, TaskSpec2] = {}
-    _dfs_build_exe_graph(root, target_task_name, task_dict)
+    target_tasks = path_to_taskSpec(tasks)
+    target_task_name = list(target_tasks.keys())
+    task_dict = target_tasks
+    _dfs_build_exe_graph(list(target_tasks.values()), task_dict)
     task_dict['_END_'] = EndTask(task_dict, target_task_name)
-    # logger.info(task_dict)
-    # for spec in task_dict.values():
-    #     logger.info(spec)
     return target_task_name, task_dict
 
 
@@ -768,11 +796,13 @@ class Runner():
 
 
 class TaskSche2():
-    def __init__(self, target, get_runner: Callable[[Queue], Runner]) -> None:
+    def __init__(self, target, get_runner: Callable[[Queue], Runner] = None) -> None:
         self.target, self.task_dict = build_exe_graph(target)
         self.event_queue = Queue()
         if get_runner is not None:
             self.runner = get_runner(self.event_queue)
+        else:
+            self.runner = Runner(self.event_queue)
 
     def _get_ready(self) -> Union[str, None]:
         """
@@ -857,9 +887,11 @@ class TaskSche2():
 
 
 def serve_target2(tasks: List[dir]):
-    logger.info(tasks)
-    build_exe_graph(tasks)
-    pass
+    logger.info(f'serve2 {tasks}')
+    scheduler = TaskSche2(tasks, None)
+    # task_dict_to_pdf(scheduler.task_dict)
+    logger.debug(scheduler.task_dict)
+    scheduler.run()
 
 
 def exec_task(task_root, task_name):
@@ -1591,7 +1623,7 @@ class Scheduler:
                 async with self.processes_lock:
                     agg_res = self._g.aggregate(
                         lambda x: x['name'] in (
-                                changed_hash_keys | removed_keys),
+                            changed_hash_keys | removed_keys),
                         any
                     )
                     process_to_end = []

@@ -55,21 +55,24 @@ if __name__ == '__main__':
     def run(target: str, task: List[str] = None, addr: str = None):
         serve_target(target, task, addr, exit=True)
 
-    @_command()
-    def clean(target: str):
-        clean_target(target)
+    # @_command()
+    # def clean(target: str):
+    #     clean_target(target)
 
     @_command()
     def new(target: str, task: str):
         new_task(target, task)
 
     @_command()
-    def sv2(task: List[str] = None, include_subdir: bool = True):
+    def sv2(task: List[str] = None):
         serve_target2(task)
 
     @_command()
-    def exec(task_root: str, task_name: str):
-        exec_task(task_root, task_name)
+    def clean(task: List[str]=None):
+        from .run import path_to_taskSpec
+        tasks = path_to_taskSpec(task)
+        for v in tasks.values():
+            v.clear()
 
     # _args = _parsers['parser'].parse_args(['run', 'export'])
     args = _parsers['parser'].parse_args()
