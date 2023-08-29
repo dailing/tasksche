@@ -287,9 +287,13 @@ class TaskSpec2:
             str: The hex digest string of the MD5 hash.
         """
         code_file = self._task_file
+        md5_hash = md5()
         with open(code_file, 'rb') as f:
             code = f.read()
-        md5_hash = md5(code)
+        md5_hash.update(code)
+        if self._inherent_task is not None:
+            spec = TaskSpec2(self.root, self._inherent_task)
+            md5_hash.update(open(spec._task_file, 'rb').read())
         return md5_hash.hexdigest()
 
     @property
