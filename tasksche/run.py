@@ -281,7 +281,8 @@ class TaskSpec2:
         Calculate the MD5 hash of the code file and return the hex digest
         string.
 
-        TODO: add other dependency too·
+        TODO: add other dependency too
+        TODO: add inherent stack to the hash
 
         Returns:
             str: The hex digest string of the MD5 hash.
@@ -308,8 +309,6 @@ class TaskSpec2:
         """
         Check if the current task is dirty by comparing the code hash with
         the last saved dump, as well as the dependency hash.
-
-        TODO: finish this
 
         Returns:
             bool: True if the task is dirty, False otherwise.
@@ -386,6 +385,10 @@ class TaskSpec2:
             raise e
         if task_info is None:
             task_info = {}
+        if 'inherent' in task_info:
+            inh_cfg = TaskSche2(self.root, task_info['inherent'])._cfg_dict
+            inh_cfg.update(task_info)
+            task_info = inh_cfg
         return task_info
 
     @cached_property
@@ -400,7 +403,6 @@ class TaskSpec2:
             return None
         task_path = process_path(self.task_name, self._cfg_dict['inherent'])
         return task_path
-
 
     @cached_property
     def _require_map(self) -> Dict[Union[int, str], str]:
