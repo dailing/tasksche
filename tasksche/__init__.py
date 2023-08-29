@@ -1,2 +1,2 @@
 from .util import path_for
-work_dir='/tmp'
+work_dir = None

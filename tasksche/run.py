@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import os.path
@@ -91,7 +92,7 @@ class DumpedTypeOperation(Enum):
 
 
 class DumpedType:
-    def __init__(self, file_name=None, field_name=None, cache=True) -> None:
+    def __init__(self, file_name, field_name, cache=True) -> None:
         self.file_name = file_name
         self.field_name = field_name
         self.cache = cache
@@ -156,18 +157,27 @@ class DumpedType:
 
 
 class ExecEnv:
-    def __init__(self, pythonpath=None, cwd=None):
+    def __init__(self, pythonpath, cwd):
         self.pythonpath = pythonpath
         self.cwd = cwd
         self.previous_dir = os.getcwd()
+        self.stdout_file = None
+        self.redirect_stdout = None
 
     def __enter__(self):
         if self.pythonpath:
             sys.path.insert(0, self.pythonpath)
+        if not os.path.exists(self.cwd):
+            os.makedirs(self.cwd, exist_ok=True)
         if self.cwd:
             os.chdir(self.cwd)
+        self.stdout_file = open(os.path.join(self.cwd, 'stdout.txt'), 'w')
+        self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
+        self.redirect_stdout.__enter__()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
+        self.stdout_file.close()
         if self.cwd:
             os.chdir(self.previous_dir)
         if self.pythonpath:
@@ -175,8 +185,8 @@ class ExecEnv:
 
 
 class TaskSpec2:
-    _exec_info_dump: ExecInfo = DumpedType(file_name='exec_info.pkl',
-                                           field_name='__exec_info')
+    _exec_info_dump = DumpedType(file_name='exec_info.pkl',
+                                 field_name='__exec_info')
     _exec_result = DumpedType(file_name='exec_result.pkl',
                               field_name='__exec_result')
 
@@ -184,7 +194,7 @@ class TaskSpec2:
             self,
             root: str,
             task_name: str,
-            task_dict: Dict[str, Self] = None
+            task_dict: Union[Dict[str, Self], None] = None
     ) -> None:
         self.root = root
         self.task_name = task_name
@@ -209,7 +219,7 @@ class TaskSpec2:
             str: The path of the output directory.
         """
         task_name = task_name[1:].replace('/', '.')
-        return os.path.join(os.path.dirname(root), '_output', task_name)
+        return os.path.join(os.path.dirname(root), '__output', task_name)
 
     @staticmethod
     def _get_dump_file(root: str, taskname: str):
@@ -373,6 +383,20 @@ class TaskSpec2:
         if task_info is None:
             task_info = {}
         return task_info
+
+    @cached_property
+    def _inherent_task(self) -> Union[str, None]:
+        """
+        Returns the task name of inherent task.
+
+        :return: inherent task name
+        :rtype: str
+        """
+        if 'inherent' not in self._cfg_dict:
+            return None
+        task_path = process_path(self.task_name, self._cfg_dict['inherent'])
+        return task_path
+
 
     @cached_property
     def _require_map(self) -> Dict[Union[int, str], str]:
@@ -552,7 +576,10 @@ class TaskSpec2:
 
     @cached_property
     def task_module_path(self):
-        task_path = os.path.join(self.task_name, 'task')
+        if self._inherent_task is not None:
+            task_path = os.path.join(self._inherent_task, 'task')
+        else:
+            task_path = os.path.join(self.task_name, 'task')
         return task_path[1:].replace('/', '.')
 
     def execute(self):
