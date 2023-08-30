@@ -27,6 +27,7 @@ class TestTaskSche(unittest.TestCase):
         self.get_task_dict(clear=True)
         sche = TaskSche2(self.task_path, Runner)
         print(sche.task_dict['/task3']._cfg_dict)
+        print(sche.task_dict['/task3']._dependent_hash)
         sche.run()
 
     def test_enum_property(self):

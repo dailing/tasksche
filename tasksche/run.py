@@ -67,7 +67,6 @@ class Status(Enum):
 @dataclass
 class ExecInfo:
     time: float
-    code_hash: str
     depend_hash: Dict[str, str]
 
 
@@ -292,9 +291,9 @@ class TaskSpec2:
         with open(code_file, 'rb') as f:
             code = f.read()
         md5_hash.update(code)
-        if self._inherent_task is not None:
-            spec = TaskSpec2(self.root, self._inherent_task)
-            with open(spec._task_file, 'rb') as f:
+        for inherent_task in self._cfg_dict['inherent_list']:
+            task_spec = TaskSpec2(self.root, inherent_task)
+            with open(task_spec._task_file, 'rb') as f:
                 md5_hash.update(f.read())
         return md5_hash.hexdigest()
 
@@ -304,10 +303,8 @@ class TaskSpec2:
             task_name: self.task_dict[task_name]._hash()
             for task_name in self._all_dependent_tasks
         }
-        task_inh = self
-        while task_inh._inherent_task is not None:
-            task_inh = TaskSpec2(self.root, task_inh._inherent_task)
-            depend_hash[task_inh.task_name] = task_inh._hash()
+        # Add me to _dependent_hash
+        depend_hash[self.task_name] = self._hash()
         return depend_hash
 
     def _check_dirty(self) -> bool:
@@ -324,18 +321,14 @@ class TaskSpec2:
             return self._dirty
         if self._exec_info_dump is None:
             self._dirty = True
+            logger.info("None exec_info")
             return self._dirty
         exec_info: ExecInfo = self._exec_info_dump
         self._dirty = False
-        if exec_info.code_hash != self._hash():
+        if exec_info.depend_hash != self._dependent_hash:
             self._dirty = True
-        for t in self.depend_task:
-            if (
-                    not self._dirty
-                    and self.task_dict[t]._hash() != exec_info.depend_hash[t]
-            ):
-                self._dirty = True
-                break
+            logger.info(f"hash_missmatch {exec_info.depend_hash} != {self._dependent_hash}")
+            return self._dirty
         return self._dirty
 
     @property
@@ -409,14 +402,15 @@ class TaskSpec2:
             raise e
         if task_info is None:
             task_info = {}
+        inherent_list = []
         if 'inherent' in task_info:
             inh_path = process_path(self.task_name, task_info['inherent'])
             inh_cfg = TaskSpec2(self.root, inh_path)._cfg_dict
-            if 'inherent' in inh_cfg and inh_cfg['inherent'] is not None:
-                inh_path = inh_cfg['inherent']
+            inherent_list.append(inh_path)
+            inherent_list.extend(inh_cfg['inherent_list'])
             self.update_dict_recursive(inh_cfg, task_info)
             task_info = inh_cfg
-            task_info['inherent'] = inh_path
+        task_info['inherent_list'] = inherent_list
         return task_info
 
     @cached_property
@@ -427,9 +421,9 @@ class TaskSpec2:
         :return: inherent task name
         :rtype: str
         """
-        if 'inherent' not in self._cfg_dict:
+        if len(self._cfg_dict['inherent_list']) == 0:
             return None
-        task_path = self._cfg_dict['inherent']
+        task_path = self._cfg_dict['inherent_list'][-1]
         return task_path
 
     @cached_property
@@ -605,7 +599,6 @@ class TaskSpec2:
         kwargs = {k: self._prepare_args(v)
                   for k, v in self._require_map.items()
                   if isinstance(k, str)}
-        logger.info(f'args: {args}, kwargs: {kwargs}, req_map: {self._require_map}')  
         return args, kwargs
 
     @cached_property
@@ -650,14 +643,9 @@ class TaskSpec2:
         :return: An instance of the ExecInfo class.
         :rtype: ExecInfo
         """
-        depend_hash = {
-            task_name: self.task_dict[task_name]._hash()
-            for task_name in self._all_dependent_tasks
-        }
         exec_info = ExecInfo(
             time=time.time(),
-            code_hash=self._hash(),
-            depend_hash=depend_hash
+            depend_hash=self._dependent_hash
         )
         return exec_info
 

@@ -80,6 +80,7 @@ class TestTaskSche(unittest.TestCase):
         sche = TaskSche2(self.task_path, Runner)
         sche.run()
         sche = TaskSche2(self.task_path, Runner)
+        self.assertFalse(sche.task_dict['/task1'].dirty)
         self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
         sche.run()
 
