@@ -294,7 +294,8 @@ class TaskSpec2:
         md5_hash.update(code)
         if self._inherent_task is not None:
             spec = TaskSpec2(self.root, self._inherent_task)
-            md5_hash.update(open(spec._task_file, 'rb').read())
+            with open(spec._task_file, 'rb') as f:
+                md5_hash.update(f.read())
         return md5_hash.hexdigest()
 
     @property
@@ -303,6 +304,10 @@ class TaskSpec2:
             task_name: self.task_dict[task_name]._hash()
             for task_name in self._all_dependent_tasks
         }
+        task_inh = self
+        while task_inh._inherent_task is not None:
+            task_inh = TaskSpec2(self.root, task_inh._inherent_task)
+            depend_hash[task_inh.task_name] = task_inh._hash()
         return depend_hash
 
     def _check_dirty(self) -> bool:
@@ -360,7 +365,26 @@ class TaskSpec2:
             str: The path of the task file.
         """
         assert self.task_name.startswith('/')
-        return os.path.join(self.root, self.task_name[1:], 'task.py')
+        return os.path.join(self.root, self.task_name[1:]+'.py')
+
+    @staticmethod
+    def update_dict_recursive(d1, d2):
+        """
+        Recursively updates the first dictionary `d1` with the key-value
+        pairs from the second dictionary `d2`.
+
+        Parameters:
+            - d1 (dict): The dictionary to be updated.
+            - d2 (dict): The dictionary containing the key-value pairs 
+                to update `d1` with.
+        Returns:
+            None
+        """
+        for key, value in d2.items():
+            if key in d1 and isinstance(d1[key], dict) and isinstance(value, dict):
+                TaskSpec2.update_dict_recursive(d1[key], value)
+            else:
+                d1[key] = value
 
     @cached_property
     def _cfg_dict(self) -> Dict[str, Any]:
@@ -386,13 +410,17 @@ class TaskSpec2:
         if task_info is None:
             task_info = {}
         if 'inherent' in task_info:
-            inh_cfg = TaskSche2(self.root, task_info['inherent'])._cfg_dict
-            inh_cfg.update(task_info)
+            inh_path = process_path(self.task_name, task_info['inherent'])
+            inh_cfg = TaskSpec2(self.root, inh_path)._cfg_dict
+            if 'inherent' in inh_cfg and inh_cfg['inherent'] is not None:
+                inh_path = inh_cfg['inherent']
+            self.update_dict_recursive(inh_cfg, task_info)
             task_info = inh_cfg
+            task_info['inherent'] = inh_path
         return task_info
 
     @cached_property
-    def _inherent_task(self) -> Union[str, None]:
+    def _inherent_task(self) -> List[str]:
         """
         Returns the task name of inherent task.
 
@@ -401,7 +429,7 @@ class TaskSpec2:
         """
         if 'inherent' not in self._cfg_dict:
             return None
-        task_path = process_path(self.task_name, self._cfg_dict['inherent'])
+        task_path = self._cfg_dict['inherent']
         return task_path
 
     @cached_property
@@ -577,16 +605,18 @@ class TaskSpec2:
         kwargs = {k: self._prepare_args(v)
                   for k, v in self._require_map.items()
                   if isinstance(k, str)}
-
+        logger.info(f'args: {args}, kwargs: {kwargs}, req_map: {self._require_map}')  
         return args, kwargs
 
     @cached_property
     def task_module_path(self):
         if self._inherent_task is not None:
-            task_path = os.path.join(self._inherent_task, 'task')
+            task_path = self._inherent_task
         else:
-            task_path = os.path.join(self.task_name, 'task')
-        return task_path[1:].replace('/', '.')
+            task_path = self.task_name
+        task_file = task_path
+        mod_path = task_file[1:].replace('/', '.')
+        return mod_path
 
     def execute(self):
         """
@@ -600,7 +630,7 @@ class TaskSpec2:
         Returns:
             None
         """
-        logger.info(f'executing {self.task_name}@{self.root}')
+        logger.info(f'executing {self.task_name}@{self.task_module_path}')
         with self._exec_env:
             import importlib
             mod = importlib.import_module(self.task_module_path)
@@ -688,7 +718,7 @@ def search_for_root(base):
     while path != '/':
         if os.path.exists(os.path.join(path, '.root')):
             return path
-        path = os.path.split(path)[0]
+        path = os.path.dirname(path)
     return None
 
 
@@ -712,23 +742,25 @@ def path_to_taskSpec(tasks: List[str], root=None) -> Dict[str, TaskSpec2]:
         root = search_for_root(tasks[0])
     if root is None:
         raise Exception('Cannot find task root!')
-
+    logger.debug(f'root: {root}')
+    logger.debug(f'tasks: {tasks}')
     task_names = []
     for task_path in tasks:
         task_path = os.path.abspath(task_path)
-        if os.path.isfile(task_path):
-            task_path = os.path.dirname(task_path)
-        if not os.path.exists(os.path.join(task_path, 'task.py')):
-            logger.warning(f'{task_path} is not a task')
+        if os.path.isdir(task_path):
             continue
+        if not task_path.endswith('.py'):
+            continue
+            # task_path = os.path.dirname(task_path)
+        # if not os.path.exists(os.path.join(task_path, 'task.py')):
+        #     logger.warning(f'{task_path} is not a task')
+        #     continue
         assert task_path.startswith(root)
         assert os.path.exists(task_path)
-        task_name = task_path[len(root):]
-        if task_name == '':
-            task_name = '/'
+        task_name = task_path[len(root):-3]
         if task_name not in task_names:
             task_names.append(task_name)
-
+    # logger.info(f'tasks: {task_names}')
     task_dict: Dict[str, TaskSpec2] = {}
     for task_name in task_names:
         task_dict[task_name] = TaskSpec2(root, task_name, task_dict=task_dict)
@@ -763,6 +795,8 @@ def _dfs_build_exe_graph(
                 task_name=depend_task_name,
                 task_dict=task_dict
             )
+            logger.info(
+                f'adding task {depend_task_name} for {task_spec._task_file}')
             task_dict[depend_task_name] = depend_task_spec
             _dfs_build_exe_graph([depend_task_spec], task_dict)
 
@@ -901,7 +935,6 @@ class TaskSche2():
                 logger.debug(f'got event:{event}')
                 if event.event_type == EventType.TASK_FINISHED:
                     self.set_finished(event.task_name)
-                    # dump exec_info
                     self.task_dict[event.task_name].dump_exec_info()
                 elif event.event_type == EventType.TASK_ERROR:
                     self.set_error(event.task_name)
@@ -1146,6 +1179,7 @@ class TaskSpecEndTask(TaskSpec):
 
 
 def process_path(task_name, path):
+    task_name = os.path.dirname(task_name)
     if not path.startswith('/'):
         path = os.path.join(task_name, path)
     path_filtered = []
