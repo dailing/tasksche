@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from multiprocessing import Process
 import os
 import os.path
 import pickle
@@ -15,7 +16,7 @@ from hashlib import md5
 from io import BytesIO, StringIO
 from itertools import zip_longest
 from pprint import pprint
-from queue import Queue
+from multiprocessing import Queue
 from typing import Any, Callable, Dict, List, Set, Tuple
 from typing import Union
 
@@ -321,13 +322,11 @@ class TaskSpec2:
             return self._dirty
         if self._exec_info_dump is None:
             self._dirty = True
-            logger.info("None exec_info")
             return self._dirty
         exec_info: ExecInfo = self._exec_info_dump
         self._dirty = False
         if exec_info.depend_hash != self._dependent_hash:
             self._dirty = True
-            logger.info(f"hash_missmatch {exec_info.depend_hash} != {self._dependent_hash}")
             return self._dirty
         return self._dirty
 
@@ -368,13 +367,17 @@ class TaskSpec2:
 
         Parameters:
             - d1 (dict): The dictionary to be updated.
-            - d2 (dict): The dictionary containing the key-value pairs 
+            - d2 (dict): The dictionary containing the key-value pairs
                 to update `d1` with.
         Returns:
             None
         """
         for key, value in d2.items():
-            if key in d1 and isinstance(d1[key], dict) and isinstance(value, dict):
+            if (
+                key in d1
+                and isinstance(d1[key], dict)
+                and isinstance(value, dict)
+            ):
                 TaskSpec2.update_dict_recursive(d1[key], value)
             else:
                 d1[key] = value
@@ -405,6 +408,7 @@ class TaskSpec2:
         inherent_list = []
         if 'inherent' in task_info:
             inh_path = process_path(self.task_name, task_info['inherent'])
+            # logger.info(f'inherent: {inh_path}, {self.task_name}')
             inh_cfg = TaskSpec2(self.root, inh_path)._cfg_dict
             inherent_list.append(inh_path)
             inherent_list.extend(inh_cfg['inherent_list'])
@@ -550,22 +554,6 @@ class TaskSpec2:
         ):
             lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
         return lines
-
-    def _dump_result(self, output: Any):
-        """
-        Dump the result of the task to the output dump file.
-        NOTE: this function should only be called by @execute
-
-        Args:
-            output (Any): The output of the task.
-
-        Returns:
-            None
-        """
-        payload = output
-        if not os.path.exists(os.path.dirname(self.output_dump_file)):
-            os.makedirs(os.path.dirname(self.output_dump_file))
-        pickle.dump(payload, open(self.output_dump_file, 'wb'))
 
     def _prepare_args(
             self,
@@ -783,8 +771,9 @@ def _dfs_build_exe_graph(
                 task_name=depend_task_name,
                 task_dict=task_dict
             )
-            logger.info(
-                f'adding task {depend_task_name} for {task_spec._task_file}')
+            logger.info(f'adding task {depend_task_name}')
+            # logger.info(
+            #     f'adding task {depend_task_name} for {task_spec._task_file}')
             task_dict[depend_task_name] = depend_task_spec
             _dfs_build_exe_graph([depend_task_spec], task_dict)
 
@@ -845,19 +834,56 @@ class Runner():
             None
         """
         task_spec = TaskSpec2(task_root, task_name)
-        task_spec.execute()
+        try:
+            task_spec.execute()
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            self.event_queue.put(SchedulerEvent(
+                EventType.TASK_ERROR, task_name, task_root))
+            return
         self.event_queue.put(SchedulerEvent(
             EventType.TASK_FINISHED, task_name, task_root))
 
 
+class PRunner(Runner):
+    @staticmethod
+    def _run(task_root, task_name, event_queue):
+        runner = Runner(event_queue)
+        runner.add_task(task_root, task_name)
+
+    def __init__(self, event_queue: Queue) -> None:
+        self.event_queue = event_queue
+        self.processes = []
+
+    def add_task(self, task_root: str, task_name: str) -> None:
+        """
+        Add a task to the task list.
+
+        Args:
+            task_root (str): The root directory of the task.
+            task_name (str): The name of the task.
+
+        Returns:
+            None
+        """
+        logger.info(f'adding task {task_name}@{task_root}')
+        p = Process(
+            target=self._run,
+            args=(task_root, task_name, self.event_queue))
+        self.processes.append(p)
+        p.start()
+
+
 class TaskSche2():
-    def __init__(self, target, get_runner: Callable[[Queue], Runner] = None) -> None:
+    def __init__(
+            self, target, get_runner: Callable[[Queue], Runner] = None
+    ) -> None:
         self.target, self.task_dict = build_exe_graph(target)
         self.event_queue = Queue()
         if get_runner is not None:
             self.runner = get_runner(self.event_queue)
         else:
-            self.runner = Runner(self.event_queue)
+            self.runner = PRunner(self.event_queue)
 
     def _get_ready(self) -> Union[str, None]:
         """
@@ -1140,11 +1166,6 @@ class TaskSpec(_TaskSpec):
                 args[k] = v
             return args
         return kwargs
-
-    def dump_result(self, result):
-        pickle.dump(result, open(self.result_file, 'wb'))
-        pickle.dump((self.code_hash, time.time()),
-                    open(self.result_info, 'wb'))
 
 
 class TaskSpecEndTask(TaskSpec):

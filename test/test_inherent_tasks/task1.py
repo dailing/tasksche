@@ -9,3 +9,8 @@ require:
 
 def run(a, b, c, d):
     return sum((a, b, c, d))
+
+
+if __name__ == '__main__':
+    from tasksche import run_task
+    run_task()
