@@ -1,15 +1,16 @@
-from tasksche.run import (
-    Runner, Status, TaskSche2,
-    build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
 import unittest
 from pathlib import Path
+
+from tasksche.run import (
+    Runner, Status, TaskScheduler,
+    build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
 
 
 class TestTaskSche(unittest.TestCase):
     @property
     def task_path(self):
         current_file_path = Path(__file__)
-        parent_path = current_file_path.parent / 'test_task_set' / 'task.py'
+        parent_path = current_file_path.parent / 'simple_task_set' / 'task.py'
         return [parent_path]
 
     def get_task_dict(self, clear=True):
@@ -39,7 +40,7 @@ class TestTaskSche(unittest.TestCase):
         self.assertEqual(d['/task'].status, Status.STATUS_PENDING)
 
     def test_get_ready(self):
-        sche = TaskSche2(self.task_path, None)
+        sche = TaskScheduler(self.task_path, None)
         ready_task = sche.get_ready_set_running()
         self.assertIn(ready_task, ['/task1', '/task2'])
         self.assertEqual(
@@ -77,15 +78,16 @@ class TestTaskSche(unittest.TestCase):
 
     def test_run_basic_runner(self):
         self.get_task_dict(clear=True)
-        sche = TaskSche2(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path, Runner)
         sche.run()
-        sche = TaskSche2(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path, Runner)
         self.assertFalse(sche.task_dict['/task1'].dirty)
         self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
         sche.run()
 
     def test_enum_property(self):
         self.assertFalse(DumpedTypeOperation.DELETE == "DELETE")
+
 
 if __name__ == '__main__':
     unittest.main()

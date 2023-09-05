@@ -1,5 +1,5 @@
 from tasksche.run import (
-    Runner, Status, TaskSche2,
+    Runner, Status, TaskScheduler,
     build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
 import unittest
 from pathlib import Path
@@ -11,7 +11,7 @@ class TestTaskSche(unittest.TestCase):
         current_file_path = Path(__file__)
         parent_path = (
             current_file_path.parent /
-            'test_inherent_tasks' /
+            'task_set_inherent_tasks' /
             'task3.py')
         return [parent_path]
 
@@ -25,7 +25,7 @@ class TestTaskSche(unittest.TestCase):
 
     def test_run_basic_runner(self):
         self.get_task_dict(clear=True)
-        sche = TaskSche2(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path, Runner)
         print(sche.task_dict['/task3']._cfg_dict)
         print(sche.task_dict['/task3']._dependent_hash)
         sche.run()

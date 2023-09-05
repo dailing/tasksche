@@ -2,7 +2,7 @@ import argparse
 import inspect
 from typing import List, get_args, get_origin
 
-from .run import clean_target, new_task, serve_target, serve_target2, exec_task
+from .run import clean_target, new_task, serve_target, serve_target, exec_task
 
 
 def _parser():
@@ -48,29 +48,13 @@ if __name__ == '__main__':
         return wrap
 
     @_command()
-    def serve(target: str, task: List[str] = None, addr: str = None):
-        serve_target(target, task, addr)
-
-    @_command()
-    def run(target: str, task: List[str] = None, addr: str = None):
-        serve_target(target, task, addr, exit=True)
-
-    # @_command()
-    # def clean(target: str):
-    #     clean_target(target)
-
-    @_command()
-    def new(target: str, task: str):
-        new_task(target, task)
-
-    @_command()
     def sv2(task: List[str] = None):
-        serve_target2(task)
+        serve_target(task)
 
     @_command()
     def clean(task: List[str]=None):
-        from .run import path_to_taskSpec
-        tasks = path_to_taskSpec(task)
+        from .run import path_to_task_spec
+        tasks = path_to_task_spec(task)
         for v in tasks.values():
             v.clear()
 
