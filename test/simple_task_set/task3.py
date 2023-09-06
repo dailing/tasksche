@@ -4,5 +4,6 @@ require:
     1: $/task2
 """
 
-def run(*args, ** kwargs):
+
+def run(*args, **kwargs):
     return sum(args)

@@ -1,7 +1,7 @@
 # task scheduler
 
 ## Features
-
+* dependence check, change detection continuous development
 * Inheritance of task configuration, and code from parent tasks
   * The run function is defined in the last parent
   * The nearest parameter overrides the parent
