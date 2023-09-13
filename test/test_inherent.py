@@ -26,7 +26,7 @@ class TestTaskSche(unittest.TestCase):
 
     def test_run_basic_runner(self):
         self.get_task_dict(clear=True)
-        sche = TaskScheduler(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path)
         print(sche.task_dict['/task3']._cfg_dict)
         print(sche.task_dict['/task3'].dependent_hash)
         sche.run(once=True)

@@ -23,9 +23,9 @@ class TestTaskSche(unittest.TestCase):
 
     def test_run_basic_Prunner(self):
         self.get_task_dict(clear=True)
-        sche = TaskScheduler(self.task_path, PRunner)
+        sche = TaskScheduler(self.task_path)
         sche.run(once=True)
-        sche = TaskScheduler(self.task_path, PRunner)
+        sche = TaskScheduler(self.task_path)
         self.assertFalse(sche.task_dict['/task1'].dirty)
         self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
         sche.run(once=True)

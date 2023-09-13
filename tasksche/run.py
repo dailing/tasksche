@@ -1,12 +1,15 @@
+import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import os.path
 import pickle
 import sys
-import threading
 import time
 from abc import abstractmethod, ABC
+# from queue import Queue as _Queue
+from asyncio import Queue
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
@@ -14,19 +17,12 @@ from hashlib import md5
 from io import BytesIO, StringIO
 from itertools import zip_longest
 from multiprocessing import Process
-from multiprocessing import Queue
 from pprint import pprint
-from typing import Any, Callable, Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 import yaml
 from typing_extensions import Self
-from watchfiles import watch
-
-try:
-    import networkx as nx
-    import socketio
-except ImportError:
-    pass
+from watchfiles import awatch
 
 
 def get_logger(name: str, print_level=logging.DEBUG):
@@ -247,6 +243,10 @@ class TaskSpec:
             self.update_status()
         return self._status
 
+    def _broadcast_status(self):
+        for t in self.all_task_depend_me:
+            self.task_dict[t].update_status()
+
     @status.setter
     def status(self, value: Status):
         """
@@ -256,14 +256,15 @@ class TaskSpec:
         Args:
             value (Status): The new status value.
         """
+        if value is None:
+            self.update_status()
         if value == self._status:
             return
         if self._status is None:
             self._status = value
             return
         self._status = value
-        for t in self.all_task_depend_me:
-            self.task_dict[t].update_status()
+        self._broadcast_status()
 
     def _hash(self):
         """
@@ -324,6 +325,9 @@ class TaskSpec:
 
     @dirty.setter
     def dirty(self, value: bool):
+        if value is None:
+            self._dirty = None
+            return
         assert isinstance(value, bool)
         prev_value = self._dirty
         self._dirty = value
@@ -628,9 +632,15 @@ class TaskSpec:
         self._exec_info_dump = exec_info
 
     def clear(self):
+        logger.info(f'clearing {self.task_name}')
+        if self.status != Status.STATUS_FINISHED:
+            return
         self._exec_info_dump = DumpedTypeOperation.DELETE
         self._exec_result = DumpedTypeOperation.DELETE
+        self.dirty = None
         self.status = None
+        for related_tasks in self.depend_by:
+            self.task_dict[related_tasks].clear()
 
 
 class EndTask(TaskSpec):
@@ -782,7 +792,7 @@ def build_exe_graph(tasks: List[str]):
     return target_task_name, task_dict
 
 
-class EventType(Enum):
+class TaskEventType(Enum):
     def _generate_next_value_(name, start, count, last_values):
         return name
 
@@ -793,8 +803,8 @@ class EventType(Enum):
 
 
 @dataclass
-class SchedulerEvent:
-    event_type: EventType
+class TaskEvent:
+    event_type: TaskEventType
     task_name: str
     task_root: str
 
@@ -803,13 +813,6 @@ class SchedulerEvent:
 
 
 class RunnerBase(ABC):
-    @abstractmethod
-    def __enter__(self):
-        pass
-
-    @abstractmethod
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
 
     @abstractmethod
     def add_task(self, task_root: str, task_name: str) -> None:
@@ -830,7 +833,8 @@ class RunnerBase(ABC):
         """
         Get the list of running processes.
 
-        :return: A list of strings representing the names of the running processes.
+        :return: A list of strings representing the names of the running
+            processes.
         :rtype: List[str]
         """
         pass
@@ -840,73 +844,54 @@ class RunnerBase(ABC):
         pass
 
 
-class Runner(RunnerBase):
-    def __init__(self, event_queue: Queue) -> None:
-        self.event_queue = event_queue
-
-    def __enter__(self):
-        logger.info('entering ...')
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        logger.info('exiting ...')
-
-    def add_task(self, task_root: str, task_name: str) -> None:
-        task_spec = TaskSpec(task_root, task_name)
-        try:
-            task_spec.execute()
-        except Exception as e:
-            logger.error(e, exc_info=True)
-            self.event_queue.put(SchedulerEvent(
-                EventType.TASK_ERROR, task_name, task_root))
-            return
-        self.event_queue.put(SchedulerEvent(
-            EventType.TASK_FINISHED, task_name, task_root))
-
-    def get_running_tasks(self) -> List[str]:
-        return []
-
-    def stop_tasks_and_wait(self, tasks: List[str]):
-        return
-
-
-class PRunner(Runner):
+class PRunner(RunnerBase):
 
     @staticmethod
-    def _run(task_root, task_name, event_queue):
-        runner = Runner(event_queue)
-        runner.add_task(task_root, task_name)
+    def _run(task_root, task_name):
+        task_spec = TaskSpec(task_root, task_name)
+        task_spec.execute()
 
-    def __init__(self, event_queue: Queue) -> None:
-        super().__init__(event_queue)
+    def __init__(self, event_queue: Queue, loop: asyncio.AbstractEventLoop) -> None:
+        self.event_queue = event_queue
+        self.loop = loop
         self.processes: Dict[str, Process] = {}
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        logging.info('exiting ...')
+    async def __aenter__(self):
+        logger.info('FUCK')
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        logger.info('exiting ...')
         for p in self.processes.values():
             if p.is_alive():
                 p.terminate()
             p.join()
         self.processes.clear()
 
-    def add_task(self, task_root: str, task_name: str) -> None:
-        """
-        Add a task to the task list.
-
-        Args:
-            task_root (str): The root directory of the task.
-            task_name (str): The name of the task.
-
-        Returns:
-            None
-        """
+    async def _run_task(self, task_root: str, task_name: str):
+        logger.info(f'running task {task_name} ...')
         p = Process(
             target=self._run,
-            args=(task_root, task_name, self.event_queue))
+            args=(task_root, task_name))
         self.processes[task_name] = p
-        p.start()
+        await self.loop.run_in_executor(None, p.start)
+        await self.loop.run_in_executor(None, p.join)
+        exit_code = p.exitcode
+        if exit_code == 0:
+            await self.event_queue.put(TaskEvent(
+                TaskEventType.TASK_FINISHED, task_name, task_root))
+        else:
+            await self.event_queue.put(TaskEvent(
+                TaskEventType.TASK_ERROR, task_name, task_root))
+        logger.info(f'finished task {task_name}')
+
+    def add_task(self, task_root: str, task_name: str) -> None:
+        self.loop.create_task(self._run_task(task_root, task_name))
 
     def get_running_tasks(self) -> List[str]:
+        for k, v in self.processes.items():
+            if not v.is_alive():
+                v.join()
+                del self.processes[k]
         return list(self.processes.keys())
 
     def stop_tasks_and_wait(self, tasks: List[str]):
@@ -923,50 +908,113 @@ class PRunner(Runner):
 
 
 class FileWatcher:
-    def __init__(self, root: str, queue: Queue):
+    def __init__(
+            self,
+            root: str,
+            queue: Queue,
+            loop: Optional[asyncio.AbstractEventLoop] = None):
         self.root = root
-        self.thread = None
-        self.stop_event = threading.Event()
+        self.stop_event = asyncio.Event()
         self.event_queue = queue
+        self.loop = loop
+        self.async_task: Optional[asyncio.Task] = None
 
-    def _func(self):
+    async def _func(self):
         logger.info(f'watching {self.root} ...')
-        for event in watch(self.root, stop_event=self.stop_event):
+        async for event in awatch(self.root, stop_event=self.stop_event):
             files = set([x[1] for x in event])
             for f in files:
-                self.event_queue.put(SchedulerEvent(
-                    EventType.FILE_CHANGE, f, 'None'))
+                await self.event_queue.put(TaskEvent(
+                    TaskEventType.FILE_CHANGE, f, 'None'))
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self.start()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop()
 
     def start(self):
-        if self.thread is not None:
+        if self.async_task is not None:
             logger.warning('already started')
             self.stop()
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._func)
-        self.thread.start()
+        self.async_task = self.loop.create_task(self._func())
         return self
 
-    def stop(self):
+    async def stop(self):
         self.stop_event.set()
-        self.thread.join()
+        await self.async_task
+
+
+class SchedulerCallbackBase(ABC):
+
+    def status_change(self, event: Status, task_spec: TaskSpec):
+        pass
+
+
+class _CallBackCollection(SchedulerCallbackBase):
+    def __init__(
+            self,
+            callbacks: Optional[List[SchedulerCallbackBase]] = None
+    ) -> None:
+        super().__init__()
+        if callbacks is None:
+            self.callbacks = []
+        else:
+            self.callbacks = callbacks
+
+    def _handle(self, payload: Any, task_spec: TaskSpec):
+        caller_frame = inspect.currentframe().f_back
+        caller_function_name = caller_frame.f_code.co_name
+        for cb in self.callbacks:
+            func = getattr(cb, caller_function_name)
+            func(payload, task_spec)
+
+    def status_change(self, event: Status, task_spec: TaskSpec):
+        return self._handle(event, task_spec)
+
+
+class SchedulerEventType(Enum):
+    STATUS_CHANGE = auto()
+
+
+@dataclass
+class SchedulerEvent:
+    event: SchedulerEventType
+    msg: Any
+
+
+class CallbackCaller:
+    def __init__(self, callback: SchedulerCallbackBase):
+        self.callback = callback
 
 
 class TaskScheduler:
     def __init__(
-            self, target, get_runner: Callable[[Queue], Runner] = None
+            self,
+            target,
+            loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         self.target, self.task_dict = build_exe_graph(target)
-        self.event_queue = Queue()
-        if get_runner is not None:
-            self.runner = get_runner(self.event_queue)
-        else:
-            self.runner = PRunner(self.event_queue)
+        self._task_event_queue = Queue()
+        self._call_back = _CallBackCollection()
+        self._call_back_caller = None
+        self.main_loop_task: Optional[asyncio.Task] = None
+        self._sche_event_queue = Queue()
+        self._callback_caller = None
+        self._callback_caller_event = None
+        if loop is None:
+            loop = asyncio.new_event_loop()
+        self.loop = loop
+        self.runner = PRunner(self._task_event_queue, self.loop)
+
+    def _restart_cb_caller(self):
+        # self._callback_caller
+        pass
+
+    def on_event(self, cb: SchedulerCallbackBase):
+        self._call_back.callbacks.append(cb)
+        return self
 
     def _get_ready(self) -> Union[str, None]:
         """
@@ -989,6 +1037,10 @@ class TaskScheduler:
         assert isinstance(task, str), task
         assert task in self.task_dict, f'{task} is not a valid task'
         self.task_dict[task].status = status
+        self.loop.create_task(self._sche_event_queue.put(SchedulerEvent(
+            SchedulerEventType.STATUS_CHANGE,
+            task,
+        )))
 
     def set_finished(self, task: str):
         self.set_status(task, Status.STATUS_FINISHED)
@@ -1003,11 +1055,16 @@ class TaskScheduler:
         for t in self.task_dict.values():
             print(f'{t.task_name}: {t.status}')
 
-    def clear(self, tasks: List[str]):
+    async def clear(self, tasks: Union[List[str], str, None] = None):
         if tasks is None:
             tasks = self.task_dict.keys()
+        elif isinstance(tasks, str):
+            tasks = [tasks]
         for task in tasks:
+            logger.info(f'clearing {task}')
             self.task_dict[task].clear()
+            await self._task_event_queue.put(
+                TaskEvent(TaskEventType.TASK_INTERRUPT, task, self.root))
 
     @cached_property
     def root(self):
@@ -1015,10 +1072,9 @@ class TaskScheduler:
 
     @cached_property
     def file_watcher(self):
-        return FileWatcher(self.root, self.event_queue)
+        return FileWatcher(self.root, self._task_event_queue, self.loop)
 
-    def _reload(self):
-        # TODO do this reload
+    async def _reload(self):
         """
         1. loop through all tasks
             2. Initiate new TaskSpec, compare dependency_hash with old TaskSpec
@@ -1028,8 +1084,8 @@ class TaskScheduler:
         5. remove task event in event queue for changed task with all children
         """
         queued_event = []
-        while not self.event_queue.empty():
-            queued_event.append(self.event_queue.get())
+        while not self._task_event_queue.empty():
+            queued_event.append(await self._task_event_queue.get())
         _, new_task_dict = build_exe_graph(
             [self.task_dict[x].task_file for x in self.target])
         removed_tasks = list(set(self.task_dict.keys()) -
@@ -1059,15 +1115,15 @@ class TaskScheduler:
         logger.info(f'all_influenced_tasks: {all_influenced_tasks}')
         self.runner.stop_tasks_and_wait(list(all_influenced_tasks))
         for event in queued_event:
-            if event.event_type == EventType.FILE_CHANGE:
+            if event.event_type == TaskEventType.FILE_CHANGE:
                 continue
             if event.task_name not in self.task_dict:
                 continue
             if event.task_name in changed_tasks:
                 continue
-            self.event_queue.put(event)
+            await self._task_event_queue.put(event)
 
-    def run(self, once=False):
+    async def _run(self, once=True):
         """
         Runs the main loop of the program. This function continuously checks
         for ready tasks and executes them. If there are no ready tasks, it
@@ -1083,43 +1139,92 @@ class TaskScheduler:
             None
         """
         logger.info('running...')
-        with self.runner, self.file_watcher:
+        async with self.runner, self.file_watcher:
             while True:
                 ready_task = self.get_ready_set_running()
+                # logger.info(f'got ready task:{ready_task}')
                 if ready_task is None:
-                    event = self.event_queue.get()
+                    try:
+                        event = await self._task_event_queue.get()
+                    except ValueError:
+                        logger.info('stop running')
+                        self.runner.stop_tasks_and_wait(
+                            self.runner.get_running_tasks())
+                        break
+                    except Exception as e:
+                        logger.error(e, stack_info=True)
+                        logger.error(f'{type(e)}')
+                        break
                     logger.debug(f'got event:{event}')
-                    if event.event_type == EventType.TASK_FINISHED:
+                    if event is None:
+                        logger.info('stop running')
+                        break
+                    elif event.event_type == TaskEventType.TASK_FINISHED:
                         self.set_finished(event.task_name)
                         self.task_dict[event.task_name].dump_exec_info()
-                    elif event.event_type == EventType.TASK_ERROR:
+                    elif event.event_type == TaskEventType.TASK_ERROR:
                         self.set_error(event.task_name)
                         logger.info(f'task:{event.task_name} is errored')
-                    elif event.event_type == EventType.TASK_INTERRUPT:
-                        self.set_error(event.task_name)
-                    elif event.event_type == EventType.FILE_CHANGE:
+                    elif event.event_type == TaskEventType.TASK_INTERRUPT:
+                        logger.info(f'task:{event.task_name} is interrupted')
+                        pass
+                    elif event.event_type == TaskEventType.FILE_CHANGE:
                         logger.info(f'file changed:{event.task_name}')
-                        self._reload()
+                        await self._reload()
                     else:
                         raise NotImplementedError()
                 else:
-                    logger.debug(f'got ready task:{ready_task}')
+                    # logger.info(f'got ready task:{ready_task}')
                     if ready_task == '_END_':
                         logger.info('all tasks are finished')
                         if once:
-                            logger.info("FUCK THIS")
+                            logger.info("in single step mode, exiting...")
                             break
                         continue
                     task_spec = self.task_dict[ready_task]
                     self.runner.add_task(task_spec.root, task_spec.task_name)
+        self.runner = None
+        logger.info('exiting _run')
+
+    async def stop(self):
+        logger.info('stop running...')
+        if self.main_loop_task is None:
+            logger.error('not running, exit')
+            return
+        logger.info('sending stop signal')
+        await self._task_event_queue.put(None)
+        logger.info('waiting for main_loop_task')
+        await self.main_loop_task
+        while not self._task_event_queue.empty():
+            await self._task_event_queue.get()
+        self.main_loop_task = None
+        # self._task_event_queue = None
+        logger.info('stopped')
+
+    def run(self, once=False, daemon=False):
+        """
+        add _run to loop if daemon,
+        else run _run and await
+        """
+        if self.main_loop_task is not None and not self.main_loop_task.done():
+            logger.error('already running !!')
+            return
+        if daemon:
+            self.main_loop_task = self.loop.create_task(self._run(once))
+        else:
+            self.loop.run_until_complete(self._run(once))
+
+    @property
+    def sche_event_queue(self):
+        return self._sche_event_queue
 
 
 def serve_target(tasks: List[dir]):
     logger.info(f'serve2 {tasks}')
-    scheduler = TaskScheduler(tasks, None)
+    scheduler = TaskScheduler(tasks)
     # task_dict_to_pdf(scheduler.task_dict)
     logger.debug(scheduler.task_dict)
-    scheduler.run()
+    scheduler.run(once=False, daemon=False)
 
 
 def exec_task(task_root, task_name):

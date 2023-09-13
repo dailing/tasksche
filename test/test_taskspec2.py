@@ -18,6 +18,7 @@ class TestTaskSche(unittest.TestCase):
         if clear:
             for v in task_dict.values():
                 v.clear()
+            # _, task_dict = build_exe_graph(self.task_path)
         task_dict_to_pdf(task_dict)
         return task_dict
 
@@ -78,9 +79,9 @@ class TestTaskSche(unittest.TestCase):
 
     def test_run_basic_runner(self):
         self.get_task_dict(clear=True)
-        sche = TaskScheduler(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path)
         sche.run(once=True)
-        sche = TaskScheduler(self.task_path, Runner)
+        sche = TaskScheduler(self.task_path)
         self.assertFalse(sche.task_dict['/task1'].dirty)
         self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
         sche.run(once=True)

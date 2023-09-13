@@ -20,3 +20,4 @@ tqdm>=4.64.0
 yaml>=0.2.5
 dataclasses>=0.8
 watchdog>=3.0.0
+fastapi>=0.103.1
