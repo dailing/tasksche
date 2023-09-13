@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import multiprocessing
 import os
 import os.path
 import pickle
@@ -19,7 +20,7 @@ from itertools import zip_longest
 from multiprocessing import Process
 from pprint import pprint
 from typing import Any, Dict, List, Tuple, Union, Optional
-
+import concurrent.futures
 import yaml
 from typing_extensions import Self
 from watchfiles import awatch
@@ -600,17 +601,21 @@ class TaskSpec:
         Returns:
             None
         """
-        logger.info(f'executing {self.task_name}@{self.task_module_path}')
+        logger.debug(f'executing {self.task_name}@{self.task_module_path}')
         with self._exec_env:
-            import importlib
-            mod = importlib.import_module(self.task_module_path)
-            mod.__dict__['work_dir'] = self.output_dump_folder
-            if not hasattr(mod, 'run'):
-                raise NotImplementedError()
-            args, kwargs = self._load_input()
-            output = mod.run(*args, **kwargs)
-            self._exec_result = output
-        return True
+            try:
+                import importlib
+                mod = importlib.import_module(self.task_module_path)
+                mod.__dict__['work_dir'] = self.output_dump_folder
+                if not hasattr(mod, 'run'):
+                    raise NotImplementedError()
+                args, kwargs = self._load_input()
+                output = mod.run(*args, **kwargs)
+                self._exec_result = output
+            except Exception as e:
+                logger.error(e, stack_info=True)
+                return 1
+        return 0
 
     @property
     def _exec_info(self) -> ExecInfo:
@@ -849,15 +854,17 @@ class PRunner(RunnerBase):
     @staticmethod
     def _run(task_root, task_name):
         task_spec = TaskSpec(task_root, task_name)
-        task_spec.execute()
+        value = task_spec.execute()
+        return value
 
     def __init__(self, event_queue: Queue, loop: asyncio.AbstractEventLoop) -> None:
         self.event_queue = event_queue
         self.loop = loop
         self.processes: Dict[str, Process] = {}
+        self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=6)
 
     async def __aenter__(self):
-        logger.info('FUCK')
+        pass
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         logger.info('exiting ...')
@@ -869,20 +876,29 @@ class PRunner(RunnerBase):
 
     async def _run_task(self, task_root: str, task_name: str):
         logger.info(f'running task {task_name} ...')
-        p = Process(
-            target=self._run,
-            args=(task_root, task_name))
-        self.processes[task_name] = p
-        await self.loop.run_in_executor(None, p.start)
-        await self.loop.run_in_executor(None, p.join)
-        exit_code = p.exitcode
+
+        def _start_process_return_exit_code():
+            p = Process(
+                target=self._run,
+                args=(task_root, task_name))
+            self.processes[task_name] = p
+            p.start()
+            p.join()
+            logger.info(p.exitcode)
+            return p.exitcode
+        exit_code = await self.loop.run_in_executor(
+            self.executor,
+            self._run,
+            task_root, task_name
+        )
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
+            logger.info(f'finished task {task_name}')
         else:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_ERROR, task_name, task_root))
-        logger.info(f'finished task {task_name}')
+            logger.info(f'Error task {task_name}')
 
     def add_task(self, task_root: str, task_name: str) -> None:
         self.loop.create_task(self._run_task(task_root, task_name))
@@ -995,16 +1011,16 @@ class TaskScheduler:
             target,
             loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
+        if loop is None:
+            loop = asyncio.new_event_loop()
         self.target, self.task_dict = build_exe_graph(target)
-        self._task_event_queue = Queue()
+        self._task_event_queue = Queue(loop=loop)
         self._call_back = _CallBackCollection()
         self._call_back_caller = None
         self.main_loop_task: Optional[asyncio.Task] = None
-        self._sche_event_queue = Queue()
+        self._sche_event_queue = Queue(loop=loop)
         self._callback_caller = None
         self._callback_caller_event = None
-        if loop is None:
-            loop = asyncio.new_event_loop()
         self.loop = loop
         self.runner = PRunner(self._task_event_queue, self.loop)
 
@@ -1183,7 +1199,7 @@ class TaskScheduler:
                         continue
                     task_spec = self.task_dict[ready_task]
                     self.runner.add_task(task_spec.root, task_spec.task_name)
-        self.runner = None
+        # self.runner = None
         logger.info('exiting _run')
 
     async def stop(self):
@@ -1221,7 +1237,7 @@ class TaskScheduler:
 
 def serve_target(tasks: List[dir]):
     logger.info(f'serve2 {tasks}')
-    scheduler = TaskScheduler(tasks)
+    scheduler = TaskScheduler(tasks, asyncio.new_event_loop())
     # task_dict_to_pdf(scheduler.task_dict)
     logger.debug(scheduler.task_dict)
     scheduler.run(once=False, daemon=False)
