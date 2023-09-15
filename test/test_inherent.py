@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from tasksche.run import (
-    Runner, TaskScheduler,
+    TaskScheduler,
     build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
 
 

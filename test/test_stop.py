@@ -7,7 +7,7 @@ from tasksche.run import (PRunner, TaskScheduler, build_exe_graph,
                           task_dict_to_pdf)
 
 
-class TestTaskSche(unittest.TestCase):
+class TestTaskSche(unittest.IsolatedAsyncioTestCase):
     @property
     def task_path(self):
         current_file_path = Path(__file__)
@@ -22,37 +22,32 @@ class TestTaskSche(unittest.TestCase):
         task_dict_to_pdf(task_dict)
         return task_dict
 
-    # def test_run_stop_long_run(self):
-    #     self.get_task_dict(clear=True)
-    #     sche = TaskScheduler(self.task_path, PRunner)
-    #     sche.run(once=False, daemon=True)
-    #     self.assertIsNotNone(sche.main_loop_task)
-    #     time.sleep(0.5)
-    #     self.assertTrue(sche.main_loop_task.is_alive())
-    #     sche.stop()
-    #     self.assertIsNone(sche.main_loop_task)
-    #     # self.assertIsNone(sche._task_event_queue)
-    #
-    #     sche.run(once=False, daemon=True)
-    #     self.assertIsNotNone(sche.main_loop_task)
-    #     self.assertTrue(sche.main_loop_task.is_alive())
-    #     time.sleep(0.5)
-    #     # self.assertTrue(sche.main_loop_task.is_alive())
-    #     sche.stop()
-    #     self.assertIsNone(sche.main_loop_task)
-    #     # self.assertIsNone(sche._task_event_queue)
-
-    def test_run_stop_once(self):
+    async def test_run_stop_long_run(self):
         self.get_task_dict(clear=True)
-        loop = asyncio.new_event_loop()
-        sche = TaskScheduler(self.task_path, loop)
+        sche = TaskScheduler(self.task_path)
+        sche.run(once=False, daemon=True)
+        self.assertIsNotNone(sche.main_loop_task)
+        time.sleep(0.5)
+        await sche.stop()
+        self.assertIsNone(sche.main_loop_task)
+        # self.assertIsNone(sche._task_event_queue)
+
+        sche.run(once=False, daemon=True)
+        self.assertIsNotNone(sche.main_loop_task)
+        time.sleep(0.5)
+        # self.assertTrue(sche.main_loop_task.is_alive())
+        await sche.stop()
+        self.assertIsNone(sche.main_loop_task)
+        # self.assertIsNone(sche._task_event_queue)
+
+    async def test_run_stop_once(self):
+        self.get_task_dict(clear=True)
+        sche = TaskScheduler(self.task_path)
         sche.run(once=True, daemon=True)
+        await asyncio.sleep(0.1)
+        await sche.stop()
 
-        async def stop():
-            await asyncio.sleep(0.1)
-            await sche.stop()
 
-        loop.run_until_complete(stop())
 
 
 if __name__ == '__main__':

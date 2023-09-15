@@ -1,15 +1,14 @@
 import asyncio
+import concurrent.futures
 import contextlib
-import inspect
+import importlib
 import logging
-import multiprocessing
 import os
 import os.path
 import pickle
 import sys
 import time
 from abc import abstractmethod, ABC
-# from queue import Queue as _Queue
 from asyncio import Queue
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -20,7 +19,7 @@ from itertools import zip_longest
 from multiprocessing import Process
 from pprint import pprint
 from typing import Any, Dict, List, Tuple, Union, Optional
-import concurrent.futures
+
 import yaml
 from typing_extensions import Self
 from watchfiles import awatch
@@ -161,6 +160,7 @@ class ExecEnv:
             os.chdir(self.previous_dir)
         if self.pythonpath:
             sys.path.remove(self.pythonpath)
+        importlib.invalidate_caches()
 
 
 class TaskSpec:
@@ -173,7 +173,7 @@ class TaskSpec:
             self,
             root: Optional[str],
             task_name: str,
-            task_dict: Union[Dict[str, Self], None] = None
+            task_dict: Optional[Dict[str, Self]] = None
     ) -> None:
         self.root = root
         self.task_name = task_name
@@ -226,10 +226,10 @@ class TaskSpec:
         if not self.dirty:
             self._status = Status.STATUS_FINISHED
             return
-        self.status = Status.STATUS_PENDING
+        self._status = Status.STATUS_PENDING
         parent_status = [self.task_dict[t].status for t in self.depend_task]
         if all(status == Status.STATUS_FINISHED for status in parent_status):
-            if self.status == Status.STATUS_PENDING:
+            if self._status == Status.STATUS_PENDING:
                 self._status = Status.STATUS_READY
         elif Status.STATUS_ERROR in parent_status:
             self._status = Status.STATUS_ERROR
@@ -325,7 +325,7 @@ class TaskSpec:
         return self._check_dirty()
 
     @dirty.setter
-    def dirty(self, value: bool):
+    def dirty(self, value: Optional[bool]):
         if value is None:
             self._dirty = None
             return
@@ -857,9 +857,8 @@ class PRunner(RunnerBase):
         value = task_spec.execute()
         return value
 
-    def __init__(self, event_queue: Queue, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, event_queue: Queue) -> None:
         self.event_queue = event_queue
-        self.loop = loop
         self.processes: Dict[str, Process] = {}
         self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=6)
 
@@ -877,16 +876,16 @@ class PRunner(RunnerBase):
     async def _run_task(self, task_root: str, task_name: str):
         logger.info(f'running task {task_name} ...')
 
-        def _start_process_return_exit_code():
-            p = Process(
-                target=self._run,
-                args=(task_root, task_name))
-            self.processes[task_name] = p
-            p.start()
-            p.join()
-            logger.info(p.exitcode)
-            return p.exitcode
-        exit_code = await self.loop.run_in_executor(
+        # def _start_process_return_exit_code():
+        #     p = Process(
+        #         target=self._run,
+        #         args=(task_root, task_name))
+        #     self.processes[task_name] = p
+        #     p.start()
+        #     p.join()
+        #     logger.info(p.exitcode)
+        #     return p.exitcode
+        exit_code = await asyncio.get_running_loop().run_in_executor(
             self.executor,
             self._run,
             task_root, task_name
@@ -894,14 +893,14 @@ class PRunner(RunnerBase):
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
-            logger.info(f'finished task {task_name}')
+            logger.info(f'\033[92;1mfinished task {task_name}\033[0m')
         else:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_ERROR, task_name, task_root))
             logger.info(f'Error task {task_name}')
 
     def add_task(self, task_root: str, task_name: str) -> None:
-        self.loop.create_task(self._run_task(task_root, task_name))
+        asyncio.create_task(self._run_task(task_root, task_name))
 
     def get_running_tasks(self) -> List[str]:
         for k, v in self.processes.items():
@@ -927,12 +926,10 @@ class FileWatcher:
     def __init__(
             self,
             root: str,
-            queue: Queue,
-            loop: Optional[asyncio.AbstractEventLoop] = None):
+            queue: Queue):
         self.root = root
         self.stop_event = asyncio.Event()
         self.event_queue = queue
-        self.loop = loop
         self.async_task: Optional[asyncio.Task] = None
 
     async def _func(self):
@@ -944,51 +941,22 @@ class FileWatcher:
                     TaskEventType.FILE_CHANGE, f, 'None'))
 
     async def __aenter__(self):
-        return self.start()
+        return await self.start()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
 
-    def start(self):
+    async def start(self):
         if self.async_task is not None:
             logger.warning('already started')
-            self.stop()
+            await self.stop()
         self.stop_event.clear()
-        self.async_task = self.loop.create_task(self._func())
+        self.async_task = asyncio.create_task(self._func())
         return self
 
     async def stop(self):
         self.stop_event.set()
         await self.async_task
-
-
-class SchedulerCallbackBase(ABC):
-
-    def status_change(self, event: Status, task_spec: TaskSpec):
-        pass
-
-
-class _CallBackCollection(SchedulerCallbackBase):
-    def __init__(
-            self,
-            callbacks: Optional[List[SchedulerCallbackBase]] = None
-    ) -> None:
-        super().__init__()
-        if callbacks is None:
-            self.callbacks = []
-        else:
-            self.callbacks = callbacks
-
-    def _handle(self, payload: Any, task_spec: TaskSpec):
-        caller_frame = inspect.currentframe().f_back
-        caller_function_name = caller_frame.f_code.co_name
-        for cb in self.callbacks:
-            func = getattr(cb, caller_function_name)
-            func(payload, task_spec)
-
-    def status_change(self, event: Status, task_spec: TaskSpec):
-        return self._handle(event, task_spec)
-
 
 class SchedulerEventType(Enum):
     STATUS_CHANGE = auto()
@@ -1000,37 +968,24 @@ class SchedulerEvent:
     msg: Any
 
 
-class CallbackCaller:
-    def __init__(self, callback: SchedulerCallbackBase):
-        self.callback = callback
-
-
 class TaskScheduler:
     def __init__(
             self,
             target,
-            loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
-        if loop is None:
-            loop = asyncio.new_event_loop()
         self.target, self.task_dict = build_exe_graph(target)
-        self._task_event_queue = Queue(loop=loop)
-        self._call_back = _CallBackCollection()
-        self._call_back_caller = None
         self.main_loop_task: Optional[asyncio.Task] = None
-        self._sche_event_queue = Queue(loop=loop)
         self._callback_caller = None
         self._callback_caller_event = None
-        self.loop = loop
-        self.runner = PRunner(self._task_event_queue, self.loop)
+        self.runner = PRunner(self._task_event_queue)
 
-    def _restart_cb_caller(self):
-        # self._callback_caller
-        pass
+    @cached_property
+    def _task_event_queue(self):
+        return Queue()
 
-    def on_event(self, cb: SchedulerCallbackBase):
-        self._call_back.callbacks.append(cb)
-        return self
+    @cached_property
+    def sche_event_queue(self):
+        return Queue()
 
     def _get_ready(self) -> Union[str, None]:
         """
@@ -1053,10 +1008,10 @@ class TaskScheduler:
         assert isinstance(task, str), task
         assert task in self.task_dict, f'{task} is not a valid task'
         self.task_dict[task].status = status
-        self.loop.create_task(self._sche_event_queue.put(SchedulerEvent(
-            SchedulerEventType.STATUS_CHANGE,
-            task,
-        )))
+        asyncio.create_task(
+            self.sche_event_queue.put(SchedulerEvent(
+                    SchedulerEventType.STATUS_CHANGE,
+                    (task, status))))
 
     def set_finished(self, task: str):
         self.set_status(task, Status.STATUS_FINISHED)
@@ -1088,7 +1043,7 @@ class TaskScheduler:
 
     @cached_property
     def file_watcher(self):
-        return FileWatcher(self.root, self._task_event_queue, self.loop)
+        return FileWatcher(self.root, self._task_event_queue)
 
     async def _reload(self):
         """
@@ -1121,6 +1076,9 @@ class TaskScheduler:
                 if old_spec.dependent_hash != new_spec.dependent_hash:
                     self.task_dict[task_name] = new_spec
                     changed_tasks.append(task_name)
+                elif new_spec.dirty:
+                    changed_tasks.append(task_name)
+                    self.task_dict[task_name].dirty = None
         for task_name in changed_tasks:
             self.task_dict[task_name].update_status()
         all_influenced_tasks = set()
@@ -1158,7 +1116,6 @@ class TaskScheduler:
         async with self.runner, self.file_watcher:
             while True:
                 ready_task = self.get_ready_set_running()
-                # logger.info(f'got ready task:{ready_task}')
                 if ready_task is None:
                     try:
                         event = await self._task_event_queue.get()
@@ -1190,7 +1147,6 @@ class TaskScheduler:
                     else:
                         raise NotImplementedError()
                 else:
-                    # logger.info(f'got ready task:{ready_task}')
                     if ready_task == '_END_':
                         logger.info('all tasks are finished')
                         if once:
@@ -1226,20 +1182,16 @@ class TaskScheduler:
             logger.error('already running !!')
             return
         if daemon:
-            self.main_loop_task = self.loop.create_task(self._run(once))
+            self.main_loop_task = asyncio.create_task(self._run(once))
         else:
-            self.loop.run_until_complete(self._run(once))
-
-    @property
-    def sche_event_queue(self):
-        return self._sche_event_queue
+            asyncio.run(self._run(once))
 
 
 def serve_target(tasks: List[dir]):
     logger.info(f'serve2 {tasks}')
-    scheduler = TaskScheduler(tasks, asyncio.new_event_loop())
+    scheduler = TaskScheduler(tasks)
     # task_dict_to_pdf(scheduler.task_dict)
-    logger.debug(scheduler.task_dict)
+    # logger.debug(scheduler.task_dict)
     scheduler.run(once=False, daemon=False)
 
 
