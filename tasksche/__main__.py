@@ -2,7 +2,7 @@ import argparse
 import inspect
 from typing import List, get_args, get_origin
 
-from .run import serve_target
+from .run import serve_target, run_target, _exec_task
 
 
 def _parser():
@@ -49,16 +49,51 @@ if __name__ == '__main__':
 
     @_command()
     def serve(task: List[str] = None):
+        """
+        Serves the specified task, watching for changes and rerunning the
+        specified task.
+
+        Args:
+            task (List[str], optional): The task to be served.
+
+        Returns:
+            None
+        """
         serve_target(task)
 
     @_command()
-    def clean(task: List[str] = None):
+    def run(task: List[str] = None):
+        """
+        Executes tasks and exit on finish.
+
+        Args:
+            task (List[str], optional): The task to be executed. 
+
+        Returns:
+            None
+        """
+        run_target(task)
+
+    @_command()
+    def clean(task: List[str] = None, r: bool = False):
         from .run import path_to_task_spec
         tasks = path_to_task_spec(task)
         for v in tasks.values():
-            v.clear()
+            v.clear_output_dump(r)
 
-    # _args = _parsers['parser'].parse_args(['run', 'export'])
+    @_command()
+    def exec_task(root: str, task: str):
+        """
+        Execute a single task, ignores dependencies and schedules.
+
+        Args:
+            task (str): The task to be executed.
+
+        Returns:
+            None
+        """
+        _exec_task(root, task)
+
     args = _parsers['parser'].parse_args()
 
     call_args = args.__dict__.copy()

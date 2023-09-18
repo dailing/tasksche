@@ -1,11 +1,12 @@
 import asyncio
-import concurrent.futures
 import contextlib
 import importlib
 import logging
 import os
 import os.path
 import pickle
+import shutil
+import signal
 import sys
 import time
 from abc import abstractmethod, ABC
@@ -16,7 +17,7 @@ from functools import cached_property
 from hashlib import md5
 from io import BytesIO, StringIO
 from itertools import zip_longest
-from multiprocessing import Process
+from asyncio.subprocess import Process
 from pprint import pprint
 from typing import Any, Dict, List, Tuple, Union, Optional
 
@@ -160,7 +161,6 @@ class ExecEnv:
             os.chdir(self.previous_dir)
         if self.pythonpath:
             sys.path.remove(self.pythonpath)
-        importlib.invalidate_caches()
 
 
 class TaskSpec:
@@ -604,7 +604,6 @@ class TaskSpec:
         logger.debug(f'executing {self.task_name}@{self.task_module_path}')
         with self._exec_env:
             try:
-                import importlib
                 mod = importlib.import_module(self.task_module_path)
                 mod.__dict__['work_dir'] = self.output_dump_folder
                 if not hasattr(mod, 'run'):
@@ -636,16 +635,20 @@ class TaskSpec:
             exec_info = self._exec_info
         self._exec_info_dump = exec_info
 
-    def clear(self):
+    def clear_output_dump(self, rm_tree=False):
+        self._exec_info_dump = DumpedTypeOperation.DELETE
+        self._exec_result = DumpedTypeOperation.DELETE
+        if rm_tree:
+            shutil.rmtree(self.output_dump_folder, ignore_errors=True)
+
+
+    def clear(self, rm_tree=False):
         logger.info(f'clearing {self.task_name}')
         if self.status != Status.STATUS_FINISHED:
             return
-        self._exec_info_dump = DumpedTypeOperation.DELETE
-        self._exec_result = DumpedTypeOperation.DELETE
+        self.clear_output_dump(rm_tree)
         self.dirty = None
         self.status = None
-        for related_tasks in self.depend_by:
-            self.task_dict[related_tasks].clear()
 
 
 class EndTask(TaskSpec):
@@ -666,7 +669,7 @@ class EndTask(TaskSpec):
     def depend_by(self) -> List[str]:
         return []
 
-    def clear(self):
+    def clear(self, rm_tree=False):
         pass
 
     def dependent_hash(self):
@@ -860,36 +863,32 @@ class PRunner(RunnerBase):
     def __init__(self, event_queue: Queue) -> None:
         self.event_queue = event_queue
         self.processes: Dict[str, Process] = {}
-        self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=6)
 
     async def __aenter__(self):
         pass
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         logger.info('exiting ...')
-        for p in self.processes.values():
-            if p.is_alive():
-                p.terminate()
-            p.join()
+        for p in list(self.processes.values()):
+            # sent int signal
+            p.send_signal(signal.SIGINT)
+            await p.wait()
         self.processes.clear()
 
     async def _run_task(self, task_root: str, task_name: str):
         logger.info(f'running task {task_name} ...')
 
-        # def _start_process_return_exit_code():
-        #     p = Process(
-        #         target=self._run,
-        #         args=(task_root, task_name))
-        #     self.processes[task_name] = p
-        #     p.start()
-        #     p.join()
-        #     logger.info(p.exitcode)
-        #     return p.exitcode
-        exit_code = await asyncio.get_running_loop().run_in_executor(
-            self.executor,
-            self._run,
-            task_root, task_name
+        process = await asyncio.create_subprocess_exec(
+            'python',
+            '-m',
+            'tasksche',
+            'exec_task',
+            task_root,
+            task_name,
         )
+        self.processes[task_name] = process
+        exit_code = await process.wait()
+        del self.processes[task_name]
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
@@ -909,16 +908,16 @@ class PRunner(RunnerBase):
                 del self.processes[k]
         return list(self.processes.keys())
 
-    def stop_tasks_and_wait(self, tasks: List[str]):
+    async def stop_tasks_and_wait(self, tasks: List[str]):
         for task in tasks:
             if task not in self.processes:
                 continue
-            if not self.processes[task].is_alive():
-                del self.processes[task]
-                continue
             logger.info(f'killing task {task}')
-            self.processes[task].terminate()
-            self.processes[task].join()
+            try:
+                self.processes[task].send_signal(signal.SIGINT)
+            except Exception as e:
+                logger.error(e, stack_info=True)
+            await self.processes[task].wait()
             self.processes.pop(task)
 
 
@@ -957,6 +956,7 @@ class FileWatcher:
     async def stop(self):
         self.stop_event.set()
         await self.async_task
+
 
 class SchedulerEventType(Enum):
     STATUS_CHANGE = auto()
@@ -1010,8 +1010,8 @@ class TaskScheduler:
         self.task_dict[task].status = status
         asyncio.create_task(
             self.sche_event_queue.put(SchedulerEvent(
-                    SchedulerEventType.STATUS_CHANGE,
-                    (task, status))))
+                SchedulerEventType.STATUS_CHANGE,
+                (task, status))))
 
     def set_finished(self, task: str):
         self.set_status(task, Status.STATUS_FINISHED)
@@ -1026,16 +1026,44 @@ class TaskScheduler:
         for t in self.task_dict.values():
             print(f'{t.task_name}: {t.status}')
 
-    async def clear(self, tasks: Union[List[str], str, None] = None):
+    async def clear(
+            self,
+            tasks: Union[List[str], str, None] = None,
+            deep: bool = False,
+            _event: bool = True,
+    ) -> None:
+        """
+        Clear specific tasks or all tasks in the task dictionary.
+
+        Args:
+            tasks (Union[List[str], str, None], optional): The tasks to be 
+                cleared. Defaults to None.
+            deep (bool, optional): Whether to perform a deep clear, which 
+                clears all subtasks of the specified tasks. Defaults to False.
+            _event (bool, optional): Whether to emit the event. If True, 
+                the event will be emitted. If False, no event will be emitted.
+
+        Returns:
+            None
+        """
         if tasks is None:
             tasks = self.task_dict.keys()
         elif isinstance(tasks, str):
             tasks = [tasks]
+        sub_tasks = set()
         for task in tasks:
             logger.info(f'clearing {task}')
             self.task_dict[task].clear()
-            await self._task_event_queue.put(
-                TaskEvent(TaskEventType.TASK_INTERRUPT, task, self.root))
+            if deep:
+                sub_tasks.update(self.task_dict[task].all_task_depend_me)
+                sub_tasks.update()
+            if _event:
+                await self._task_event_queue.put(
+                    TaskEvent(TaskEventType.TASK_INTERRUPT, task, self.root))
+        if deep:
+            sub_tasks = sub_tasks - set(tasks)
+            # clear all sub-tasks, without emitting event
+            await self.clear(list(sub_tasks), deep=False, _event=False)
 
     @cached_property
     def root(self):
@@ -1184,7 +1212,7 @@ class TaskScheduler:
         if daemon:
             self.main_loop_task = asyncio.create_task(self._run(once))
         else:
-            asyncio.run(self._run(once))
+            asyncio.get_event_loop().run_until_complete(self._run(once))
 
 
 def serve_target(tasks: List[dir]):
@@ -1195,9 +1223,17 @@ def serve_target(tasks: List[dir]):
     scheduler.run(once=False, daemon=False)
 
 
-def exec_task(task_root, task_name):
-    task_spec = TaskSpec(task_root, task_name)
-    task_spec.execute()
+def run_target(tasks: List[dir]):
+    logger.info(f'exec {tasks}')
+    scheduler = TaskScheduler(tasks)
+    # task_dict_to_pdf(scheduler.task_dict)
+    # logger.debug(scheduler.task_dict)
+    scheduler.run(once=True, daemon=False)
+
+
+def _exec_task(root: str, task: str):
+    taskspec = TaskSpec(root, task)
+    taskspec.execute()
 
 
 def process_path(task_name: str, path: str):

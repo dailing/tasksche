@@ -11,3 +11,4 @@ def run(data):
         f.write(str(data))
         f.write('\n')
         f.write(path_for('task3'))
+    print("test")
