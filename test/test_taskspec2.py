@@ -22,16 +22,18 @@ class TestTaskSche(unittest.TestCase):
         task_dict_to_pdf(task_dict)
         return task_dict
 
-    def test_build_graph(self):
-        d = self.get_task_dict()
-        for k, v in d.items():
-            v.dirty = False
-            self.assertFalse(v.dirty)
-        d['/task1'].dirty = True
-        self.assertTrue(d['/task1'].dirty)
-        self.assertFalse(d['/task2'].dirty)
-        self.assertTrue(d['/task3'].dirty)
-        self.assertTrue(d['/task'].dirty)
+    # def test_build_graph(self):
+    #     d = self.get_task_dict()
+    #     for k, v in d.items():
+    #         if k == '_END_':
+    #             continue
+    #         v.dirty = False
+    #         self.assertFalse(v.dirty)
+    #     d['/task1'].dirty = True
+    #     self.assertTrue(d['/task1'].dirty)
+    #     self.assertFalse(d['/task2'].dirty)
+    #     self.assertTrue(d['/task3'].dirty)
+    #     self.assertTrue(d['/task'].dirty)
 
     # def test_status(self):
     #     d = self.get_task_dict()

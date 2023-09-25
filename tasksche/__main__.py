@@ -15,6 +15,7 @@ def _parser():
 if __name__ == '__main__':
     _parsers = _parser()
 
+
     def _command(*_args, **kwargs):
         _subparser = _parsers['_subparser']
 
@@ -47,6 +48,7 @@ if __name__ == '__main__':
 
         return wrap
 
+
     @_command()
     def serve(task: List[str] = None):
         """
@@ -61,6 +63,7 @@ if __name__ == '__main__':
         """
         serve_target(task)
 
+
     @_command()
     def run(task: List[str] = None):
         """
@@ -74,12 +77,14 @@ if __name__ == '__main__':
         """
         run_target(task)
 
+
     @_command()
     def clean(task: List[str] = None, r: bool = False):
         from .run import path_to_task_spec
         tasks = path_to_task_spec(task)
         for v in tasks.values():
             v.clear_output_dump(r)
+
 
     @_command()
     def exec_task(root: str, task: str):
@@ -93,6 +98,7 @@ if __name__ == '__main__':
             None
         """
         _exec_task(root, task)
+
 
     args = _parsers['parser'].parse_args()
 

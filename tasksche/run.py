@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import importlib
-import logging
 import os
 import os.path
 import pickle
@@ -11,38 +10,26 @@ import sys
 import time
 from abc import abstractmethod, ABC
 from asyncio import Queue
+from asyncio.subprocess import Process
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
 from hashlib import md5
 from io import BytesIO, StringIO
 from itertools import zip_longest
-from asyncio.subprocess import Process
 from pprint import pprint
-from typing import Any, Dict, List, Tuple, Union, Optional
+from threading import RLock
+from typing import Any, Dict, List, Tuple, Union, Optional, Iterable
+from typing import Callable
 
 import yaml
 from typing_extensions import Self
 from watchfiles import awatch
 
+from .logger import Logger
+_INVALIDATE = object()
 
-def get_logger(name: str, print_level=logging.DEBUG):
-    formatter = logging.Formatter(
-        fmt="%(levelname)10s "
-            "[%(filename)15s:%(lineno)-3d %(asctime)s]"
-            " %(message)s",
-        datefmt='%H:%M:%S',
-    )
-    logger_obj = logging.getLogger(name)
-    stream_handler = logging.StreamHandler(sys.stderr)
-    stream_handler.setFormatter(formatter)
-    stream_handler.setLevel(print_level)
-    logger_obj.addHandler(stream_handler)
-    logger_obj.setLevel(logging.DEBUG)
-    return logger_obj
-
-
-logger = get_logger('runner', print_level=logging.INFO)
+logger = Logger()
 
 
 def pprint_str(*args, **kwargs):
@@ -99,7 +86,7 @@ class DumpedType:
             file_name = os.path.join(
                 getattr(instance, 'output_dump_folder'), self.file_name)
             if not os.path.exists(file_name):
-                return None
+                return _INVALIDATE
             with open(file_name, 'rb') as f:
                 result = pickle.load(f)
                 if self.cache:
@@ -125,7 +112,7 @@ class DumpedType:
             os.makedirs(dump_folder, exist_ok=True)
         file_name = os.path.join(
             dump_folder, self.file_name)
-        if value is DumpedTypeOperation.DELETE:
+        if value is _INVALIDATE:
             if os.path.exists(file_name):
                 os.remove(file_name)
             if hasattr(instance, self.field_name):
@@ -133,6 +120,86 @@ class DumpedType:
         else:
             with open(file_name, 'wb') as f:
                 pickle.dump(value, f)
+
+
+class CachedPropertyWithInvalidator:
+    """
+    Property decorator that caches the result of a function.
+    When the property is assigned a new value, the cached value is invalidated,
+    and all properties in the broadcaster are invalidated, the new value will
+    be calculated on the next access.
+    """
+
+    def __init__(self, func):
+        self.func = func
+        self.attr_name = None
+        self.broadcaster = None
+        self.__doc__ = func.__doc__
+        self.lock = RLock()
+
+    def register_broadcaster(self, broadcaster: Callable[[], Iterable]):
+        """
+        Register a broadcaster function.
+
+        :param broadcaster: A callable function that broadcasts messages.
+        """
+        self.broadcaster = broadcaster
+        return broadcaster
+
+    def __set_name__(self, owner, name):
+        if self.attr_name is None:
+            self.attr_name = name
+        elif name != self.attr_name:
+            raise TypeError(
+                "Cannot assign the to two different names"
+                f"({self.attr_name!r} and {name!r})."
+            )
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        if self.attr_name is None:
+            raise TypeError(
+                "Cannot use instance without __set_name__ on it.")
+        try:
+            cache = instance.__dict__
+        # not all objects have __dict__ (e.g. class defines slots)
+        except AttributeError:
+            msg = (
+                f"No '__dict__' attribute on {type(instance).__name__!r} "
+                f"instance to cache {self.attr_name!r} property."
+            )
+            raise TypeError(msg) from None
+        val = cache.get(self.attr_name, _INVALIDATE)
+        if val is _INVALIDATE:
+            with self.lock:
+                # check if another thread filled cache while we awaited lock
+                val = cache.get(self.attr_name, _INVALIDATE)
+                if val is _INVALIDATE:
+                    val = self.func(instance)
+                    try:
+                        cache[self.attr_name] = val
+                    except TypeError:
+                        msg = (
+                            f"The '__dict__' attribute on "
+                            f"{type(instance).__name__!r} instance "
+                            f"does not support item assignment for "
+                            f"caching {self.attr_name!r} property."
+                        )
+                        raise TypeError(msg) from None
+        return val
+
+    def __set__(self, instance, value):
+        logger.debug(f'set value {value} to {instance}')
+        with self.lock:
+            if value == instance.__dict__.get(self.attr_name, _INVALIDATE):
+                return
+            instance.__dict__[self.attr_name] = value
+            if self.broadcaster:
+                # INVALIDATE ALL ATTR IN BROADCASTER
+                for inst in self.broadcaster(instance):
+                    logger.debug(f'invalidate {inst}')
+                    setattr(inst, self.attr_name, _INVALIDATE)
 
 
 class ExecEnv:
@@ -198,6 +265,7 @@ class TaskSpec:
             str: The path of the output directory.
         """
         task_name = task_name[1:].replace('/', '.')
+        logger.debug(f'{root}, {task_name}')
         return os.path.join(os.path.dirname(root), '__output', task_name)
 
     @staticmethod
@@ -215,57 +283,31 @@ class TaskSpec:
     def output_dump_file(self):
         return self._get_dump_file(self.root, self.task_name)
 
-    def update_status(self):
-        """
-        Updates the status of the task.
-
-        If the task is not dirty, the status is set to `STATUS_FINISHED`.
-        If the task is dirty, the status is set to `STATUS_PENDING` by default.
-        The status is determined based on the status of the parent tasks.
-        """
-        if not self.dirty:
-            self._status = Status.STATUS_FINISHED
-            return
-        self._status = Status.STATUS_PENDING
-        parent_status = [self.task_dict[t].status for t in self.depend_task]
-        if all(status == Status.STATUS_FINISHED for status in parent_status):
-            if self._status == Status.STATUS_PENDING:
-                self._status = Status.STATUS_READY
-        elif Status.STATUS_ERROR in parent_status:
-            self._status = Status.STATUS_ERROR
-        elif Status.STATUS_PENDING in parent_status:
-            self._status = Status.STATUS_PENDING
-        elif Status.STATUS_RUNNING in parent_status:
-            self._status = Status.STATUS_PENDING
-
-    @property
+    @CachedPropertyWithInvalidator
     def status(self):
-        if self._status is None:
-            self.update_status()
-        return self._status
-
-    def _broadcast_status(self):
-        for t in self.all_task_depend_me:
-            self.task_dict[t].update_status()
-
-    @status.setter
-    def status(self, value: Status):
-        """
-        Set the status of the current node and update the status of all its
-        child nodes.
-
-        Args:
-            value (Status): The new status value.
-        """
-        if value is None:
-            self.update_status()
-        if value == self._status:
-            return
-        if self._status is None:
-            self._status = value
-            return
-        self._status = value
-        self._broadcast_status()
+        def _f():
+            logger.debug(f'{self}, {self.depend_task}')
+            parent_status = [
+                self.task_dict[t].status for t in self.depend_task]
+            if all(status == Status.STATUS_FINISHED for status in parent_status):
+                if self.dirty:
+                    return Status.STATUS_READY
+                else:
+                    return Status.STATUS_FINISHED
+            elif Status.STATUS_ERROR in parent_status:
+                return Status.STATUS_ERROR
+            elif Status.STATUS_PENDING in parent_status:
+                return Status.STATUS_PENDING
+            elif Status.STATUS_RUNNING in parent_status:
+                return Status.STATUS_PENDING
+            elif Status.STATUS_READY in parent_status:
+                return Status.STATUS_PENDING
+            else:
+                logger.error(f'{self}, {parent_status}')
+                raise Exception("ERR")
+        st = _f()
+        logger.debug(f'get status {self}, {st}')
+        return st
 
     def _hash(self):
         """
@@ -284,6 +326,9 @@ class TaskSpec:
             task_spec = TaskSpec(self.root, inherent_task)
             with open(task_spec.task_file, 'rb') as f:
                 md5_hash.update(f.read())
+        if os.path.exists(self.output_dump_file):
+            with open(self.output_dump_file, 'rb') as f:
+                md5_hash.update(f.read())
         return md5_hash.hexdigest()
 
     @cached_property
@@ -296,21 +341,14 @@ class TaskSpec:
         depend_hash[self.task_name] = self._hash()
         return depend_hash
 
-    def _check_dirty(self) -> bool:
-        """
-        Check if the current task is dirty by comparing the code hash with
-        the last saved dump, as well as the dependency hash.
-
-        Returns:
-            bool: True if the task is dirty, False otherwise.
-        """
+    @CachedPropertyWithInvalidator
+    def dirty(self):
         parent_dirty = [self.task_dict[t].dirty for t in self.depend_task]
         if any(parent_dirty):
-            self._dirty = True
-            return self._dirty
-        if self._exec_info_dump is None:
-            self._dirty = True
-            return self._dirty
+            return True
+        if (self._exec_info_dump is _INVALIDATE
+                or self._exec_result is _INVALIDATE):
+            return True
         exec_info: ExecInfo = self._exec_info_dump
         self._dirty = False
         if exec_info.depend_hash != self.dependent_hash:
@@ -318,26 +356,10 @@ class TaskSpec:
             return self._dirty
         return self._dirty
 
-    @property
-    def dirty(self):
-        if self._dirty is not None:
-            return self._dirty
-        return self._check_dirty()
-
-    @dirty.setter
-    def dirty(self, value: Optional[bool]):
-        if value is None:
-            self._dirty = None
-            return
-        assert isinstance(value, bool)
-        prev_value = self._dirty
-        self._dirty = value
-        if prev_value is None:
-            return
-        if prev_value != value and value is True:
-            # Propagate dirty to dependent tasks
-            for t in self.depend_by:
-                self.task_dict[t].dirty = True
+    @dirty.register_broadcaster
+    @status.register_broadcaster
+    def _depend_task_specs(self) -> List[Self]:
+        return [self.task_dict[k] for k in self.depend_by]
 
     @cached_property
     def task_file(self):
@@ -536,13 +558,13 @@ class TaskSpec:
 
     def __repr__(self) -> str:
         lines = ''
-        lines = lines + f"<Task:{self.task_name}>\n"
-        for parent, me, child in zip_longest(
-                self.depend_task,
-                [self.task_name],
-                self.depend_by, fillvalue=''
-        ):
-            lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
+        lines = lines + f"<Task:{self.task_name}>"
+        # for parent, me, child in zip_longest(
+        #         self.depend_task,
+        #         [self.task_name],
+        #         self.depend_by, fillvalue=''
+        # ):
+        #     lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
         return lines
 
     def _prepare_args(
@@ -634,21 +656,21 @@ class TaskSpec:
         if exec_info is None:
             exec_info = self._exec_info
         self._exec_info_dump = exec_info
+        self.dirty = False
 
     def clear_output_dump(self, rm_tree=False):
-        self._exec_info_dump = DumpedTypeOperation.DELETE
-        self._exec_result = DumpedTypeOperation.DELETE
+        self._exec_info_dump = _INVALIDATE
+        self._exec_result = _INVALIDATE
         if rm_tree:
             shutil.rmtree(self.output_dump_folder, ignore_errors=True)
-
 
     def clear(self, rm_tree=False):
         logger.info(f'clearing {self.task_name}')
         if self.status != Status.STATUS_FINISHED:
             return
         self.clear_output_dump(rm_tree)
-        self.dirty = None
-        self.status = None
+        self.dirty = _INVALIDATE
+        self.status = _INVALIDATE
 
 
 class EndTask(TaskSpec):
@@ -657,9 +679,16 @@ class EndTask(TaskSpec):
             task_dict: Dict[str, TaskSpec],
             depend_task: List[str]
     ):
-        super().__init__(None, "_END_", task_dict)
-        self._dirty = True
+        super().__init__('/tmp/none_exist', "_END_", task_dict)
         self._depend_task = depend_task
+
+    @property
+    def dirty(self):
+        return True
+
+    @dirty.setter
+    def dirty(self, value):
+        pass
 
     @property
     def depend_task(self) -> List[str]:
@@ -776,7 +805,7 @@ def _dfs_build_exe_graph(
                 task_name=depend_task_name,
                 task_dict=task_dict
             )
-            logger.info(f'adding task {depend_task_name}')
+            logger.debug(f'adding task {depend_task_name}')
             task_dict[depend_task_name] = depend_task_spec
             _dfs_build_exe_graph([depend_task_spec], task_dict)
 
@@ -876,8 +905,7 @@ class PRunner(RunnerBase):
         self.processes.clear()
 
     async def _run_task(self, task_root: str, task_name: str):
-        logger.info(f'running task {task_name} ...')
-
+        logger.info(f'entering task {task_name} ...')
         process = await asyncio.create_subprocess_exec(
             'python',
             '-m',
@@ -889,6 +917,7 @@ class PRunner(RunnerBase):
         self.processes[task_name] = process
         exit_code = await process.wait()
         del self.processes[task_name]
+        logger.info(f'exiting task {task_name} ...')
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
@@ -902,10 +931,6 @@ class PRunner(RunnerBase):
         asyncio.create_task(self._run_task(task_root, task_name))
 
     def get_running_tasks(self) -> List[str]:
-        for k, v in self.processes.items():
-            if not v.is_alive():
-                v.join()
-                del self.processes[k]
         return list(self.processes.keys())
 
     async def stop_tasks_and_wait(self, tasks: List[str]):
@@ -994,6 +1019,7 @@ class TaskScheduler:
         :return: Union of string or None.
         """
         for task in self.task_dict.values():
+            logger.debug(f'checking task {task.task_name} {task.status}')
             if task.status == Status.STATUS_READY:
                 return task.task_name
         return None
@@ -1005,6 +1031,7 @@ class TaskScheduler:
         return ready_task
 
     def set_status(self, task: str, status: Status):
+        logger.debug(f'setting status of {task} to {status}')
         assert isinstance(task, str), task
         assert task in self.task_dict, f'{task} is not a valid task'
         self.task_dict[task].status = status
@@ -1036,11 +1063,11 @@ class TaskScheduler:
         Clear specific tasks or all tasks in the task dictionary.
 
         Args:
-            tasks (Union[List[str], str, None], optional): The tasks to be 
+            tasks (Union[List[str], str, None], optional): The tasks to be
                 cleared. Defaults to None.
-            deep (bool, optional): Whether to perform a deep clear, which 
+            deep (bool, optional): Whether to perform a deep clear, which
                 clears all subtasks of the specified tasks. Defaults to False.
-            _event (bool, optional): Whether to emit the event. If True, 
+            _event (bool, optional): Whether to emit the event. If True,
                 the event will be emitted. If False, no event will be emitted.
 
         Returns:
@@ -1056,7 +1083,6 @@ class TaskScheduler:
             self.task_dict[task].clear()
             if deep:
                 sub_tasks.update(self.task_dict[task].all_task_depend_me)
-                sub_tasks.update()
             if _event:
                 await self._task_event_queue.put(
                     TaskEvent(TaskEventType.TASK_INTERRUPT, task, self.root))
@@ -1108,14 +1134,14 @@ class TaskScheduler:
                     changed_tasks.append(task_name)
                     self.task_dict[task_name].dirty = None
         for task_name in changed_tasks:
-            self.task_dict[task_name].update_status()
+            self.task_dict[task_name].status = _INVALIDATE
         all_influenced_tasks = set()
         for task in changed_tasks:
             all_influenced_tasks.add(task)
             all_influenced_tasks.update(
                 set(self.task_dict[task].all_task_depend_me))
         logger.info(f'all_influenced_tasks: {all_influenced_tasks}')
-        self.runner.stop_tasks_and_wait(list(all_influenced_tasks))
+        await self.runner.stop_tasks_and_wait(list(all_influenced_tasks))
         for event in queued_event:
             if event.event_type == TaskEventType.FILE_CHANGE:
                 continue
@@ -1149,7 +1175,7 @@ class TaskScheduler:
                         event = await self._task_event_queue.get()
                     except ValueError:
                         logger.info('stop running')
-                        self.runner.stop_tasks_and_wait(
+                        await self.runner.stop_tasks_and_wait(
                             self.runner.get_running_tasks())
                         break
                     except Exception as e:
@@ -1201,7 +1227,7 @@ class TaskScheduler:
         # self._task_event_queue = None
         logger.info('stopped')
 
-    def run(self, once=False, daemon=False):
+    def run(self, once=False, daemon=False, timeout=None):
         """
         add _run to loop if daemon,
         else run _run and await
@@ -1212,7 +1238,8 @@ class TaskScheduler:
         if daemon:
             self.main_loop_task = asyncio.create_task(self._run(once))
         else:
-            asyncio.get_event_loop().run_until_complete(self._run(once))
+            # asyncio.run()
+            asyncio.run(self._run(once))
 
 
 def serve_target(tasks: List[dir]):

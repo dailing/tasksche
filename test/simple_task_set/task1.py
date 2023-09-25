@@ -8,5 +8,5 @@ import time
 
 def run(a):
     print(a)
-    time.sleep(1)
-    return a * 10
+    time.sleep(2)
+    return a * 12

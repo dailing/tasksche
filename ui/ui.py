@@ -8,11 +8,14 @@ from typing import Dict
 from fastapi.responses import RedirectResponse
 from nicegui import Client, app, ui
 
+from tasksche.logger import Logger
 from tasksche.run import (
     Status, TaskScheduler, TaskSpec)
 
 sche_storage: Dict[str, TaskScheduler] = {}
 cb_storage = {}
+
+logger = Logger()
 
 
 def task_dict_to_dot(task_dict: Dict[str, TaskSpec]):
@@ -165,7 +168,7 @@ class PathSelection(ui.table):
 
 @ui.page('/')
 async def root_page():
-    print(app.storage.browser['id'])
+    logger.debug(app.storage.browser['id'])
     if app.storage.browser['id'] in sche_storage:
         return RedirectResponse('/task')
     path_selection = PathSelection(
@@ -196,27 +199,31 @@ async def task_page():
 
     sche = sche_storage.get(app.storage.browser['id'], None)
     if sche is None:
-        sche = TaskScheduler(selected_tasks, asyncio.get_event_loop())
+        sche = TaskScheduler(selected_tasks)
         sche_storage[app.storage.browser['id']] = sche
         sche.run(once=False, daemon=True)
+        logger.info('created Task Scheduler')
+    else:
+        logger.info('reusing Task Scheduler')
 
     async def cb():
         try:
-            print('running... event queue')
+            logger.info('running... event queue')
             while True:
-                await sche.sche_event_queue.get()
-                print('got event')
+                evt = await sche.sche_event_queue.get()
+                logger.debug(f'got event {evt}')
                 mermaid.content = task_dict_to_dot(sche.task_dict)
         except CancelledError:
             print('cancelled event queue')
 
-    prev_task = cb_storage.get(app.storage.browser['id'], None)
+    prev_task:asyncio.Task = cb_storage.get(app.storage.browser['id'], None)
     if prev_task is not None:
         prev_task.cancel()
+        await prev_task.result()
     cb_storage[app.storage.browser['id']] = asyncio.create_task(cb())
 
     task_collection.set_elements(sche.task_dict.keys())
-    task_collection.on_row_click(lambda t: asyncio.create_task(sche.clear(t)))
+    task_collection.on_row_click(lambda t: asyncio.create_task(sche.clear(t, deep=False)))
     mermaid.content = task_dict_to_dot(sche.task_dict)
 
     async def on_stop():
