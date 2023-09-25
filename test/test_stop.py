@@ -3,8 +3,11 @@ import time
 import unittest
 from pathlib import Path
 
-from tasksche.run import (PRunner, TaskScheduler, build_exe_graph,
-                          task_dict_to_pdf)
+from tasksche.run import (SchedulerEvent, Status, TaskScheduler, build_exe_graph,
+                          task_dict_to_pdf, _INVALIDATE)
+from tasksche.logger import Logger
+
+logger = Logger()
 
 
 class TestTaskSche(unittest.IsolatedAsyncioTestCase):
@@ -47,7 +50,46 @@ class TestTaskSche(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         await sche.stop()
 
+    async def test_clear(self):
+        self.get_task_dict(clear=True)
+        task = str(self.task_path[0]).replace('/task.py', '/task.py')
+        logger.info(task)
+        logger.info(type(task))
+        sche = TaskScheduler(
+            [task])
+        await sche._run(once=True)
+        self.assertNotEqual(
+            sche.task_dict['/task1']._exec_info_dump, _INVALIDATE)
+        sche.task_dict['/task1'].clear()
+        self.assertEqual(sche.task_dict['/task1']._exec_info_dump, _INVALIDATE)
+        sche.task_dict['/task'].clear()
+        self.assertEqual(sche.task_dict['/task']._exec_info_dump, _INVALIDATE)
 
+    async def test_random_result_rerun(self):
+        self.get_task_dict(clear=True)
+        sche = TaskScheduler(self.task_path)
+        await sche._run(once=True)
+        self.assertFalse(sche.task_dict['/task1'].dirty)
+        self.assertFalse(sche.task_dict['/task'].dirty)
+        sche.task_dict['/task1'].clear()
+        self.assertTrue(sche.task_dict['/task1'].dirty)
+        self.assertTrue(sche.task_dict['/task'].dirty)
+        self.assertEqual(
+            sche.task_dict['/task1'].status, Status.STATUS_READY)
+        self.assertEqual(
+            sche.task_dict['/task2'].status, Status.STATUS_FINISHED)
+        self.assertEqual(
+            sche.task_dict['/task'].status, Status.STATUS_PENDING)
+        while not sche.sche_event_queue.empty():
+            logger.debug(await sche.sche_event_queue.get())
+        await sche._run(once=True)
+        output_event = set()
+        while not sche.sche_event_queue.empty():
+            evt: SchedulerEvent = await sche.sche_event_queue.get()
+            output_event.add(evt.msg)
+        self.assertIn(('/task', Status.STATUS_FINISHED), output_event)
+        self.assertIn(('/task1', Status.STATUS_FINISHED), output_event)
+        self.assertIn(('/task3', Status.STATUS_FINISHED), output_event)
 
 
 if __name__ == '__main__':

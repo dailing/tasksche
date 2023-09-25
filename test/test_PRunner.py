@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from tasksche.run import (
-    Status, TaskScheduler, PRunner,
+    Status, TaskScheduler,
     build_exe_graph, task_dict_to_pdf)
 
 
@@ -25,10 +25,10 @@ class TestTaskSche(unittest.TestCase):
         self.get_task_dict(clear=True)
         sche = TaskScheduler(self.task_path)
         sche.run(once=True)
-        # sche = TaskScheduler(self.task_path)
+        sche = TaskScheduler(self.task_path)
         self.assertFalse(sche.task_dict['/task1'].dirty)
         self.assertEqual(sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
-        # sche.run(once=True)
+        sche.run(once=True)
 
 
 if __name__ == '__main__':

@@ -37,7 +37,7 @@ class Logger:
         if cls.logger is None:
             cls.logger = _get_logger('runner', print_level=logging.INFO)
         return cls.logger
-    
+
 
 if __name__ == '__main__':
     singleton1 = Logger()

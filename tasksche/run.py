@@ -16,7 +16,7 @@ from enum import Enum, auto
 from functools import cached_property
 from hashlib import md5
 from io import BytesIO, StringIO
-from itertools import zip_longest
+from pathlib import Path
 from pprint import pprint
 from threading import RLock
 from typing import Any, Dict, List, Tuple, Union, Optional, Iterable
@@ -27,7 +27,22 @@ from typing_extensions import Self
 from watchfiles import awatch
 
 from .logger import Logger
-_INVALIDATE = object()
+
+
+class __INVALIDATE__:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(__INVALIDATE__, cls).__new__(cls)
+
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return '<INVALID>'
+
+
+_INVALIDATE = __INVALIDATE__()
 
 logger = Logger()
 
@@ -113,6 +128,7 @@ class DumpedType:
         file_name = os.path.join(
             dump_folder, self.file_name)
         if value is _INVALIDATE:
+            logger.debug(f'deleting {instance} file {file_name}')
             if os.path.exists(file_name):
                 os.remove(file_name)
             if hasattr(instance, self.field_name):
@@ -120,6 +136,7 @@ class DumpedType:
         else:
             with open(file_name, 'wb') as f:
                 pickle.dump(value, f)
+                logger.debug(f'dump result {value}')
 
 
 class CachedPropertyWithInvalidator:
@@ -177,6 +194,8 @@ class CachedPropertyWithInvalidator:
                 val = cache.get(self.attr_name, _INVALIDATE)
                 if val is _INVALIDATE:
                     val = self.func(instance)
+                    logger.debug(
+                        f'updating value {instance}.{self.attr_name} to {val}')
                     try:
                         cache[self.attr_name] = val
                     except TypeError:
@@ -190,7 +209,7 @@ class CachedPropertyWithInvalidator:
         return val
 
     def __set__(self, instance, value):
-        logger.debug(f'set value {value} to {instance}')
+        logger.debug(f'set value {value} to {instance}.{self.attr_name}')
         with self.lock:
             if value == instance.__dict__.get(self.attr_name, _INVALIDATE):
                 return
@@ -198,7 +217,6 @@ class CachedPropertyWithInvalidator:
             if self.broadcaster:
                 # INVALIDATE ALL ATTR IN BROADCASTER
                 for inst in self.broadcaster(instance):
-                    logger.debug(f'invalidate {inst}')
                     setattr(inst, self.attr_name, _INVALIDATE)
 
 
@@ -265,7 +283,6 @@ class TaskSpec:
             str: The path of the output directory.
         """
         task_name = task_name[1:].replace('/', '.')
-        logger.debug(f'{root}, {task_name}')
         return os.path.join(os.path.dirname(root), '__output', task_name)
 
     @staticmethod
@@ -286,10 +303,10 @@ class TaskSpec:
     @CachedPropertyWithInvalidator
     def status(self):
         def _f():
-            logger.debug(f'{self}, {self.depend_task}')
             parent_status = [
                 self.task_dict[t].status for t in self.depend_task]
-            if all(status == Status.STATUS_FINISHED for status in parent_status):
+            if all(status == Status.STATUS_FINISHED
+                   for status in parent_status):
                 if self.dirty:
                     return Status.STATUS_READY
                 else:
@@ -305,10 +322,12 @@ class TaskSpec:
             else:
                 logger.error(f'{self}, {parent_status}')
                 raise Exception("ERR")
+
         st = _f()
         logger.debug(f'get status {self}, {st}')
         return st
 
+    @CachedPropertyWithInvalidator
     def _hash(self):
         """
         Calculate the MD5 hash of the code file and return the hex digest
@@ -326,19 +345,20 @@ class TaskSpec:
             task_spec = TaskSpec(self.root, inherent_task)
             with open(task_spec.task_file, 'rb') as f:
                 md5_hash.update(f.read())
-        if os.path.exists(self.output_dump_file):
-            with open(self.output_dump_file, 'rb') as f:
+        out_dump = os.path.join(self.output_dump_folder, 'exec_result.pkl')
+        if os.path.exists(out_dump):
+            with open(out_dump, 'rb') as f:
                 md5_hash.update(f.read())
         return md5_hash.hexdigest()
 
-    @cached_property
+    @CachedPropertyWithInvalidator
     def dependent_hash(self) -> Dict[str, str]:
         depend_hash = {
-            task_name: self.task_dict[task_name]._hash()
+            task_name: self.task_dict[task_name]._hash
             for task_name in self._all_dependent_tasks
         }
         # Add me to dependent_hash
-        depend_hash[self.task_name] = self._hash()
+        depend_hash[self.task_name] = self._hash
         return depend_hash
 
     @CachedPropertyWithInvalidator
@@ -346,19 +366,19 @@ class TaskSpec:
         parent_dirty = [self.task_dict[t].dirty for t in self.depend_task]
         if any(parent_dirty):
             return True
-        if (self._exec_info_dump is _INVALIDATE
+        exec_info: ExecInfo = self._exec_info_dump
+        if (exec_info is _INVALIDATE
                 or self._exec_result is _INVALIDATE):
             return True
-        exec_info: ExecInfo = self._exec_info_dump
-        self._dirty = False
         if exec_info.depend_hash != self.dependent_hash:
-            self._dirty = True
-            return self._dirty
-        return self._dirty
+            return True
+        return False
 
     @dirty.register_broadcaster
     @status.register_broadcaster
-    def _depend_task_specs(self) -> List[Self]:
+    @_hash.register_broadcaster
+    @dependent_hash.register_broadcaster
+    def _depend_by_task_specs(self) -> List[Self]:
         return [self.task_dict[k] for k in self.depend_by]
 
     @cached_property
@@ -657,17 +677,20 @@ class TaskSpec:
             exec_info = self._exec_info
         self._exec_info_dump = exec_info
         self.dirty = False
+        self._hash = _INVALIDATE
+        self.dependent_hash = _INVALIDATE
 
     def clear_output_dump(self, rm_tree=False):
         self._exec_info_dump = _INVALIDATE
         self._exec_result = _INVALIDATE
         if rm_tree:
             shutil.rmtree(self.output_dump_folder, ignore_errors=True)
+        self._hash = _INVALIDATE
 
     def clear(self, rm_tree=False):
-        logger.info(f'clearing {self.task_name}')
-        if self.status != Status.STATUS_FINISHED:
-            return
+        logger.debug(f'clearing {self.task_name}')
+        # if self.status != Status.STATUS_FINISHED:
+        #     return
         self.clear_output_dump(rm_tree)
         self.dirty = _INVALIDATE
         self.status = _INVALIDATE
@@ -810,7 +833,8 @@ def _dfs_build_exe_graph(
             _dfs_build_exe_graph([depend_task_spec], task_dict)
 
 
-def build_exe_graph(tasks: List[str]):
+def build_exe_graph(tasks: List[Union[str, Path]]) \
+        -> Tuple[List[str], Dict[str, TaskSpec]]:
     """
     Build the execution graph for the given tasks.
     NOTE: tasks are path of tasks in FS, not the tasks names
@@ -905,7 +929,7 @@ class PRunner(RunnerBase):
         self.processes.clear()
 
     async def _run_task(self, task_root: str, task_name: str):
-        logger.info(f'entering task {task_name} ...')
+        logger.info(f'running task {task_name} ...')
         process = await asyncio.create_subprocess_exec(
             'python',
             '-m',
@@ -969,6 +993,7 @@ class FileWatcher:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
+        self.async_task = None
 
     async def start(self):
         if self.async_task is not None:
@@ -1024,30 +1049,29 @@ class TaskScheduler:
                 return task.task_name
         return None
 
-    def get_ready_set_running(self):
+    async def get_ready_set_running(self):
         ready_task = self._get_ready()
         if ready_task:
-            self.set_running(ready_task)
+            await self.set_running(ready_task)
         return ready_task
 
-    def set_status(self, task: str, status: Status):
+    async def set_status(self, task: str, status: Status):
         logger.debug(f'setting status of {task} to {status}')
         assert isinstance(task, str), task
         assert task in self.task_dict, f'{task} is not a valid task'
         self.task_dict[task].status = status
-        asyncio.create_task(
-            self.sche_event_queue.put(SchedulerEvent(
-                SchedulerEventType.STATUS_CHANGE,
-                (task, status))))
+        await self.sche_event_queue.put(SchedulerEvent(
+            SchedulerEventType.STATUS_CHANGE,
+            (task, status)))
 
-    def set_finished(self, task: str):
-        self.set_status(task, Status.STATUS_FINISHED)
+    async def set_finished(self, task: str):
+        await self.set_status(task, Status.STATUS_FINISHED)
 
-    def set_error(self, task: str):
-        self.set_status(task, Status.STATUS_ERROR)
+    async def set_error(self, task: str):
+        await self.set_status(task, Status.STATUS_ERROR)
 
-    def set_running(self, task: str):
-        self.set_status(task, Status.STATUS_RUNNING)
+    async def set_running(self, task: str):
+        await self.set_status(task, Status.STATUS_RUNNING)
 
     def print_status(self):
         for t in self.task_dict.values():
@@ -1169,7 +1193,7 @@ class TaskScheduler:
         logger.info('running...')
         async with self.runner, self.file_watcher:
             while True:
-                ready_task = self.get_ready_set_running()
+                ready_task = await self.get_ready_set_running()
                 if ready_task is None:
                     try:
                         event = await self._task_event_queue.get()
@@ -1187,10 +1211,10 @@ class TaskScheduler:
                         logger.info('stop running')
                         break
                     elif event.event_type == TaskEventType.TASK_FINISHED:
-                        self.set_finished(event.task_name)
+                        await self.set_finished(event.task_name)
                         self.task_dict[event.task_name].dump_exec_info()
                     elif event.event_type == TaskEventType.TASK_ERROR:
-                        self.set_error(event.task_name)
+                        await self.set_error(event.task_name)
                         logger.info(f'task:{event.task_name} is errored')
                     elif event.event_type == TaskEventType.TASK_INTERRUPT:
                         logger.info(f'task:{event.task_name} is interrupted')
