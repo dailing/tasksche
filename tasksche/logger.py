@@ -11,7 +11,7 @@ def _get_logger(name: str, print_level=logging.DEBUG):
     )
     formatter_file = logging.Formatter(
         fmt="%(levelname)5s "
-            "[%(filename)10s:%(lineno)-5d %(asctime)s]"
+            "[%(filename)15s:%(lineno)-5d %(asctime)s]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from tasksche.run import (
     Status, TaskScheduler,
-    build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
+    build_exe_graph, task_dict_to_pdf)
 
 
 class TestTaskSche(unittest.IsolatedAsyncioTestCase):
@@ -51,9 +51,6 @@ class TestTaskSche(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             sche.task_dict['/task1'].status, Status.STATUS_FINISHED)
         sche.run(once=True)
-
-    def test_enum_property(self):
-        self.assertFalse(DumpedTypeOperation.DELETE == "DELETE")
 
 
 if __name__ == '__main__':

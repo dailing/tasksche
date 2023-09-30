@@ -22,7 +22,7 @@ class TestTaskSche(unittest.IsolatedAsyncioTestCase):
         if clear:
             for v in task_dict.values():
                 v.clear()
-        task_dict_to_pdf(task_dict)
+        # task_dict_to_pdf(task_dict)
         return task_dict
 
     async def test_run_stop_long_run(self):
@@ -30,14 +30,14 @@ class TestTaskSche(unittest.IsolatedAsyncioTestCase):
         sche = TaskScheduler(self.task_path)
         sche.run(once=False, daemon=True)
         self.assertIsNotNone(sche.main_loop_task)
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
         await sche.stop()
         self.assertIsNone(sche.main_loop_task)
         # self.assertIsNone(sche._task_event_queue)
 
         sche.run(once=False, daemon=True)
         self.assertIsNotNone(sche.main_loop_task)
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
         # self.assertTrue(sche.main_loop_task.is_alive())
         await sche.stop()
         self.assertIsNone(sche.main_loop_task)

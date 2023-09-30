@@ -1,744 +1,25 @@
 import asyncio
-import contextlib
-import importlib
-import io
 import os
 import os.path
-import pickle
-import shutil
 import signal
 import sys
-import time
 from abc import abstractmethod, ABC
 from asyncio import Queue
 from asyncio.subprocess import Process
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
-from hashlib import md5
-from io import BytesIO, StringIO
 from pathlib import Path
-from pprint import pprint
-from threading import RLock
-from typing import Any, Dict, List, Tuple, Union, Optional, Iterable
-from typing import Callable
+from typing import Any, Dict, List, Tuple, Union, Optional
 
-import yaml
-from typing_extensions import Self
 from watchfiles import awatch
 
+from .common import __INVALIDATE__, Status
 from .logger import Logger
-
-
-class __INVALIDATE__:
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(__INVALIDATE__, cls).__new__(cls)
-
-        return cls._instance
-
-    def __repr__(self) -> str:
-        return '<INVALID>'
-
+from .task_spec import TaskSpec, EndTask
 
 _INVALIDATE = __INVALIDATE__()
-
 logger = Logger()
-
-
-def pprint_str(*args, **kwargs):
-    sio = StringIO()
-    pprint(*args, stream=sio, **kwargs)
-    sio.seek(0)
-    return sio.read()
-
-
-class Status(Enum):
-    STATUS_READY = 'ready'
-    STATUS_FINISHED = 'finished'
-    STATUS_ERROR = 'error'
-    STATUS_PENDING = 'pending'
-    STATUS_RUNNING = 'running'
-
-
-@dataclass
-class ExecInfo:
-    time: float
-    depend_hash: Dict[str, str]
-
-
-class DumpedTypeOperation(Enum):
-    DELETE = 'DELETE'
-
-
-class DumpedType:
-    def __init__(self, file_name, field_name, cache=True) -> None:
-        self.file_name = file_name
-        self.field_name = field_name
-        self.cache = cache
-
-    def __get__(self, instance, owner):
-        """
-        Get the value of the descriptor.
-
-        This method is used to get the value of the descriptor when accessed
-        through an instance or a class.
-
-        Parameters:
-        - instance: The instance of the class that the descriptor is accessed
-            through.
-        - owner: The class that owns the descriptor.
-
-        Returns:
-        - The value of the descriptor.
-        """
-        if instance is None:
-            return self
-        if self.cache and hasattr(instance, self.field_name):
-            return getattr(instance, self.field_name)
-        else:
-            file_name = os.path.join(
-                getattr(instance, 'output_dump_folder'), self.file_name)
-            if not os.path.exists(file_name):
-                return _INVALIDATE
-            with open(file_name, 'rb') as f:
-                result = pickle.load(f)
-                if self.cache:
-                    setattr(instance, self.field_name, result)
-            return result
-
-    def __set__(self, instance, value):
-        """
-        Set the value of the descriptor attribute.
-
-        Args:
-            instance: The instance of the class that the descriptor is being
-                set on.
-            value: The new value to set for the descriptor attribute.
-
-        Returns:
-            None
-        """
-        if self.cache:
-            setattr(instance, self.field_name, value)
-        dump_folder = getattr(instance, 'output_dump_folder')
-        if not os.path.exists(dump_folder):
-            os.makedirs(dump_folder, exist_ok=True)
-        file_name = os.path.join(
-            dump_folder, self.file_name)
-        if value is _INVALIDATE:
-            logger.debug(f'deleting {instance} file {file_name}')
-            if os.path.exists(file_name):
-                os.remove(file_name)
-            if hasattr(instance, self.field_name):
-                delattr(instance, self.field_name)
-        else:
-            with open(file_name, 'wb') as f:
-                pickle.dump(value, f)
-
-
-class CachedPropertyWithInvalidator:
-    """
-    Property decorator that caches the result of a function.
-    When the property is assigned a new value, the cached value is invalidated,
-    and all properties in the broadcaster are invalidated, the new value will
-    be calculated on the next access.
-    """
-
-    def __init__(self, func):
-        self.func = func
-        self.attr_name = None
-        self.broadcaster = None
-        self.__doc__ = func.__doc__
-        self.lock = RLock()
-
-    def register_broadcaster(self, broadcaster: Callable[[], Iterable]):
-        """
-        Register a broadcaster function.
-
-        :param broadcaster: A callable function that broadcasts messages.
-        """
-        assert self.broadcaster is None
-        self.broadcaster = broadcaster
-        return broadcaster
-
-    def __set_name__(self, owner, name: str):
-        if self.attr_name is None:
-            self.attr_name = name
-        elif name != self.attr_name:
-            raise TypeError(
-                "Cannot assign the to two different names"
-                f"({self.attr_name!r} and {name!r})."
-            )
-
-    def __get__(self, instance, owner=None):
-        if instance is None:
-            return self
-        if self.attr_name is None:
-            raise TypeError(
-                "Cannot use instance without __set_name__ on it.")
-        try:
-            cache = instance.__dict__
-        # not all objects have __dict__ (e.g. class defines slots)
-        except AttributeError:
-            msg = (
-                f"No '__dict__' attribute on {type(instance).__name__!r} "
-                f"instance to cache {self.attr_name!r} property."
-            )
-            raise TypeError(msg) from None
-        val = cache.get(self.attr_name, _INVALIDATE)
-        if val is _INVALIDATE:
-            with self.lock:
-                # check if another thread filled cache while we awaited lock
-                val = cache.get(self.attr_name, _INVALIDATE)
-                if val is _INVALIDATE:
-                    val = self.func(instance)
-                    logger.debug(
-                        f'updating value {instance}.{self.attr_name} to {val}')
-                    try:
-                        cache[self.attr_name] = val
-                    except TypeError:
-                        msg = (
-                            f"The '__dict__' attribute on "
-                            f"{type(instance).__name__!r} instance "
-                            f"does not support item assignment for "
-                            f"caching {self.attr_name!r} property."
-                        )
-                        raise TypeError(msg) from None
-        return val
-
-    def __set__(self, instance, value):
-        # logger.debug(f'set value {value} to {instance}.{self.attr_name}')
-        assert self.attr_name is not None
-        with self.lock:
-            if value == instance.__dict__.get(self.attr_name, _INVALIDATE):
-                return
-            instance.__dict__[self.attr_name] = value
-            if self.broadcaster:
-                # INVALIDATE ALL ATTR IN BROADCASTER
-                for inst in self.broadcaster(instance):
-                    setattr(inst, self.attr_name, _INVALIDATE)
-
-
-class ExecEnv:
-    def __init__(self, pythonpath, cwd):
-        self.pythonpath = pythonpath
-        self.cwd = cwd
-        self.previous_dir = os.getcwd()
-        self.stdout_file: Optional[io.TextIOWrapper] = None
-        self.redirect_stdout: Optional[contextlib.redirect_stdout] = None
-
-    def __enter__(self):
-        if self.pythonpath:
-            sys.path.insert(0, self.pythonpath)
-        if not os.path.exists(self.cwd):
-            os.makedirs(self.cwd, exist_ok=True)
-        if self.cwd:
-            os.chdir(self.cwd)
-        self.stdout_file = open(os.path.join(self.cwd, 'stdout.txt'), 'w')
-        self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
-        self.redirect_stdout.__enter__()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        assert self.redirect_stdout is not None
-        assert self.stdout_file is not None
-        self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
-        self.stdout_file.close()
-        if self.cwd:
-            os.chdir(self.previous_dir)
-        if self.pythonpath:
-            sys.path.remove(self.pythonpath)
-
-
-class TaskSpec:
-    _exec_info_dump = DumpedType(file_name='exec_info.pkl',
-                                 field_name='__exec_info')
-    _exec_result = DumpedType(file_name='exec_result.pkl',
-                              field_name='__exec_result')
-
-    def __init__(
-            self,
-            root: Optional[str],
-            task_name: str,
-            task_dict: Optional[Dict[str, Self]] = None
-    ) -> None:
-        self.root = root
-        self.task_name = task_name
-        self.task_dict = task_dict
-
-    @cached_property
-    def _exec_env(self) -> ExecEnv:
-        return ExecEnv(self.root, self.output_dump_folder)
-
-    @staticmethod
-    def _get_output_folder(root, task_name: str):
-        """
-        Get the path of the output directory.
-
-        Args:
-            root (str): The root directory.
-            task_name (str): The name of the task.
-
-        Returns:
-            str: The path of the output directory.
-        """
-        task_name = task_name[1:].replace('/', '.')
-        return os.path.join(os.path.dirname(root), '__output', task_name)
-
-    @staticmethod
-    def _get_dump_file(root: str, task_name: str):
-        return os.path.join(
-            TaskSpec._get_output_folder(root, task_name),
-            'dump.pkl'
-        )
-
-    @cached_property
-    def output_dump_folder(self):
-        return self._get_output_folder(self.root, self.task_name)
-
-    @cached_property
-    def output_dump_file(self):
-        assert self.root is not None
-        return self._get_dump_file(self.root, self.task_name)
-
-    @CachedPropertyWithInvalidator
-    def status(self):
-        def _f():
-            assert self.task_dict is not None
-            parent_status = [
-                self.task_dict[t].status for t in self.depend_task]
-            if all(status == Status.STATUS_FINISHED
-                   for status in parent_status):
-                if self.dirty:
-                    return Status.STATUS_READY
-                else:
-                    return Status.STATUS_FINISHED
-            elif Status.STATUS_ERROR in parent_status:
-                return Status.STATUS_ERROR
-            elif Status.STATUS_PENDING in parent_status:
-                return Status.STATUS_PENDING
-            elif Status.STATUS_RUNNING in parent_status:
-                return Status.STATUS_PENDING
-            elif Status.STATUS_READY in parent_status:
-                return Status.STATUS_PENDING
-            else:
-                logger.error(f'{self}, {parent_status}')
-                raise Exception("ERR")
-
-        st = _f()
-        logger.debug(f'get status {self}, {st}')
-        return st
-
-    @CachedPropertyWithInvalidator
-    def _hash(self):
-        """
-        Calculate the MD5 hash of the code file and return the hex digest
-        string.
-
-        Returns:
-            str: The hex digest string of the MD5 hash.
-        """
-        code_file = self.task_file
-        md5_hash = md5()
-        with open(code_file, 'rb') as f:
-            code = f.read()
-        md5_hash.update(code)
-        for inherent_task in self._cfg_dict['inherent_list']:
-            task_spec = TaskSpec(self.root, inherent_task)
-            with open(task_spec.task_file, 'rb') as f:
-                md5_hash.update(f.read())
-        out_dump = os.path.join(self.output_dump_folder, 'exec_result.pkl')
-        if os.path.exists(out_dump):
-            with open(out_dump, 'rb') as f:
-                md5_hash.update(f.read())
-        return md5_hash.hexdigest()
-
-    @CachedPropertyWithInvalidator
-    def dependent_hash(self) -> Dict[str, str]:
-        """
-        Calculates the hash values of all dependent tasks and returns a
-        dictionary mapping task names to their respective hash values.
-
-        Returns:
-            dict: A dictionary mapping task names (str) to their corresponding
-            hash values (str).
-        """
-        assert self.task_dict is not None
-        depend_hash = {
-            task_name: self.task_dict[task_name]._hash
-            for task_name in self._all_dependent_tasks
-        }
-        # Add me to dependent_hash
-        depend_hash[self.task_name] = self._hash
-        return depend_hash
-
-    @CachedPropertyWithInvalidator
-    def dirty(self):
-        parent_dirty = [self.task_dict[t].dirty for t in self.depend_task]
-        if any(parent_dirty):
-            return True
-        exec_info: ExecInfo = self._exec_info_dump
-        if (exec_info is _INVALIDATE
-                or self._exec_result is _INVALIDATE):
-            return True
-        if exec_info.depend_hash != self.dependent_hash:
-            logger.debug(
-                f'{self}, {exec_info.depend_hash}, {self.dependent_hash}')
-            return True
-        return False
-
-    @dirty.register_broadcaster
-    @status.register_broadcaster
-    @_hash.register_broadcaster
-    @dependent_hash.register_broadcaster
-    def _depend_by_task_specs(self) -> List[Self]:
-        return [self.task_dict[k] for k in self.depend_by]
-
-    @cached_property
-    def task_file(self):
-        """
-        Get the path of the task file.
-
-        Returns:
-            str: The path of the task file.
-        """
-        assert self.task_name.startswith('/')
-        return os.path.join(self.root, self.task_name[1:] + '.py')
-
-    @staticmethod
-    def update_dict_recursive(d1, d2):
-        """
-        Recursively updates the first dictionary `d1` with the key-value
-        pairs from the second dictionary `d2`.
-
-        Parameters:
-            - d1 (dict): The dictionary to be updated.
-            - d2 (dict): The dictionary containing the key-value pairs
-                to update `d1` with.
-        Returns:
-            None
-        """
-        for key, value in d2.items():
-            if (
-                    key in d1
-                    and isinstance(d1[key], dict)
-                    and isinstance(value, dict)
-            ):
-                TaskSpec.update_dict_recursive(d1[key], value)
-            else:
-                d1[key] = value
-
-    @cached_property
-    def _cfg_dict(self) -> Dict[str, Any]:
-        """
-        Loads the raw YAML content of the task file into a dictionary.
-
-        Returns:
-            Dict[str, Any]: The dictionary containing the YAML content.
-        """
-        payload = bytearray()
-        with open(self.task_file, 'rb') as f:
-            f.readline()
-            while True:
-                line = f.readline()
-                if line == b'"""\n' or line == b'"""':
-                    break
-                payload.extend(line)
-        try:
-            task_info: Dict[str:Any] = yaml.safe_load(BytesIO(payload))
-        except yaml.scanner.ScannerError as e:
-            logger.error(f"ERROR parse {self.task_file}")
-            raise e
-        if task_info is None:
-            task_info: Dict[str, Any] = {}
-        inherent_list = []
-        if 'inherent' in task_info:
-            inh_path = process_path(self.task_name, task_info['inherent'])
-            inh_cfg = TaskSpec(self.root, inh_path)._cfg_dict
-            inherent_list.append(inh_path)
-            inherent_list.extend(inh_cfg['inherent_list'])
-            self.update_dict_recursive(inh_cfg, task_info)
-            task_info = inh_cfg
-        task_info['inherent_list'] = inherent_list
-        return task_info
-
-    @cached_property
-    def _inherent_task(self) -> Optional[str]:
-        """
-        Returns the task name of inherent task.
-
-        :return: inherent task name
-        :rtype: str
-        """
-        if len(self._cfg_dict['inherent_list']) == 0:
-            return None
-        task_path = self._cfg_dict['inherent_list'][-1]
-        return task_path
-
-    @cached_property
-    def _require_map(self) -> Dict[Union[int, str], str]:
-        """
-        Generates a dictionary that maps integers or strings to strings
-        based on the 'require' key in the '_cfg_dict' attribute.
-
-        This is the raw requirement dictionary parsed from the task,
-        the required tasks are regulated to the relative path from root.
-
-        NOTE: task requirement are marked with $ sign
-        TODO: use $$ to represent original $
-
-        Returns:
-            Dict[Union[int, str], str]: The generated dictionary.
-
-        Raises:
-            Exception: If 'require' is neither a list nor a dictionary.
-        """
-        require: Dict[Union[int, str], str] = \
-            self._cfg_dict.get('require', {})
-        if isinstance(require, dict):
-            pass
-        elif isinstance(require, list):
-            require = {i: v for i, v in enumerate(require)}
-        else:
-            raise Exception('require not list or dict')
-        for k, v in require.items():
-            if isinstance(v, str) and v.startswith('$'):
-                task_path = v[1:]
-                task_path = process_path(self.task_name, task_path)
-                require[k] = f'${task_path}'
-        return require
-
-    @cached_property
-    def depend_task(self) -> List[str]:
-        """
-        A list of dependency task_name.
-        Returns:
-            List[str]: A list of dependency tasks.
-        """
-        return list(
-            map(
-                lambda x: x[1:],
-                filter(
-                    lambda x: isinstance(x, str) and x.startswith('$'),
-                    self._require_map.values()
-                )
-            )
-        )
-
-    @cached_property
-    def depend_by(self) -> List[str]:
-        """
-        Get the tasks that directly depend on this task.
-
-        Returns:
-            List[str]: A list of task names that directly depend on this task.
-        """
-        child_tasks = []
-        for task_name, task_spec in self.task_dict.items():
-            if self.task_name in task_spec.depend_task:
-                child_tasks.append(task_name)
-        return child_tasks
-
-    @cached_property
-    def _all_dependent_tasks(self) -> List[str]:
-        """
-        Get all child tasks of this task using BFS.
-        NOTE: the output follows the hierarchical order, i.e. the child
-        task is put after the parent task
-
-        Returns:
-            List[str]: A list of unique task names.
-        """
-        visited = set()
-        queue = [self.task_name]
-        queue_idx = 0
-        while len(queue) > queue_idx:
-            task_name = queue[queue_idx]
-            queue_idx += 1
-            if task_name not in visited:
-                visited.add(task_name)
-                task_spec = self.task_dict[task_name]
-                queue.extend([
-                    task for task in task_spec.depend_task
-                    if task not in visited
-                ])
-        return queue[1:]
-
-    @cached_property
-    def all_task_depend_me(self) -> List[str]:
-        """
-        Get all parent tasks of this task using BFS.
-        NOTE: the output are sorted by name to keep consistent on each run.
-
-        Returns:
-            List[str]: A list of unique task names.
-        """
-        visited = set()
-        queue = [self.task_name]
-        queue_idx = 0
-        while len(queue) > queue_idx:
-            task_name = queue[queue_idx]
-            queue_idx += 1
-            if task_name not in visited:
-                visited.add(task_name)
-                task_spec = self.task_dict[task_name]
-                queue.extend([
-                    task for task in task_spec.depend_by
-                    if task not in visited
-                ])
-        queue = queue[1:]
-        return sorted(queue)
-
-    def __repr__(self) -> str:
-        lines = ''
-        lines = lines + f"<Task:{self.task_name}>"
-        return lines
-
-    def _prepare_args(
-            self,
-            arg: Any,
-    ) -> Any:
-        if isinstance(arg, str) and arg.startswith('$'):
-            task_name = arg[1:]
-            result_dump = TaskSpec(self.root, task_name)._exec_result
-            return result_dump
-        else:
-            return arg
-
-    def _load_input(self) -> Tuple[List[Any], Dict[str, Any]]:
-        """
-        Load the input arguments for the task.
-        NOTE: this function should only be called by @execute
-
-        Returns:
-            Tuple[List[Any], Dict[str, Any]]: A tuple containing the list of
-                positional arguments and the dictionary of keyword arguments.
-        """
-        arg_keys = [key for key in self._require_map.keys()
-                    if isinstance(key, int)]
-        args = []
-        if len(arg_keys) > 0:
-            args = [None] * (max(arg_keys) + 1)
-            for k in arg_keys:
-                args[k] = self._prepare_args(
-                    self._require_map[k]
-                )
-        kwargs = {k: self._prepare_args(v)
-                  for k, v in self._require_map.items()
-                  if isinstance(k, str)}
-        return args, kwargs
-
-    @cached_property
-    def task_module_path(self):
-        if self._inherent_task is not None:
-            task_path = self._inherent_task
-        else:
-            task_path = self.task_name
-        task_file = task_path
-        mod_path = task_file[1:].replace('/', '.')
-        return mod_path
-
-    def execute(self):
-        """
-        Execute the task by importing the task module and calling the
-        'run' function.
-
-        NOTE: this function should only be called when all dependent
-        task finished. No dirty check or dependency check will be invoked
-        in this function.
-
-        Returns:
-            None
-        """
-        logger.debug(f'executing {self.task_name}@{self.task_module_path}')
-        with self._exec_env:
-            try:
-                mod = importlib.import_module(self.task_module_path)
-                mod.__dict__['work_dir'] = self.output_dump_folder
-                if not hasattr(mod, 'run'):
-                    raise NotImplementedError()
-                args, kwargs = self._load_input()
-                output = mod.run(*args, **kwargs)
-                self._exec_result = output
-            except Exception as e:
-                logger.error(e, stack_info=True)
-                return 1
-        return 0
-
-    @property
-    def _exec_info(self) -> ExecInfo:
-        """
-        Returns the execution information for the current execution.
-
-        :return: An instance of the ExecInfo class.
-        :rtype: ExecInfo
-        """
-        exec_info = ExecInfo(
-            time=time.time(),
-            depend_hash=self.dependent_hash
-        )
-        return exec_info
-
-    def dump_exec_info(self, exec_info=None):
-        if exec_info is None:
-            self.dirty = False
-            self._hash = _INVALIDATE
-            self.dependent_hash = _INVALIDATE
-            exec_info = self._exec_info
-        self._exec_info_dump = exec_info
-
-    def clear_output_dump(self, rm_tree=False):
-        self._exec_info_dump = _INVALIDATE
-        self._exec_result = _INVALIDATE
-        if rm_tree:
-            shutil.rmtree(self.output_dump_folder, ignore_errors=True)
-        self._hash = _INVALIDATE
-
-    def clear(self, rm_tree=False):
-        logger.debug(f'clearing {self.task_name}')
-        # if self.status != Status.STATUS_FINISHED:
-        #     return
-        self.clear_output_dump(rm_tree)
-        self.dirty = _INVALIDATE
-        self.status = _INVALIDATE
-
-
-class EndTask(TaskSpec):
-    def __init__(
-            self,
-            task_dict: Dict[str, TaskSpec],
-            depend_task: List[str]
-    ):
-        super().__init__('/tmp/none_exist', "_END_", task_dict)
-        self._depend_task = depend_task
-
-    @property
-    def dirty(self):
-        return True
-
-    @dirty.setter
-    def dirty(self, value):
-        pass
-
-    @property
-    def depend_task(self) -> List[str]:
-        return self._depend_task
-
-    @property
-    def depend_by(self) -> List[str]:
-        return []
-
-    def clear(self, rm_tree=False):
-        pass
-
-    def dependent_hash(self):
-        return None
-
-    @cached_property
-    def task_module_path(self):
-        return '_END_'
 
 
 def task_dict_to_pdf(task_dict: Dict[str, TaskSpec]):
@@ -937,8 +218,12 @@ class PRunner(RunnerBase):
         logger.info('exiting ...')
         for p in list(self.processes.values()):
             # sent int signal
-            p.send_signal(signal.SIGINT)
-            await p.wait()
+            try:
+                p.send_signal(signal.SIGINT)
+                await p.wait()
+            except ProcessLookupError:
+                logger.debug(f'process {p.pid} already exited')
+                pass
         self.processes.clear()
 
     async def _run_task(self, task_root: str, task_name: str):
@@ -959,10 +244,17 @@ class PRunner(RunnerBase):
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
             logger.info(f'\033[92;1mfinished task {task_name}\033[0m')
-        else:
+        elif exit_code == 3:
+            logger.info(f'\033[91;1mkilling task {task_name}\033[0m')
+            await self.event_queue.put(TaskEvent(
+                TaskEventType.TASK_INTERRUPT, task_name, task_root
+            ))
+        elif exit_code == 2:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_ERROR, task_name, task_root))
             logger.info(f'Error task {task_name}')
+        else:
+            logger.error(f'UNKNOWN EXIT CODE {exit_code}')
 
     def add_task(self, task_root: str, task_name: str) -> None:
         asyncio.create_task(self._run_task(task_root, task_name))
@@ -1083,12 +375,11 @@ class TaskScheduler:
     async def set_error(self, task: str):
         await self.set_status(task, Status.STATUS_ERROR)
 
+    async def clear_status(self, task: str):
+        self.task_dict[task].status = _INVALIDATE
+
     async def set_running(self, task: str):
         await self.set_status(task, Status.STATUS_RUNNING)
-
-    def print_status(self):
-        for t in self.task_dict.values():
-            print(f'{t.task_name}: {t.status}')
 
     async def clear(
             self,
@@ -1250,9 +541,6 @@ class TaskScheduler:
             elif event.event_type == TaskEventType.TASK_ERROR:
                 await self.set_error(event.task_name)
                 logger.info(f'task:{event.task_name} is errored')
-            elif event.event_type == TaskEventType.TASK_INTERRUPT:
-                logger.info(f'task:{event.task_name} is interrupted')
-                pass
             elif event.event_type == TaskEventType.FILE_CHANGE:
                 logger.info(f'file changed:{event.task_name}')
                 await self._reload()
@@ -1263,6 +551,10 @@ class TaskScheduler:
         async with self.runner, self.file_watcher:
             while not await loop():
                 pass
+        # clearing running tasks
+        for task in self.task_dict.values():
+            if task.status == Status.STATUS_RUNNING:
+                task.status = _INVALIDATE
         logger.info('exiting _run')
 
     async def stop(self):
@@ -1284,6 +576,7 @@ class TaskScheduler:
         """
         add _run to loop if daemon,
         else run _run and await
+        # TODO: add task level timeout
         """
         if self.main_loop_task is not None and not self.main_loop_task.done():
             logger.error('already running !!')
@@ -1312,23 +605,12 @@ def run_target(tasks: List[dir]):
 
 
 def _exec_task(root: str, task: str):
-    task_spec = TaskSpec(root, task)
-    task_spec.execute()
-
-
-def process_path(task_name: str, path: str):
-    task_name = os.path.dirname(task_name)
-    if not path.startswith('/'):
-        path = os.path.join(task_name, path)
-    path_filtered = []
-    for sub_path in path.split('/'):
-        if sub_path == '.':
-            continue
-        if sub_path == '..':
-            path_filtered.pop()
-            continue
-        path_filtered.append(sub_path)
-    if path_filtered[0] != '':
-        path_filtered = task_name.split('/') + path_filtered
-    path_new = '/'.join(path_filtered)
-    return path_new
+    try:
+        task_spec = TaskSpec(root, task)
+        task_spec.execute()
+    except KeyboardInterrupt:
+        logger.info(f'Cancelling task {task}')
+        sys.exit(3)
+    except Exception as e:
+        logger.error(e, stack_info=True)
+        sys.exit(2)

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from tasksche.run import (
     TaskScheduler,
-    build_exe_graph, task_dict_to_pdf, DumpedTypeOperation)
+    build_exe_graph, task_dict_to_pdf)
 
 
 class TestTaskSche(unittest.TestCase):
@@ -27,12 +27,9 @@ class TestTaskSche(unittest.TestCase):
     def test_run_basic_runner(self):
         self.get_task_dict(clear=True)
         sche = TaskScheduler(self.task_path)
-        print(sche.task_dict['/task3']._cfg_dict)
-        print(sche.task_dict['/task3'].dependent_hash)
+        # print(sche.task_dict['/task3']._cfg_dict)
+        # print(sche.task_dict['/task3'].dependent_hash)
         sche.run(once=True)
-
-    def test_enum_property(self):
-        self.assertFalse(DumpedTypeOperation.DELETE == "DELETE")
 
 
 if __name__ == '__main__':
