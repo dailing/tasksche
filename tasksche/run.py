@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import importlib
+import io
 import os
 import os.path
 import pickle
@@ -136,7 +137,6 @@ class DumpedType:
         else:
             with open(file_name, 'wb') as f:
                 pickle.dump(value, f)
-                logger.debug(f'dump result {value}')
 
 
 class CachedPropertyWithInvalidator:
@@ -160,10 +160,11 @@ class CachedPropertyWithInvalidator:
 
         :param broadcaster: A callable function that broadcasts messages.
         """
+        assert self.broadcaster is None
         self.broadcaster = broadcaster
         return broadcaster
 
-    def __set_name__(self, owner, name):
+    def __set_name__(self, owner, name: str):
         if self.attr_name is None:
             self.attr_name = name
         elif name != self.attr_name:
@@ -209,7 +210,8 @@ class CachedPropertyWithInvalidator:
         return val
 
     def __set__(self, instance, value):
-        logger.debug(f'set value {value} to {instance}.{self.attr_name}')
+        # logger.debug(f'set value {value} to {instance}.{self.attr_name}')
+        assert self.attr_name is not None
         with self.lock:
             if value == instance.__dict__.get(self.attr_name, _INVALIDATE):
                 return
@@ -225,8 +227,8 @@ class ExecEnv:
         self.pythonpath = pythonpath
         self.cwd = cwd
         self.previous_dir = os.getcwd()
-        self.stdout_file = None
-        self.redirect_stdout = None
+        self.stdout_file: Optional[io.TextIOWrapper] = None
+        self.redirect_stdout: Optional[contextlib.redirect_stdout] = None
 
     def __enter__(self):
         if self.pythonpath:
@@ -240,6 +242,8 @@ class ExecEnv:
         self.redirect_stdout.__enter__()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        assert self.redirect_stdout is not None
+        assert self.stdout_file is not None
         self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
         self.stdout_file.close()
         if self.cwd:
@@ -263,8 +267,6 @@ class TaskSpec:
         self.root = root
         self.task_name = task_name
         self.task_dict = task_dict
-        self._status = None
-        self._dirty = None
 
     @cached_property
     def _exec_env(self) -> ExecEnv:
@@ -298,11 +300,13 @@ class TaskSpec:
 
     @cached_property
     def output_dump_file(self):
+        assert self.root is not None
         return self._get_dump_file(self.root, self.task_name)
 
     @CachedPropertyWithInvalidator
     def status(self):
         def _f():
+            assert self.task_dict is not None
             parent_status = [
                 self.task_dict[t].status for t in self.depend_task]
             if all(status == Status.STATUS_FINISHED
@@ -353,6 +357,15 @@ class TaskSpec:
 
     @CachedPropertyWithInvalidator
     def dependent_hash(self) -> Dict[str, str]:
+        """
+        Calculates the hash values of all dependent tasks and returns a
+        dictionary mapping task names to their respective hash values.
+
+        Returns:
+            dict: A dictionary mapping task names (str) to their corresponding
+            hash values (str).
+        """
+        assert self.task_dict is not None
         depend_hash = {
             task_name: self.task_dict[task_name]._hash
             for task_name in self._all_dependent_tasks
@@ -371,6 +384,8 @@ class TaskSpec:
                 or self._exec_result is _INVALIDATE):
             return True
         if exec_info.depend_hash != self.dependent_hash:
+            logger.debug(
+                f'{self}, {exec_info.depend_hash}, {self.dependent_hash}')
             return True
         return False
 
@@ -579,12 +594,6 @@ class TaskSpec:
     def __repr__(self) -> str:
         lines = ''
         lines = lines + f"<Task:{self.task_name}>"
-        # for parent, me, child in zip_longest(
-        #         self.depend_task,
-        #         [self.task_name],
-        #         self.depend_by, fillvalue=''
-        # ):
-        #     lines = lines + f'{parent:15s}-->{me:15s}-->{child:15s}\n'
         return lines
 
     def _prepare_args(
@@ -674,11 +683,11 @@ class TaskSpec:
 
     def dump_exec_info(self, exec_info=None):
         if exec_info is None:
+            self.dirty = False
+            self._hash = _INVALIDATE
+            self.dependent_hash = _INVALIDATE
             exec_info = self._exec_info
         self._exec_info_dump = exec_info
-        self.dirty = False
-        self._hash = _INVALIDATE
-        self.dependent_hash = _INVALIDATE
 
     def clear_output_dump(self, rm_tree=False):
         self._exec_info_dump = _INVALIDATE
@@ -726,6 +735,10 @@ class EndTask(TaskSpec):
 
     def dependent_hash(self):
         return None
+
+    @cached_property
+    def task_module_path(self):
+        return '_END_'
 
 
 def task_dict_to_pdf(task_dict: Dict[str, TaskSpec]):
@@ -941,7 +954,7 @@ class PRunner(RunnerBase):
         self.processes[task_name] = process
         exit_code = await process.wait()
         del self.processes[task_name]
-        logger.info(f'exiting task {task_name} ...')
+        logger.debug(f'exiting task {task_name} ...')
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
@@ -981,7 +994,7 @@ class FileWatcher:
         self.async_task: Optional[asyncio.Task] = None
 
     async def _func(self):
-        logger.info(f'watching {self.root} ...')
+        logger.debug(f'watching {self.root} ...')
         async for event in awatch(self.root, stop_event=self.stop_event):
             files = set([x[1] for x in event])
             for f in files:
@@ -1191,49 +1204,65 @@ class TaskScheduler:
             None
         """
         logger.info('running...')
-        async with self.runner, self.file_watcher:
+
+        async def loop() -> bool:
+            """
+            the main event loop body
+            return True for stoping the event loop
+            """
+            ready_list = []
             while True:
                 ready_task = await self.get_ready_set_running()
                 if ready_task is None:
-                    try:
-                        event = await self._task_event_queue.get()
-                    except ValueError:
-                        logger.info('stop running')
-                        await self.runner.stop_tasks_and_wait(
-                            self.runner.get_running_tasks())
-                        break
-                    except Exception as e:
-                        logger.error(e, stack_info=True)
-                        logger.error(f'{type(e)}')
-                        break
-                    logger.debug(f'got event:{event}')
-                    if event is None:
-                        logger.info('stop running')
-                        break
-                    elif event.event_type == TaskEventType.TASK_FINISHED:
-                        await self.set_finished(event.task_name)
-                        self.task_dict[event.task_name].dump_exec_info()
-                    elif event.event_type == TaskEventType.TASK_ERROR:
-                        await self.set_error(event.task_name)
-                        logger.info(f'task:{event.task_name} is errored')
-                    elif event.event_type == TaskEventType.TASK_INTERRUPT:
-                        logger.info(f'task:{event.task_name} is interrupted')
-                        pass
-                    elif event.event_type == TaskEventType.FILE_CHANGE:
-                        logger.info(f'file changed:{event.task_name}')
-                        await self._reload()
-                    else:
-                        raise NotImplementedError()
+                    break
+                ready_list.append(ready_task)
+            if len(ready_list) == 1 and ready_list[0] == '_END_':
+                logger.info('all tasks are finished')
+                await self.set_finished(ready_list[0])
+                if once:
+                    logger.info("in single step mode, exiting...")
+                    return True
                 else:
-                    if ready_task == '_END_':
-                        logger.info('all tasks are finished')
-                        if once:
-                            logger.info("in single step mode, exiting...")
-                            break
-                        continue
-                    task_spec = self.task_dict[ready_task]
-                    self.runner.add_task(task_spec.root, task_spec.task_name)
-        # self.runner = None
+                    return False
+            for ready_task in ready_list:
+                task_spec = self.task_dict[ready_task]
+                assert task_spec.root is not None
+                self.runner.add_task(task_spec.root, task_spec.task_name)
+            # set all task to running, waiting for event now:
+            try:
+                event = await self._task_event_queue.get()
+            except ValueError:
+                logger.info('stop running')
+                await self.runner.stop_tasks_and_wait(
+                    self.runner.get_running_tasks())
+                return True
+            except Exception as e:
+                logger.error(e, stack_info=True)
+                logger.error(f'{type(e)}')
+                return True
+            logger.debug(f'got event:{event}')
+            if event is None:
+                logger.info('stop running')
+                return True
+            elif event.event_type == TaskEventType.TASK_FINISHED:
+                await self.set_finished(event.task_name)
+                self.task_dict[event.task_name].dump_exec_info()
+            elif event.event_type == TaskEventType.TASK_ERROR:
+                await self.set_error(event.task_name)
+                logger.info(f'task:{event.task_name} is errored')
+            elif event.event_type == TaskEventType.TASK_INTERRUPT:
+                logger.info(f'task:{event.task_name} is interrupted')
+                pass
+            elif event.event_type == TaskEventType.FILE_CHANGE:
+                logger.info(f'file changed:{event.task_name}')
+                await self._reload()
+            else:
+                raise NotImplementedError()
+            return False
+
+        async with self.runner, self.file_watcher:
+            while not await loop():
+                pass
         logger.info('exiting _run')
 
     async def stop(self):
@@ -1283,8 +1312,8 @@ def run_target(tasks: List[dir]):
 
 
 def _exec_task(root: str, task: str):
-    taskspec = TaskSpec(root, task)
-    taskspec.execute()
+    task_spec = TaskSpec(root, task)
+    task_spec.execute()
 
 
 def process_path(task_name: str, path: str):

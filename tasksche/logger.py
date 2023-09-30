@@ -4,14 +4,14 @@ import sys
 
 def _get_logger(name: str, print_level=logging.DEBUG):
     formatter = logging.Formatter(
-        fmt="%(levelname)10s "
+        fmt="%(levelname)5s "
             "[%(filename)15s:%(lineno)-4d %(asctime)s]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )
     formatter_file = logging.Formatter(
-        fmt="%(levelname)10s "
-            "[%(filename)15s:%(lineno)-5d %(asctime)s]"
+        fmt="%(levelname)5s "
+            "[%(filename)10s:%(lineno)-5d %(asctime)s]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )

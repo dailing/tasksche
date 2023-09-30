@@ -92,6 +92,7 @@ if __name__ == '__main__':
         Execute a single task, ignores dependencies and schedules.
 
         Args:
+            root (str): The root path
             task (str): The task to be executed.
 
         Returns:

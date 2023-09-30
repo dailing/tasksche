@@ -216,7 +216,7 @@ async def task_page():
         except CancelledError:
             print('cancelled event queue')
 
-    prev_task:asyncio.Task = cb_storage.get(app.storage.browser['id'], None)
+    prev_task: asyncio.Task = cb_storage.get(app.storage.browser['id'], None)
     if prev_task is not None:
         prev_task.cancel()
         await prev_task.result()
