@@ -1,6 +1,6 @@
 import dataclasses
 from collections import defaultdict
-from typing import Callable, Dict, List, Any
+from typing import Callable, Dict, List, Any, TypeVar
 
 from .common import CachedPropertyWithInvalidator, Status
 from .logger import Logger
@@ -38,14 +38,23 @@ class CallbackBase:
         """
         raise NotImplementedError()
 
-    @classmethod
-    def _callbacks(cls) -> Dict[str, Callable]:
-        cbs = cls.__callbacks__
-        if cbs is not None:
-            return cbs
-        cbs = dict({k: v for k, v in cls.__dict__.items() if not k.startswith('_')})
-        cls.__callbacks__ = cbs
-        return cbs
+    def task_start(self, task: TaskSpec):
+        raise NotImplementedError()
+
+    def task_finish(self, task: TaskSpec):
+        raise NotImplementedError()
+
+    def task_error(self, task: TaskSpec):
+        raise NotImplementedError()
+
+    def task_interrupt(self, task: TaskSpec):
+        raise NotImplementedError()
+
+
+CALLBACK_TYPE = TypeVar('CALLBACK_TYPE', bound=CallbackBase)
+CALL_BACK_DICT: Dict[str, Callable] = {
+    k: v for k, v in CallbackBase.__dict__.items() if not k.startswith('_')
+}
 
 
 class _CallbackRunnerMeta(type):
@@ -71,14 +80,14 @@ class _CallbackRunnerMeta(type):
         return f
 
     def __new__(cls, name, bases, attrs):
-        for k, v in CallbackBase._callbacks().items():
+        for k, v in CALL_BACK_DICT.items():
             attrs[k] = _CallbackRunnerMeta.wrapper(v, k)
         return super().__new__(cls, name, bases, attrs)
 
 
 class CallbackRunner(CallbackBase, metaclass=_CallbackRunnerMeta):
 
-    def __init__(self, callbacks: List[CallbackBase]) -> None:
+    def __init__(self, callbacks: List[CALLBACK_TYPE]) -> None:
         """
         Initializes CallbackRunner with a list of callbacks.
         :param callbacks: List of callback objects
@@ -89,8 +98,8 @@ class CallbackRunner(CallbackBase, metaclass=_CallbackRunnerMeta):
     def _cbs(self) -> Dict[str, List[Callable]]:
         cbs = defaultdict(list)
         for cb in self.cbs:
-            for call_back_name, invalid_func in CallbackBase._callbacks().items():
+            for call_back_name, invalid_func in CALL_BACK_DICT.items():
                 if invalid_func is getattr(cb.__class__, call_back_name):
                     continue
                 cbs[call_back_name].append(getattr(cb, call_back_name))
-        return dict(cbs)
+        return cbs

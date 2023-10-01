@@ -35,7 +35,7 @@ class Logger:
 
     def __new__(cls):
         if cls.logger is None:
-            cls.logger = _get_logger('runner', print_level=logging.INFO)
+            cls.logger = _get_logger('runner', print_level=logging.WARNING)
         return cls.logger
 
 

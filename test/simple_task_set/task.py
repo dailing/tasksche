@@ -4,6 +4,7 @@ require:
 """
 
 from tasksche import path_for
+import time
 
 
 def run(data):
@@ -12,3 +13,4 @@ def run(data):
         f.write('\n')
         f.write(path_for('task3'))
     print("test")
+    time.sleep(1)

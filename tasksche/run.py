@@ -3,20 +3,22 @@ import os
 import os.path
 import signal
 import sys
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
 from asyncio import Queue
 from asyncio.subprocess import Process
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from watchfiles import awatch
 
+from .callback import CALLBACK_TYPE, CallbackRunner
+from .cbs import ProgressCB
 from .common import __INVALIDATE__, Status
 from .logger import Logger
-from .task_spec import TaskSpec, EndTask
+from .task_spec import EndTask, TaskSpec
 
 _INVALIDATE = __INVALIDATE__()
 logger = Logger()
@@ -50,7 +52,8 @@ def search_for_root(base):
     return None
 
 
-def path_to_task_spec(tasks: List[str], root=None) -> Dict[str, TaskSpec]:
+def path_to_task_spec(
+        tasks: List[Union[str, Path]], root=None) -> Dict[str, TaskSpec]:
     """
     Convert the paths specified by the tasks argument into TaskSpec objects.
 
@@ -97,7 +100,7 @@ def path_to_task_spec(tasks: List[str], root=None) -> Dict[str, TaskSpec]:
 
 def _dfs_build_exe_graph(
         task_specs: List[TaskSpec],
-        task_dict: Dict[str, TaskSpec] = None
+        task_dict: Optional[Dict[str, TaskSpec]] = None
 ):
     """
     Recursively builds an execution graph for the given task specifications.
@@ -161,7 +164,7 @@ class TaskEventType(Enum):
 class TaskEvent:
     event_type: TaskEventType
     task_name: str
-    task_root: str
+    task_root: Optional[str]
 
     def __repr__(self) -> str:
         return f'<{self.event_type}: {self.task_name}@{self.task_root}>'
@@ -227,7 +230,7 @@ class PRunner(RunnerBase):
         self.processes.clear()
 
     async def _run_task(self, task_root: str, task_name: str):
-        logger.info(f'running task {task_name} ...')
+        logger.debug(f'running task {task_name} ...')
         process = await asyncio.create_subprocess_exec(
             'python',
             '-m',
@@ -243,9 +246,9 @@ class PRunner(RunnerBase):
         if exit_code == 0:
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_FINISHED, task_name, task_root))
-            logger.info(f'\033[92;1mfinished task {task_name}\033[0m')
+            logger.debug(f'finished task {task_name}')
         elif exit_code == 3:
-            logger.info(f'\033[91;1mkilling task {task_name}\033[0m')
+            logger.debug(f'killing task {task_name}')
             await self.event_queue.put(TaskEvent(
                 TaskEventType.TASK_INTERRUPT, task_name, task_root
             ))
@@ -310,7 +313,9 @@ class FileWatcher:
 
     async def stop(self):
         self.stop_event.set()
-        await self.async_task
+        if self.async_task is not None:
+            logger.debug('stopping ...')
+            await self.async_task
 
 
 class SchedulerEventType(Enum):
@@ -324,14 +329,17 @@ class SchedulerEvent:
 
 
 class TaskScheduler:
+
     def __init__(
             self,
-            target,
+            target: List[Union[str, Path]],
+            call_backs: Optional[List[CALLBACK_TYPE]] = None,
     ) -> None:
         self.target, self.task_dict = build_exe_graph(target)
         self.main_loop_task: Optional[asyncio.Task] = None
-        self._callback_caller = None
-        self._callback_caller_event = None
+        if call_backs is None:
+            call_backs = []
+        self._cbs = CallbackRunner(call_backs)
         self.runner = PRunner(self._task_event_queue)
 
     @cached_property
@@ -383,7 +391,7 @@ class TaskScheduler:
 
     async def clear(
             self,
-            tasks: Union[List[str], str, None] = None,
+            tasks: Union[Iterable[str], str, None] = None,
             deep: bool = False,
             _event: bool = True,
     ) -> None:
@@ -391,7 +399,7 @@ class TaskScheduler:
         Clear specific tasks or all tasks in the task dictionary.
 
         Args:
-            tasks (Union[List[str], str, None], optional): The tasks to be
+            tasks (Union[Iterable[str], str, None], optional): The tasks to be
                 cleared. Defaults to None.
             deep (bool, optional): Whether to perform a deep clear, which
                 clears all subtasks of the specified tasks. Defaults to False.
@@ -425,6 +433,7 @@ class TaskScheduler:
 
     @cached_property
     def file_watcher(self):
+        assert self.root is not None
         return FileWatcher(self.root, self._task_event_queue)
 
     async def _reload(self):
@@ -519,6 +528,7 @@ class TaskScheduler:
                 task_spec = self.task_dict[ready_task]
                 assert task_spec.root is not None
                 self.runner.add_task(task_spec.root, task_spec.task_name)
+                self._cbs.task_start(task=task_spec)
             # set all task to running, waiting for event now:
             try:
                 event = await self._task_event_queue.get()
@@ -538,9 +548,11 @@ class TaskScheduler:
             elif event.event_type == TaskEventType.TASK_FINISHED:
                 await self.set_finished(event.task_name)
                 self.task_dict[event.task_name].dump_exec_info()
+                self._cbs.task_finish(task=self.task_dict[event.task_name])
             elif event.event_type == TaskEventType.TASK_ERROR:
                 await self.set_error(event.task_name)
                 logger.info(f'task:{event.task_name} is errored')
+                self._cbs.task_error(task=self.task_dict[event.task_name])
             elif event.event_type == TaskEventType.FILE_CHANGE:
                 logger.info(f'file changed:{event.task_name}')
                 await self._reload()
@@ -588,17 +600,22 @@ class TaskScheduler:
             asyncio.run(self._run(once))
 
 
-def serve_target(tasks: List[dir]):
+default_cbs = [
+    ProgressCB(),
+]
+
+
+def serve_target(tasks: List[Union[str, Path]]):
     logger.info(f'serve2 {tasks}')
-    scheduler = TaskScheduler(tasks)
+    scheduler = TaskScheduler(tasks, call_backs=default_cbs)
     # task_dict_to_pdf(scheduler.task_dict)
     # logger.debug(scheduler.task_dict)
     scheduler.run(once=False, daemon=False)
 
 
-def run_target(tasks: List[dir]):
+def run_target(tasks: List[Union[str, Path]]):
     logger.info(f'exec {tasks}')
-    scheduler = TaskScheduler(tasks)
+    scheduler = TaskScheduler(tasks, call_backs=default_cbs)
     # task_dict_to_pdf(scheduler.task_dict)
     # logger.debug(scheduler.task_dict)
     scheduler.run(once=True, daemon=False)

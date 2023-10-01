@@ -1,11 +1,10 @@
 import asyncio
-import time
 import unittest
 from pathlib import Path
 
-from tasksche.run import (SchedulerEvent, Status, TaskScheduler, build_exe_graph,
-                          task_dict_to_pdf, _INVALIDATE)
 from tasksche.logger import Logger
+from tasksche.run import (SchedulerEvent, Status, TaskScheduler, build_exe_graph,
+                          _INVALIDATE)
 
 logger = Logger()
 
