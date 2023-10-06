@@ -1,6 +1,5 @@
 import inspect
 import os.path
-from pprint import pprint
 
 
 def path_for(p) -> str:

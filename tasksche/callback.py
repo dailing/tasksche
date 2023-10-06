@@ -59,7 +59,7 @@ CALL_BACK_DICT: Dict[str, Callable] = {
 
 class _CallbackRunnerMeta(type):
     @staticmethod
-    def wrapper(func, cb_name):
+    def wrapper(func: Callable, cb_name):
         def f(_instance, **kwargs):
             cb_dict = getattr(_instance, '_cbs')
             for cb in cb_dict[cb_name]:

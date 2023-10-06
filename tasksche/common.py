@@ -3,8 +3,9 @@ import pickle
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import Callable, Iterable
-from typing import Dict
+from typing import Any, Callable, Iterable, Union
+from typing_extensions import Self
+from typing import Dict, Generic, TypeVar
 
 from .logger import Logger
 
@@ -107,7 +108,10 @@ class DumpedType:
                 pickle.dump(value, f)
 
 
-class CachedPropertyWithInvalidator:
+_CacheType = TypeVar('_CacheType')
+
+
+class CachedPropertyWithInvalidator(Generic[_CacheType], property):
     """
     Property decorator that caches the result of a function.
     When the property is assigned a new value, the cached value is invalidated,
@@ -116,13 +120,14 @@ class CachedPropertyWithInvalidator:
     """
 
     def __init__(self, func):
+        super().__init__()
         self.func = func
         self.attr_name = None
         self.broadcaster = None
         self.__doc__ = func.__doc__
         self.lock = RLock()
 
-    def register_broadcaster(self, broadcaster: Callable[[], Iterable]):
+    def register_broadcaster(self, broadcaster: Callable[[Any], Iterable]):
         """
         Register a broadcaster function.
 
@@ -141,7 +146,7 @@ class CachedPropertyWithInvalidator:
                 f"({self.attr_name!r} and {name!r})."
             )
 
-    def __get__(self, instance, owner=None):
+    def __get__(self, instance, owner=None) -> Union[Self, _CacheType]:
         if instance is None:
             return self
         if self.attr_name is None:
@@ -177,8 +182,7 @@ class CachedPropertyWithInvalidator:
                         raise TypeError(msg) from None
         return val
 
-    def __set__(self, instance, value):
-        # logger.debug(f'set value {value} to {instance}.{self.attr_name}')
+    def __set__(self, instance, value: _CacheType):
         assert self.attr_name is not None
         with self.lock:
             if value == instance.__dict__.get(self.attr_name, _INVALIDATE):

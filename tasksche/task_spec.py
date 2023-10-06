@@ -11,10 +11,11 @@ from hashlib import md5
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Union, Optional
 
-import yaml
+import yaml.scanner
 from typing_extensions import Self
 
-from .common import __INVALIDATE__, Status, ExecInfo, DumpedType, CachedPropertyWithInvalidator
+from .common import (__INVALIDATE__, Status, ExecInfo,
+                     DumpedType, CachedPropertyWithInvalidator)
 from .logger import Logger
 
 _INVALIDATE = __INVALIDATE__()
@@ -54,6 +55,7 @@ class ExecEnv:
             os.makedirs(self.cwd, exist_ok=True)
         if self.cwd:
             os.chdir(self.cwd)
+        assert self.cwd is not None
         self.stdout_file = open(os.path.join(self.cwd, 'stdout.txt'), 'w')
         self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
         self.redirect_stdout.__enter__()
@@ -193,6 +195,7 @@ class TaskSpec:
 
     @CachedPropertyWithInvalidator
     def dirty(self):
+        assert self.task_dict is not None
         parent_dirty = [self.task_dict[t].dirty for t in self.depend_task]
         if any(parent_dirty):
             return True
@@ -211,6 +214,7 @@ class TaskSpec:
     @_hash.register_broadcaster
     @dependent_hash.register_broadcaster
     def _depend_by_task_specs(self) -> List[Self]:
+        assert self.task_dict is not None
         return [self.task_dict[k] for k in self.depend_by]
 
     @cached_property
@@ -264,7 +268,7 @@ class TaskSpec:
                     break
                 payload.extend(line)
         try:
-            task_info: Dict[str:Any] = yaml.safe_load(BytesIO(payload))
+            task_info: Dict[str, Any] = yaml.safe_load(BytesIO(payload))
         except yaml.scanner.ScannerError as e:
             logger.error(f"ERROR parse {self.task_file}")
             raise e
@@ -371,6 +375,7 @@ class TaskSpec:
         visited = set()
         queue = [self.task_name]
         queue_idx = 0
+        assert self.task_dict is not None
         while len(queue) > queue_idx:
             task_name = queue[queue_idx]
             queue_idx += 1
