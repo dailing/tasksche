@@ -24,25 +24,6 @@ _INVALIDATE = __INVALIDATE__()
 logger = Logger()
 
 
-def task_dict_to_pdf(task_dict: Dict[str, TaskSpec]):
-    """
-    save graph to a pdf file using graphviz
-    """
-    from graphviz import Digraph
-    dot = Digraph('G', format='pdf', filename='./export',
-                  graph_attr={'layout': 'dot'})
-    dot.attr(rankdir='LR')
-    for k in task_dict.keys():
-        dot.node(
-            k,
-            label=k,
-        )
-    for node, spec in task_dict.items():
-        for b in spec.depend_task:
-            dot.edge(b, node)
-    dot.render(cleanup=True)
-
-
 def search_for_root(base):
     path = os.path.abspath(base)
     while path != '/':
@@ -231,6 +212,8 @@ class PRunner(RunnerBase):
 
     async def _run_task(self, task_root: str, task_name: str):
         logger.debug(f'running task {task_name} ...')
+        taskspec = TaskSpec(task_root, task_name)
+        os.mkfifo(os.path.join(taskspec.output_dump_file, '_progress.pipe'))
         process = await asyncio.create_subprocess_exec(
             'python',
             '-m',

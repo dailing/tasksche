@@ -3,7 +3,7 @@ from pathlib import Path
 
 from tasksche.run import (
     Status, TaskScheduler,
-    build_exe_graph, task_dict_to_pdf)
+    build_exe_graph)
 
 
 class TestTaskSche(unittest.TestCase):
@@ -18,7 +18,6 @@ class TestTaskSche(unittest.TestCase):
         if clear:
             for v in task_dict.values():
                 v.clear()
-        task_dict_to_pdf(task_dict)
         return task_dict
 
     def test_run_basic_Prunner(self):

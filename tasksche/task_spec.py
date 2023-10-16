@@ -6,6 +6,7 @@ import os.path
 import shutil
 import sys
 import time
+import types
 from functools import cached_property
 from hashlib import md5
 from io import BytesIO
@@ -482,6 +483,21 @@ class TaskSpec:
                 raise NotImplementedError()
             args, kwargs = self._load_input()
             output = mod.run(*args, **kwargs)
+            # if output is generator, iter over it and return the last item
+            if isinstance(output, types.GeneratorType):
+                with open('_progress.pipe', 'w') as f:
+                    while True:
+                        try:
+                            step_update_value = next(output)
+                            assert isinstance(step_update_value, int), \
+                                f'{step_update_value} is not int'
+                            f.write(f'{step_update_value}\n')
+                            f.flush()
+                        except StopIteration as e:
+                            output = e.value
+                            break
+            output = output
+
             self._exec_result = output
         return 0
 

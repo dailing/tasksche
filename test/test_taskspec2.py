@@ -3,7 +3,7 @@ from pathlib import Path
 
 from tasksche.run import (
     Status, TaskScheduler,
-    build_exe_graph, task_dict_to_pdf)
+    build_exe_graph)
 
 
 class TestTaskSche(unittest.IsolatedAsyncioTestCase):
@@ -18,8 +18,6 @@ class TestTaskSche(unittest.IsolatedAsyncioTestCase):
         if clear:
             for v in task_dict.values():
                 v.clear()
-            # _, task_dict = build_exe_graph(self.task_path)
-        task_dict_to_pdf(task_dict)
         return task_dict
 
     def test_build_graph(self):

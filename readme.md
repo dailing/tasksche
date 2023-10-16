@@ -1,6 +1,7 @@
 # task scheduler
 
 ## Features
+
 * dependence check, change detection continuous development
 * Inheritance of task configuration, and code from parent tasks
   * The run function is defined in the last parent
@@ -16,3 +17,21 @@ TODO:
 * emit sche event
 * resource tags
 * cluster support?
+* generator
+
+      Scheduler: manage status, invoke task
+      |  -> add task (args, kwargs, task_path)
+      |  -> interrupt
+      |  <- finish/progressReport/Iter/error
+      |
+      |CALL BACK
+      |     |
+      |     V
+      |-- Runner:
+      |    |
+      |    |-- Execution thread
+      |    |-- Execution thread
+      |
+      |-- Remote Runner:
+      |    |-- Remote Execution thread
+      |    |-- Remote Execution thread

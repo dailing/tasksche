@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
 from typing import Any, Callable, Iterable, Union
-from typing_extensions import Self
 from typing import Dict, Generic, TypeVar
+
+from typing_extensions import Self
 
 from .logger import Logger
 
@@ -111,7 +112,7 @@ class DumpedType:
 _CacheType = TypeVar('_CacheType')
 
 
-class CachedPropertyWithInvalidator(Generic[_CacheType], property):
+class CachedPropertyWithInvalidator(property, Generic[_CacheType]):
     """
     Property decorator that caches the result of a function.
     When the property is assigned a new value, the cached value is invalidated,
