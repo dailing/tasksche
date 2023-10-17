@@ -1,14 +1,20 @@
+import contextlib
 import hashlib
+import importlib
+import io
 import os.path
+import sys
+import types
 from enum import Enum, auto
 from functools import cached_property
 from io import BytesIO
 from itertools import chain
-from typing import Any, Dict, List, Optional, Union, Tuple, Callable
+from typing import Any, Dict, List, Union, Tuple, Callable, Optional
 
 import yaml.scanner
 from pydantic import BaseModel, Field
 
+from tasksche.storage.storage import storage_factory, KVStorageBase
 from .logger import Logger
 from .task_spec import process_path
 
@@ -40,14 +46,14 @@ class ARG_TYPE(Enum):
 
 class RequirementArg(BaseModel):
     arg_type: ARG_TYPE
-    from_task: Optional[str] = Field()
-    value: Optional[Any] = Field()
+    from_task: Optional[str] = Field(default=None)
+    value: Optional[Any] = Field(default=None)
 
 
 class RunnerArgSpec(BaseModel):
     arg_type: ARG_TYPE
-    value: Optional[Any]
-    storage_path: Optional[str | int]
+    value: Optional[Any] = Field(default=None)
+    storage_path: Optional[str | int] = Field(default=None)
 
 
 class RunnerTaskSpec(BaseModel):
@@ -95,7 +101,7 @@ def file_path_to_task_name(
 
 
 def process_inherent(child: TaskSpecFmt, parent: TaskSpecFmt) -> TaskSpecFmt:
-    new_fmt = child.copy(deep=True)
+    new_fmt = child.model_copy(deep=True)
     if new_fmt.require is None:
         new_fmt.require = parent.require
     elif (isinstance(parent.require, dict)
@@ -116,7 +122,7 @@ def parse_task_specs(task_name: str, root: str) -> TaskSpecFmt:
             if line == b'"""\n' or line == b'"""':
                 break
             payload.extend(line)
-    task_info = TaskSpecFmt.parse_obj(
+    task_info = TaskSpecFmt.model_validate(
         yaml.safe_load(BytesIO(payload))
     )
     if task_info is None:
@@ -199,16 +205,6 @@ class FlowNode:
 
     @cached_property
     def depend_on(self) -> List[str]:
-        """
-        Returns a list of strings representing the dependencies of the current task.
-
-        Parameters:
-            self (object): The current instance of the class.
-
-        Returns:
-            List[str]: A list of strings representing the dependencies of the current
-                        task.
-        """
         return [
             val.from_task
             for val in chain(self.args, self.kwargs.values())
@@ -270,7 +266,7 @@ class Graph:
             map_func: Callable[[FlowNode], Any],
             reduce_func: Callable[[List[Any]], Any],
             target: str,
-            result: Dict[str, Any] = None
+            result: Optional[Dict[str, Any]] = None
     ):
         if result is None:
             result = {}
@@ -290,7 +286,7 @@ class Graph:
             targets: Optional[List[str] | str] = None):
         result = {}
         if targets is None:
-            targets = self.node_map.keys()
+            targets = list(self.node_map.keys())
         for target in targets:
             self._agg(map_func, reduce_func, target, result)
         return result
@@ -308,6 +304,91 @@ class Graph:
             reduce_func=reduce_func,
             targets=self.target_tasks,
         )
+
+
+def load_input(spec: RunnerTaskSpec, storage: Optional[KVStorageBase] = None):
+    def get_input(arg: RunnerArgSpec):
+        if arg.arg_type == ARG_TYPE.RAW:
+            return arg.value
+        elif arg.arg_type == ARG_TYPE.TASK_OUTPUT:
+            assert storage is not None
+            return storage.get(arg.storage_path)
+        else:
+            raise ValueError(f'unknown arg type {arg.arg_type}')
+
+    args = [get_input(node_arg) for node_arg in spec.args]
+    kwargs = {k: get_input(v) for k, v in spec.kwargs.items()}
+    return args, kwargs
+
+
+class ExecEnv:
+    def __init__(self, pythonpath, cwd):
+        self.pythonpath = pythonpath
+        self.cwd = cwd
+        self.previous_dir = os.getcwd()
+        self.stdout_file: Optional[io.TextIOWrapper] = None
+        self.redirect_stdout: Optional[contextlib.redirect_stdout] = None
+
+    def __enter__(self):
+        if self.pythonpath:
+            sys.path.insert(0, self.pythonpath)
+        if not os.path.exists(self.cwd):
+            os.makedirs(self.cwd, exist_ok=True)
+        if self.cwd:
+            os.chdir(self.cwd)
+        assert self.cwd is not None
+        self.stdout_file = open(os.path.join(self.cwd, 'stdout.txt'), 'w')
+        self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
+        self.redirect_stdout.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        assert self.redirect_stdout is not None
+        assert self.stdout_file is not None
+        self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
+        self.stdout_file.close()
+        if self.cwd:
+            os.chdir(self.previous_dir)
+        if self.pythonpath:
+            sys.path.remove(self.pythonpath)
+
+
+def execute_task(spec: RunnerTaskSpec):
+    """
+    Execute the task by importing the task module and calling the
+    'run' function.
+
+    NOTE: this function should only be called when all dependent
+    task finished. No dirty check or dependency check will be invoked
+    in this function.
+
+    Returns:
+        None
+    """
+    task_module_path = spec.task.replace('/', '.')[1:]
+    storage = storage_factory(spec.storage_path)
+    with ExecEnv(spec.root, spec.work_dir):
+        if task_module_path in sys.modules:
+            logger.info(f'reloading module {task_module_path}')
+            mod = importlib.reload(sys.modules[task_module_path])
+        else:
+            mod = importlib.import_module(task_module_path)
+        mod.__dict__['work_dir'] = '.'
+        if not hasattr(mod, 'run'):
+            raise NotImplementedError()
+        args, kwargs = load_input(spec, storage)
+        output = mod.run(*args, **kwargs)
+        # if output is generator, iter over it and return the last item
+        if isinstance(output, types.GeneratorType):
+            # with open('_progress.pipe', 'w') as f:
+            while True:
+                try:
+                    _ = next(output)
+                except StopIteration as e:
+                    output = e.value
+                    break
+        storage.store(spec.output_path, output)
+    return 0
 
 
 if __name__ == '__main__':

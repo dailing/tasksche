@@ -1,6 +1,6 @@
 from itertools import chain
 
-from ..callback import CallbackBase, CallBackEvent, EmitEvent
+from ..callback import CallbackBase, CallBackEvent, InterruptSignal
 from ..logger import Logger
 from ..storage.storage import ResultStorage
 
@@ -37,10 +37,10 @@ class FinishChecker(CallbackBase):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
         if not self.result_storage.has(task_name, run_id):
             return
-        logger.info('check hash')
+        # logger.info('check hash')
         if not self.hash_storage.has(task_name, run_id):
             return
-        logger.info('compare hash')
+        # logger.info('compare hash')
         code_hash_map, result_map = self.hash_storage.get(task_name, run_id)
         if code_hash_map is None or result_map is None:
             return
@@ -54,5 +54,5 @@ class FinishChecker(CallbackBase):
         if code_hash_map.get(task_name, None) != graph.node_map[task_name].hash_code:
             # logger.info(f'{task_name} code hash not match')
             return
-        logger.info('hash match')
-        raise EmitEvent('on_task_finish', event.new_inst(value=NOT_DUMP_HASH))
+        # logger.info('hash match')
+        raise InterruptSignal('on_task_finish', event.new_inst(value=NOT_DUMP_HASH))
