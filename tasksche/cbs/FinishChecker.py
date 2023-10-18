@@ -18,8 +18,6 @@ class FinishChecker(CallbackBase):
         self.hash_storage = ResultStorage(hash_storage)
 
     def on_task_finish(self, event: CallBackEvent):
-        if event.task_name == '_END_':
-            return
         if event.value is NOT_DUMP_HASH:
             return event.new_inst(value=None)
         task_name, run_id, graph = event.task_name, event.run_id, event.graph

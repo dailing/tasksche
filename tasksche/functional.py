@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Union, Tuple, Callable, Optional
 import yaml.scanner
 from pydantic import BaseModel, Field
 
-from tasksche.storage.storage import storage_factory, KVStorageBase
+from .storage.storage import storage_factory, KVStorageBase, ResultStorage
 from .logger import Logger
 from .task_spec import process_path
 

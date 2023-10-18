@@ -96,11 +96,20 @@ class CallbackBase:
 
     def on_task_start(self, event: CallBackEvent):
         """
-        Called when task is about to run
+        Called when a task is started. Mainly used by RUNNER to initiate the task.
         """
         raise NotImplementedError
 
     def on_task_finish(self, event: CallBackEvent):
+        """
+        Called when a task is finished.
+        """
+        raise NotImplementedError
+
+    def on_run_finish(self, event: CallBackEvent):
+        """
+        Called when a run is finished.
+        """
         raise NotImplementedError
 
 
@@ -171,6 +180,12 @@ class _CallbackRunnerMeta(type):
         async def f(_instance, event: CallBackEvent, *args, **kwargs):
             assert isinstance(event, CallBackEvent), \
                 f'{type(event)} is not CallBackEvent'
+            if hasattr(_instance, '_cb_lock_'):
+                lock = _instance._cb_lock_
+            else:
+                lock = asyncio.Lock()
+                _instance._cb_lock_ = lock
+            # async with lock:
             for arg_value, arg_name in zip(args, list_of_args_name[:len(args)]):
                 kwargs[arg_name] = arg_value
             cb_dict = getattr(_instance, '_cbs')
@@ -183,7 +198,7 @@ class _CallbackRunnerMeta(type):
                         f'{event.run_id}'
                     )
                     if asyncio.iscoroutinefunction(cb):
-                        retval = await cb(*args, **kwargs)
+                        retval = await cb(event, **kwargs)
                     else:
                         retval = cb(event, **kwargs)
                     _cbs, _event = _handle_call_back_output(retval)
@@ -257,3 +272,4 @@ def parse_callbacks(callback_name: List[str]) -> List[Callable]:
         callbacks.append(callback_function)
 
     return callbacks
+

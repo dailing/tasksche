@@ -4,10 +4,11 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional, Callable
 
-from tasksche.cbs.EndTask import EndTask
-from tasksche.cbs.LocalRunner import LocalRunner
 from .callback import CALLBACK_TYPE, CallbackRunner, CallbackBase, CallBackEvent, InvokeSignal
+from .cbs.EndTask import EndTask
 from .cbs.FinishChecker import FinishChecker
+from .cbs.LocalRunner import LocalRunner
+from .cbs.ParallelRunner import ParallelRunner
 from .common import Status
 from .functional import (
     Graph, RunnerTaskSpec, search_for_root)
@@ -85,10 +86,8 @@ class Scheduler(CallbackBase):
 
     def on_task_ready(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
-        if task_name == '_END_':
-            self.cb.on_task_finish(event)
-            return
         self.status_storage.store(task_name, run_id, value=Status.STATUS_RUNNING)
+        return InvokeSignal('on_task_start', event)
 
     def on_task_finish(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
@@ -104,6 +103,9 @@ class Scheduler(CallbackBase):
             if ready:
                 return InvokeSignal('on_task_ready', event.new_inst(task_name=k))
                 # self.cb.on_task_ready(event.new_inst(task_name=k))
+
+    def on_run_finish(self, event: CallBackEvent):
+        pass
 
 
 def run(
@@ -123,7 +125,8 @@ def run(
         [
             EndTask(),
             FinishChecker(storage_result),
-            LocalRunner(),
+            # LocalRunner(),
+            ParallelRunner(),
         ]
     )
     scheduler.feed(run_id=str(run_id))
