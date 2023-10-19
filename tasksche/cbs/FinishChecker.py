@@ -10,6 +10,7 @@ NOT_DUMP_HASH = object()
 
 
 class FinishChecker(CallbackBase):
+
     def __init__(
             self,
             result_storage: str = 'file:default',

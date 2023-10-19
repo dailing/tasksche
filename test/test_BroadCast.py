@@ -1,6 +1,6 @@
 import unittest
 
-from tasksche.common import CachedPropertyWithInvalidator, _INVALIDATE
+from tasksche.functional import CachedPropertyWithInvalidator, _INVALIDATE
 
 
 class T:

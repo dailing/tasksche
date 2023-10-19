@@ -30,7 +30,10 @@ def call_back_event_to_runner_task(event: CallBackEvent) -> RunnerTaskSpec:
     spec = RunnerTaskSpec(
         task=task_name,
         root=graph.root,
-        args=[arg_transfer(arg) for arg in graph.node_map[task_name].args],
+        args=[
+            arg_transfer(arg) for arg in graph.node_map[task_name].args
+            if arg.arg_type != ARG_TYPE.VIRTUAL
+        ],
         kwargs={
             k: arg_transfer(arg)
             for k, arg in graph.node_map[task_name].kwargs.items()

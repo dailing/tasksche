@@ -1,8 +1,8 @@
 import unittest
 
 from tasksche.callback import CallbackBase, CallbackRunner, call_back_pipe
-from tasksche.common import Status
-from tasksche.task_spec import TaskSpec
+from tasksche.functional import Status
+# from tasksche.task_spec import TaskSpec
 
 
 class TestCallBackCollection(unittest.TestCase):

@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Any, TypeVar, Optional, Generator, Tupl
 
 from pydantic import BaseModel, field_validator
 
-from .functional import Graph
+from .functional import Graph, ROOT_NODE
 from .logger import Logger
 from .storage.storage import ResultStorage, StatusStorage
 
@@ -81,11 +81,12 @@ class InvokeSignal(CallBackSignal):
 
 
 class CallbackBase:
+    IGNORE_ROOT_NODE = False
     """
     Abstract Base Class for callback system.
     """
 
-    def on_feed(self, event: CallBackEvent, kwargs: Dict[str, Any]):
+    def on_feed(self, event: CallBackEvent, payload: Any = None):
         raise NotImplementedError()
 
     def on_task_ready(self, event: CallBackEvent):
@@ -109,6 +110,12 @@ class CallbackBase:
     def on_run_finish(self, event: CallBackEvent):
         """
         Called when a run is finished.
+        """
+        raise NotImplementedError
+
+    def on_interrupt(self, event: CallBackEvent):
+        """
+        Called when a task is interrupted. should kill all running tasks and return
         """
         raise NotImplementedError
 
@@ -180,18 +187,16 @@ class _CallbackRunnerMeta(type):
         async def f(_instance, event: CallBackEvent, *args, **kwargs):
             assert isinstance(event, CallBackEvent), \
                 f'{type(event)} is not CallBackEvent'
-            if hasattr(_instance, '_cb_lock_'):
-                lock = _instance._cb_lock_
-            else:
-                lock = asyncio.Lock()
-                _instance._cb_lock_ = lock
-            # async with lock:
             for arg_value, arg_name in zip(args, list_of_args_name[:len(args)]):
                 kwargs[arg_name] = arg_value
             cb_dict = getattr(_instance, '_cbs')
             call_later = []
             try:
                 for cb in cb_dict[cb_name]:
+                    if (
+                            event.task_name == ROOT_NODE.NAME
+                            and getattr(cb.__self__, 'IGNORE_ROOT_NODE')):
+                        continue
                     logger.debug(
                         f'[{cb_name:15s}][{str(cb.__self__.__class__.__name__):15s}] '
                         f'{str(event.task_name):15s} '
@@ -221,6 +226,8 @@ class _CallbackRunnerMeta(type):
 
     def __new__(cls, name, bases, attrs):
         for k, v in CALL_BACK_DICT.items():
+            if not k.startswith('on_'):
+                continue
             attrs[k] = _CallbackRunnerMeta.wrapper(v, k)
         return super().__new__(cls, name, bases, attrs)
 
@@ -272,4 +279,3 @@ def parse_callbacks(callback_name: List[str]) -> List[Callable]:
         callbacks.append(callback_function)
 
     return callbacks
-

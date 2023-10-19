@@ -1,8 +1,8 @@
 
 from typing import Dict
 
-from ..common import Status
-from ..task_spec import TaskSpec
+from ..functional import Status
+# from ..task_spec import TaskSpec
 from ..callback import CallbackBase
 from tqdm import tqdm
 
@@ -13,7 +13,7 @@ class ProgressCB(CallbackBase):
         self.bars: Dict[str, tqdm] = {}
         self.total_tasks = -1
 
-    def task_start(self, task: TaskSpec):
+    def on_task_start(self, task):
         if self.total_tasks < 0:
             # Initiate bars
             assert task.task_dict is not None
@@ -32,7 +32,7 @@ class ProgressCB(CallbackBase):
             position=len(self.bars), total=100, desc=f'{task.task_name}'
         )
 
-    def task_finish(self, task: TaskSpec):
+    def on_task_finish(self, task):
         task_name = task.task_name
         # pos = self.bars[task_name].pos
         self.bars[task_name].update(100)

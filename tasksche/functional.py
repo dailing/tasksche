@@ -14,11 +14,52 @@ from typing import Any, Dict, List, Union, Tuple, Callable, Optional
 import yaml.scanner
 from pydantic import BaseModel, Field
 
-from .storage.storage import storage_factory, KVStorageBase, ResultStorage
 from .logger import Logger
-from .task_spec import process_path
+from .storage.storage import storage_factory, KVStorageBase
 
 logger = Logger()
+
+
+class __INVALIDATE__:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(__INVALIDATE__, cls).__new__(cls)
+
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return '<INVALID>'
+
+
+_INVALIDATE = __INVALIDATE__()
+
+
+class Status(Enum):
+    STATUS_READY = 'ready'
+    STATUS_FINISHED = 'finished'
+    STATUS_ERROR = 'error'
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+
+
+def process_path(task_name: str, path: str):
+    task_name = os.path.dirname(task_name)
+    if not path.startswith('/'):
+        path = os.path.join(task_name, path)
+    path_filtered = []
+    for sub_path in path.split('/'):
+        if sub_path == '.':
+            continue
+        if sub_path == '..':
+            path_filtered.pop()
+            continue
+        path_filtered.append(sub_path)
+    if path_filtered[0] != '':
+        path_filtered = task_name.split('/') + path_filtered
+    path_new = '/'.join(path_filtered)
+    return path_new
 
 
 def search_for_root(base):
@@ -42,6 +83,7 @@ class TaskSpecFmt(BaseModel):
 class ARG_TYPE(Enum):
     RAW = auto()
     TASK_OUTPUT = auto()
+    VIRTUAL = auto()
 
 
 class RequirementArg(BaseModel):
@@ -70,7 +112,7 @@ class RunnerTaskSpec(BaseModel):
 
 
 def task_name_to_file_path(task_name: str, root: str) -> str:
-    assert task_name.startswith('/')
+    assert task_name.startswith('/'), f'task name is: {task_name}'
     return os.path.join(root, task_name[1:] + '.py')
 
 
@@ -147,6 +189,7 @@ class FlowNode:
             task_root: str,
             task_spec: Optional[TaskSpecFmt] = None,
     ) -> None:
+        assert task_name is not None
         self._task_spec = task_spec
         self.task_name = task_name
         self.task_root = task_root
@@ -159,43 +202,53 @@ class FlowNode:
         return RequirementArg(arg_type=ARG_TYPE.RAW, value=arg)
 
     @cached_property
-    def args(self) -> List[RequirementArg]:
-        if isinstance(self.task_spec.require, list):
-            return [self._parse_arg_str(arg) for arg in self.task_spec.require]
-        elif isinstance(self.task_spec.require, dict):
-            keys = [
-                k for k in self.task_spec.require.keys() if isinstance(k, int)]
-            if len(keys) == 0:
-                return []
-            max_key = max(keys)
-            if len(keys) < max_key + 1:
-                logger.warning(
-                    'missing positional argument will be set to None')
-            return [
-                self._parse_arg_str(
-                    self.task_spec.require[k]
-                ) if k in keys else RequirementArg(
-                    arg_type=ARG_TYPE.RAW,
-                    value=None
-                ) for k in range(max_key + 1)
-            ]
-        else:
+    def _arg_kwarg_parse(self) -> Tuple[List[RequirementArg], Dict[str, RequirementArg]]:
+        def parse() -> Tuple[List[RequirementArg], Dict[str, RequirementArg]]:
+            # logger.info(f'{self.task_name} {self.task_spec.require}')
+            if isinstance(self.task_spec.require, list):
+                return [self._parse_arg_str(arg) for arg in self.task_spec.require], {}
+            elif isinstance(self.task_spec.require, dict):
+                keys = [
+                    k for k in self.task_spec.require.keys() if isinstance(k, int)]
+                if len(keys) == 0:
+                    _args = []
+                else:
+                    max_key = max(keys)
+                    if len(keys) < max_key + 1:
+                        logger.warning(
+                            'missing positional argument will be set to None')
+                    _args = [
+                        self._parse_arg_str(
+                            self.task_spec.require[k]
+                        ) for k in range(max_key + 1)
+                    ]
+                _kwargs = {
+                    k: self._parse_arg_str(v)
+                    for k, v in self.task_spec.require.items()
+                    if isinstance(k, str)
+                }
+                return _args, _kwargs
             raise ValueError(
-                f'unknown requirement type type {self.task_spec.require}')
+                f'Cannot process requirement type: {type(self.task_spec.require)}')
+
+        args, kwargs = parse()
+        # logger.info(f'args: {args}, kwargs: {kwargs}')
+        dep_cnt = 0
+        for arg in chain(args, kwargs.values()):
+            if arg.arg_type == ARG_TYPE.TASK_OUTPUT:
+                dep_cnt += 1
+        if dep_cnt == 0:
+            args.append(
+                RequirementArg(arg_type=ARG_TYPE.VIRTUAL, from_task=ROOT_NODE.NAME))
+        return args, kwargs
+
+    @cached_property
+    def args(self) -> List[RequirementArg]:
+        return self._arg_kwarg_parse[0]
 
     @cached_property
     def kwargs(self) -> Dict[str, RequirementArg]:
-        if isinstance(self.task_spec.require, dict):
-            return {
-                k: self._parse_arg_str(v)
-                for k, v in self.task_spec.require.items()
-                if isinstance(k, str)}
-        else:
-            return {}
-
-    @cached_property
-    def is_source_node(self) -> bool:
-        return len(self.depend_on) == 0
+        return self._arg_kwarg_parse[1]
 
     @cached_property
     def task_spec(self) -> TaskSpecFmt:
@@ -208,7 +261,7 @@ class FlowNode:
         return [
             val.from_task
             for val in chain(self.args, self.kwargs.values())
-            if val.arg_type == ARG_TYPE.TASK_OUTPUT and val.from_task is not None
+            if val.arg_type == ARG_TYPE.TASK_OUTPUT or val.arg_type == ARG_TYPE.VIRTUAL
         ]
 
     @cached_property
@@ -220,14 +273,38 @@ class FlowNode:
         with open(self.code_file, 'rb') as f:
             return hashlib.md5(f.read()).hexdigest()
 
+    def __repr__(self):
+        return f'<FlowNode: {self.task_name} <<-- {self.depend_on}>'
+
 
 class END_NODE(FlowNode):
+    NAME = '_END_'
+
     def __init__(self, depend_on: List[str]) -> None:
         super().__init__(
-            '_END_', '', TaskSpecFmt(require=[f'${k}' for k in depend_on]))
+            self.NAME, '', TaskSpecFmt(require=[f'${k}' for k in depend_on]))
 
     def __repr__(self) -> str:
         return f'<END_NODE depend_on: {self.depend_on}>'
+
+
+class ROOT_NODE(FlowNode):
+    NAME = '_ROOT_'
+
+    def __init__(self) -> None:
+        super().__init__(
+            self.NAME, '', TaskSpecFmt(require=[]))
+
+    def __repr__(self) -> str:
+        return f'<ROOT_NODE>'
+
+    @cached_property
+    def depend_on(self) -> List[str]:
+        return []
+
+    @cached_property
+    def hash_code(self) -> str:
+        return ''
 
 
 class Graph:
@@ -239,6 +316,7 @@ class Graph:
     def node_map(self) -> Dict[str, FlowNode]:
         to_add = set(self.target_tasks)
         nmap: Dict[str, FlowNode] = {}
+        nmap[ROOT_NODE.NAME] = ROOT_NODE()
         while len(to_add) > 0:
             task_name = to_add.pop()
             node = FlowNode(task_name, self.root)
@@ -251,15 +329,19 @@ class Graph:
             for n in node.depend_on:
                 sink_node[n] = False
         sink_node = [k for k, v in sink_node.items() if v]
-        nmap['_END_'] = END_NODE(sink_node)
+        nmap[END_NODE.NAME] = END_NODE(sink_node)
+        # nmap[ROOT_NODE.NAME] = root_node
+        # for k, v in self.node_map.items():
+        #     if v.is_source_node and ROOT_NODE.NAME not in v.depend_on:
+        #         v.args.append()
         return nmap
 
-    @cached_property
-    def source_nodes(self) -> List[str]:
-        return [
-            k for k, v in self.node_map.items()
-            if v.is_source_node
-        ]
+    # @cached_property
+    # def source_nodes(self) -> List[str]:
+    #     return [
+    #         k for k, v in self.node_map.items()
+    #         if v.is_source_node
+    #     ]
 
     def _agg(
             self,
@@ -396,4 +478,4 @@ if __name__ == '__main__':
     logger.info(scheduler.node_map)
     logger.info(scheduler.node_map['/task'].kwargs)
     logger.info(scheduler.node_map['/task'].depend_on)
-    logger.info(scheduler.source_nodes)
+    # logger.info(scheduler.source_nodes)
