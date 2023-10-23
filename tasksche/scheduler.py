@@ -1,51 +1,22 @@
-import abc
 import asyncio
 import os
 import uuid
-from typing import Any, List, Optional, Callable
+from typing import Any, List, Optional
 
-from .callback import CALLBACK_TYPE, CallbackRunner, CallbackBase, CallBackEvent, InvokeSignal
+from tasksche.cbs.FileWatcher import FileWatcher
+from .callback import (
+    CALLBACK_TYPE, CallbackRunner, CallbackBase, CallBackEvent, InvokeSignal)
 from .cbs.EndTask import EndTask
 from .cbs.FinishChecker import FinishChecker
 from .cbs.LocalRunner import LocalRunner
-from .cbs.ParallelRunner import ParallelRunner
+from .cbs.PRunner import PRunner
 from .cbs.ROOT_starter import RootStarter
 from .functional import (
-    Graph, RunnerTaskSpec, search_for_root, Status, ROOT_NODE)
+    Graph, search_for_root, Status, ROOT_NODE)
 from .logger import Logger
 from .storage.storage import ResultStorage, StatusStorage
 
 logger = Logger()
-
-
-class RunnerBase(abc.ABC):
-    @abc.abstractmethod
-    def add_task(self, spec: RunnerTaskSpec, cb: Callable):
-        """
-        Add a task to the runner.
-
-        Args:
-            spec (RunnerTaskSpec): The specification of the task.
-            cb (Callable): The callback function to be executed when the task is
-                completed.
-
-        Raises:
-            NotImplementedError: This method needs to be implemented by a subclass.
-        """
-        raise NotImplementedError
-
-
-class MultiProcessRunner(RunnerBase):
-
-    def add_task(self, spec: RunnerTaskSpec, cb: Callable):
-        pass
-
-
-# class LocalRunner(RunnerBase):
-#
-#     def add_task(self, spec: RunnerTaskSpec, cb: Callable):
-#         execute_task(spec)
-#         cb()
 
 
 class Scheduler(CallbackBase):
@@ -68,13 +39,16 @@ class Scheduler(CallbackBase):
         event = CallBackEvent(
             graph=self.graph, run_id=run_id,
             result_storage=self.result_storage,
-            status_storage=self.status_storage)
-        asyncio.run(self.cb.on_feed(event, payload))
+            status_storage=self.status_storage,
+            value={'RootStarter': payload}
+        )
+        asyncio.run(self.cb.on_feed(event))
 
-    def on_feed(self, event: CallBackEvent, payload: Any = None):
+    def on_feed(self, event: CallBackEvent):
         for n in event.graph.node_map.keys():
             self.status_storage.store(n, event.run_id, value=Status.STATUS_PENDING)
-        return InvokeSignal('on_task_start', event.new_inst(task_name=ROOT_NODE.NAME, value=payload))
+        return InvokeSignal(
+            'on_task_start', event.new_inst(task_name=ROOT_NODE.NAME))
 
     def on_task_ready(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
@@ -84,13 +58,9 @@ class Scheduler(CallbackBase):
     def on_task_finish(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
         self.status_storage.store(task_name, run_id, value=Status.STATUS_FINISHED)
-        # logger.info(f'run_id: {run_id}, task_name: {task_name}')
-        # logger.info(f'graph: {graph.node_map["_ROOT_"].depend_on}')
-        # sys.exit(0)
         for k, v in self.graph.node_map.items():
             if task_name not in v.depend_on:
                 continue
-            # logger.info(f'k: {k}, v: {v}')
             ready = True
             for n in v.depend_on:
                 if self.status_storage.get(n, run_id) != Status.STATUS_FINISHED:
@@ -98,10 +68,19 @@ class Scheduler(CallbackBase):
                     break
             if ready:
                 yield InvokeSignal('on_task_ready', event.new_inst(task_name=k))
-                # self.cb.on_task_ready(event.new_inst(task_name=k))
 
     def on_run_finish(self, event: CallBackEvent):
         pass
+
+    def on_interrupt(self, event: CallBackEvent):
+        self.graph = Graph(self.graph.root, self.graph.target_tasks)
+        return InvokeSignal('on_feed', CallBackEvent(
+            graph=self.graph,
+            run_id=event.run_id,
+            result_storage=self.result_storage,
+            status_storage=self.status_storage,
+            value={'RootStarter': event.value['RootStarter']}
+        ))
 
 
 def run(
@@ -125,7 +104,8 @@ def run(
             EndTask(),
             FinishChecker(storage_result),
             RootStarter(),
-            ParallelRunner(),
+            PRunner(),
+            FileWatcher(),
         ]
     )
     scheduler.feed(run_id=str(run_id), payload=payload)

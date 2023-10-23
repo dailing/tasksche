@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import importlib
+import inspect
 import io
 import os.path
 import sys
@@ -206,7 +207,7 @@ class FlowNode:
         def parse() -> Tuple[List[RequirementArg], Dict[str, RequirementArg]]:
             # logger.info(f'{self.task_name} {self.task_spec.require}')
             if isinstance(self.task_spec.require, list):
-                return [self._parse_arg_str(arg) for arg in self.task_spec.require], {}
+                return [self._parse_arg_str(_arg) for _arg in self.task_spec.require], {}
             elif isinstance(self.task_spec.require, dict):
                 keys = [
                     k for k in self.task_spec.require.keys() if isinstance(k, int)]
@@ -232,7 +233,6 @@ class FlowNode:
                 f'Cannot process requirement type: {type(self.task_spec.require)}')
 
         args, kwargs = parse()
-        # logger.info(f'args: {args}, kwargs: {kwargs}')
         dep_cnt = 0
         for arg in chain(args, kwargs.values()):
             if arg.arg_type == ARG_TYPE.TASK_OUTPUT:
@@ -335,13 +335,6 @@ class Graph:
         #     if v.is_source_node and ROOT_NODE.NAME not in v.depend_on:
         #         v.args.append()
         return nmap
-
-    # @cached_property
-    # def source_nodes(self) -> List[str]:
-    #     return [
-    #         k for k, v in self.node_map.items()
-    #         if v.is_source_node
-    #     ]
 
     def _agg(
             self,
@@ -460,8 +453,8 @@ def execute_task(spec: RunnerTaskSpec):
             raise NotImplementedError()
         args, kwargs = load_input(spec, storage)
         output = mod.run(*args, **kwargs)
-        # if output is generator, iter over it and return the last item
-        if isinstance(output, types.GeneratorType):
+        if inspect.isgeneratorfunction(mod.run):
+            # if output is generator, iter over it and return the last item
             # with open('_progress.pipe', 'w') as f:
             while True:
                 try:

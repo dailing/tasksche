@@ -1,17 +1,28 @@
+import datetime
+import locale
 import logging
 import sys
 
 
+class DeltaTimeFormatter(logging.Formatter):
+
+    def format(self, record):
+        duration = datetime.datetime.utcfromtimestamp(record.relativeCreated / 1000)
+        record.delta = '+' + duration.strftime("%H:%M:%S") + \
+                       f'.{duration.microsecond // 1000:03d}'
+        return super().format(record)
+
+
 def _get_logger(name: str, print_level=logging.DEBUG):
-    formatter = logging.Formatter(
+    formatter = DeltaTimeFormatter(
         fmt="%(levelname)5s "
-            "[%(filename)15s:%(lineno)-4d %(asctime)s]"
+            "[%(filename)15s:%(lineno)-4d %(delta)s]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )
     formatter_file = logging.Formatter(
         fmt="%(levelname)5s "
-            "[%(filename)15s:%(lineno)-5d %(asctime)s]"
+            "[%(filename)15s:%(lineno)-5d %(asctime)s.%(msecs)03d]"
             " %(message)s",
         datefmt='%H:%M:%S',
     )

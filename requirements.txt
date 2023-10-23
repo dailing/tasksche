@@ -6,3 +6,5 @@ tqdm
 fastapi
 pydantic
 click
+watchfiles
+

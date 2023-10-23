@@ -19,8 +19,9 @@ class FinishChecker(CallbackBase):
         self.hash_storage = ResultStorage(hash_storage)
 
     def on_task_finish(self, event: CallBackEvent):
-        if event.value is NOT_DUMP_HASH:
-            return event.new_inst(value=None)
+        if event.value.get('FinishChecker', None) is NOT_DUMP_HASH:
+            del event.value['FinishChecker']
+            return
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
         code_hash_map = {
             k: graph.node_map[k].hash_code for k in chain(
@@ -54,4 +55,5 @@ class FinishChecker(CallbackBase):
             # logger.info(f'{task_name} code hash not match')
             return
         # logger.info('hash match')
-        raise InterruptSignal('on_task_finish', event.new_inst(value=NOT_DUMP_HASH))
+        event.value['FinishChecker'] = NOT_DUMP_HASH
+        raise InterruptSignal('on_task_finish', event)

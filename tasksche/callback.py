@@ -3,9 +3,9 @@ import dataclasses
 import inspect
 from collections import defaultdict
 from functools import cached_property
-from typing import Callable, Dict, List, Any, TypeVar, Optional, Generator, Tuple
+from typing import Callable, Dict, List, Any, TypeVar, Optional, Generator, Tuple, AsyncGenerator
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 
 from .functional import Graph, ROOT_NODE
 from .logger import Logger
@@ -27,7 +27,7 @@ class CallBackEvent(BaseModel):
     graph: Graph
     run_id: str
     task_name: Optional[str] = None
-    value: Optional[Any] = None
+    value: Dict[str, Any] = Field(default_factory=dict)
     result_storage: Optional[ResultStorage] = None
     status_storage: Optional[StatusStorage] = None
 
@@ -86,7 +86,7 @@ class CallbackBase:
     Abstract Base Class for callback system.
     """
 
-    def on_feed(self, event: CallBackEvent, payload: Any = None):
+    def on_feed(self, event: CallBackEvent):
         raise NotImplementedError()
 
     def on_task_ready(self, event: CallBackEvent):
@@ -109,7 +109,7 @@ class CallbackBase:
 
     def on_run_finish(self, event: CallBackEvent):
         """
-        Called when a run is finished.
+        Called when a run is finished, all tasks in the run_id are finished.
         """
         raise NotImplementedError
 
@@ -126,20 +126,26 @@ CALL_BACK_DICT: Dict[str, Callable] = {
 }
 
 
-def _handle_call_back_output(
+async def _handle_call_back_output(
         retval=None | Generator | InvokeSignal
 ) -> Tuple[List[InvokeSignal], Optional[CallBackEvent]]:
-    # logger.info('here')
     if retval is None:
         return [], None
     elif isinstance(retval, InvokeSignal):
         return [retval], None
     elif isinstance(retval, Generator):
-        # logger.info('generator')
         val = []
         event = None
         for ret in retval:
-            _val, _event = _handle_call_back_output(ret)
+            _val, _event = await _handle_call_back_output(ret)
+            val.extend(_val)
+            event = _event
+        return val, event
+    elif isinstance(retval, AsyncGenerator):
+        val = []
+        event = None
+        async for ret in retval:
+            _val, _event = await _handle_call_back_output(ret)
             val.extend(_val)
             event = _event
         return val, event
@@ -178,21 +184,26 @@ class _CallbackRunnerMeta(type):
     @staticmethod
     def wrapper(func: Callable, cb_name):
         # get list of args using inspect package, and transfer to kwargs
-        list_of_args_name = inspect.getfullargspec(func).args
-        if len(list_of_args_name) > 0 and list_of_args_name[0] == 'self':
-            list_of_args_name = list_of_args_name[1:]
-        assert list_of_args_name[0] == 'event', f'invalid args {list_of_args_name}'
-        list_of_args_name = list_of_args_name[1:]
+        # list_of_args_name = inspect.getfullargspec(func).args
+        # if len(list_of_args_name) > 0 and list_of_args_name[0] == 'self':
+            # list_of_args_name = list_of_args_name[1:]
+        # assert list_of_args_name[0] == 'event', f'invalid args {list_of_args_name}'
+        # list_of_args_name = list_of_args_name[1:]
 
         async def f(_instance, event: CallBackEvent, *args, **kwargs):
             assert isinstance(event, CallBackEvent), \
                 f'{type(event)} is not CallBackEvent'
-            for arg_value, arg_name in zip(args, list_of_args_name[:len(args)]):
-                kwargs[arg_name] = arg_value
+            # for arg_value, arg_name in zip(args, list_of_args_name[:len(args)]):
+            #     kwargs[arg_name] = arg_value
             cb_dict = getattr(_instance, '_cbs')
             call_later = []
+            cb_instance = kwargs.pop('cb_instance', None)
+            if cb_instance is not None:
+                logger.info(f'Calling for {cb_instance.__class__.__name__} ')
             try:
                 for cb in cb_dict[cb_name]:
+                    if cb_instance is not None and cb_instance is not cb.__self__:
+                        continue
                     if (
                             event.task_name == ROOT_NODE.NAME
                             and getattr(cb.__self__, 'IGNORE_ROOT_NODE')):
@@ -203,10 +214,10 @@ class _CallbackRunnerMeta(type):
                         f'{event.run_id}'
                     )
                     if asyncio.iscoroutinefunction(cb):
-                        retval = await cb(event, **kwargs)
+                        retval = await cb(event, *args, **kwargs)
                     else:
-                        retval = cb(event, **kwargs)
-                    _cbs, _event = _handle_call_back_output(retval)
+                        retval = cb(event, *args, **kwargs)
+                    _cbs, _event = await _handle_call_back_output(retval)
                     call_later.extend(_cbs)
                     event = _event if _event is not None else event
             except InterruptSignal as e:
@@ -215,8 +226,9 @@ class _CallbackRunnerMeta(type):
             for sig in call_later:
                 func_to_call = getattr(_instance, sig.signal)
                 assert asyncio.iscoroutinefunction(func_to_call)
+                _event = sig.event if sig.event is not None else event
                 fs.append(asyncio.create_task(
-                    func_to_call(sig.event, *sig.args, **sig.kwargs)))
+                    func_to_call(_event, *sig.args, **sig.kwargs)))
             if len(fs) > 0:
                 await asyncio.wait(fs)
             return kwargs
@@ -272,7 +284,8 @@ def parse_callbacks(callback_name: List[str]) -> List[Callable]:
             if hasattr(callback_module, name):
                 callbacks.append(getattr(callback_module, name)())
         except ImportError:
-            # If not in the .cbs package, import the package and initialize the callback function
+            # If not in the .cbs package, import the package and initialize the
+            # callback function
             callback_module = importlib.import_module(f'.{name}', __package__)
 
         callback_function = getattr(callback_module, name)
