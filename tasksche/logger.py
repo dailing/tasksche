@@ -27,7 +27,7 @@ def _get_logger(name: str, print_level=logging.DEBUG):
         datefmt='%H:%M:%S',
     )
     logger_obj = logging.getLogger(name)
-    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(print_level)
     file_handler = logging.FileHandler(

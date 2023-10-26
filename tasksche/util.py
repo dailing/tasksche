@@ -15,6 +15,7 @@ def call_back_event_to_runner_task(event: CallBackEvent) -> RunnerTaskSpec:
     task_name = event.task_name
     graph = event.graph
     run_id = event.run_id
+    n_iter = event.n_iter
 
     def arg_transfer(arg: RequirementArg) -> RunnerArgSpec:
         if arg.arg_type == ARG_TYPE.RAW:
@@ -22,7 +23,8 @@ def call_back_event_to_runner_task(event: CallBackEvent) -> RunnerTaskSpec:
         elif arg.arg_type == ARG_TYPE.TASK_OUTPUT:
             return RunnerArgSpec(
                 arg_type=ARG_TYPE.TASK_OUTPUT,
-                storage_path=ResultStorage.key_for(arg.from_task, run_id),
+                storage_path=ResultStorage.key_for(
+                    arg.from_task, run_id, n_iter[:event.graph.layer_map[arg.from_task]]),
             )
         else:
             raise TypeError(f'unknown arg type {arg.arg_type}')
@@ -39,7 +41,7 @@ def call_back_event_to_runner_task(event: CallBackEvent) -> RunnerTaskSpec:
             for k, arg in graph.node_map[task_name].kwargs.items()
         },
         storage_path=event.result_storage.storage_path,
-        output_path=ResultStorage.key_for(task_name, run_id),
+        output_path=ResultStorage.key_for(task_name, run_id, i_iter=event.n_iter),
         work_dir=os.path.join(
             '/tmp/storage/', run_id, task_name.replace('/', '_')),
     )

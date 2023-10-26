@@ -1,7 +1,6 @@
 import contextlib
 import hashlib
 import importlib
-import inspect
 import io
 import os.path
 import sys
@@ -13,7 +12,7 @@ from itertools import chain
 from typing import Any, Dict, List, Union, Tuple, Callable, Optional
 
 import yaml.scanner
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .logger import Logger
 from .storage.storage import storage_factory, KVStorageBase
@@ -72,6 +71,12 @@ def search_for_root(base):
     return None
 
 
+class TASK_TYPE(Enum):
+    NORMAL = "normal"
+    COLLECTOR = "collector"
+    GENERATOR = "generator"
+
+
 class TaskSpecFmt(BaseModel):
     """
     Task Specification header definition.
@@ -79,6 +84,7 @@ class TaskSpecFmt(BaseModel):
     require: Optional[Union[List[str], Dict[Union[str, int], Any]]] = Field(
         default=None)
     inherent: Optional[str] = Field(default=None)
+    task_type: Optional[TASK_TYPE] = Field(default=TASK_TYPE.NORMAL)
 
 
 class ARG_TYPE(Enum):
@@ -165,9 +171,13 @@ def parse_task_specs(task_name: str, root: str) -> TaskSpecFmt:
             if line == b'"""\n' or line == b'"""':
                 break
             payload.extend(line)
-    task_info = TaskSpecFmt.model_validate(
-        yaml.safe_load(BytesIO(payload))
-    )
+    try:
+        task_info = TaskSpecFmt.model_validate(
+            yaml.safe_load(BytesIO(payload))
+        )
+    except ValidationError as e:
+        logger.error(f'Error parsing {task_name}')
+        raise e
     if task_info is None:
         raise ValueError()
     if task_info.inherent is not None:
@@ -229,6 +239,8 @@ class FlowNode:
                     if isinstance(k, str)
                 }
                 return _args, _kwargs
+            elif self.task_spec.require is None:
+                return [], {}
             raise ValueError(
                 f'Cannot process requirement type: {type(self.task_spec.require)}')
 
@@ -255,6 +267,14 @@ class FlowNode:
         if self._task_spec is None:
             return parse_task_specs(self.task_name, self.task_root)
         return self._task_spec
+
+    @cached_property
+    def is_generator(self) -> bool:
+        return self.task_spec.task_type == TASK_TYPE.GENERATOR
+
+    @cached_property
+    def is_collector(self) -> bool:
+        return self.task_spec.task_type == TASK_TYPE.COLLECTOR
 
     @cached_property
     def depend_on(self) -> List[str]:
@@ -336,6 +356,28 @@ class Graph:
         #         v.args.append()
         return nmap
 
+    @cached_property
+    def layer_map(self):
+        layer_map: Dict[str, int] = {}
+
+        def map_func(node: FlowNode) -> int:
+            if node.task_name in layer_map:
+                return layer_map[node.task_name]
+            elif node.is_generator:
+                return 1
+            elif node.is_collector:
+                return -1
+            else:
+                return 0
+
+        def reduce_func(n_layer: List[int]) -> int:
+            if n_layer[-1] < 0:
+                return 0
+            prev_max = max(n_layer[:-1]) if len(n_layer) > 2 else n_layer[0]
+            return prev_max + n_layer[-1]
+
+        return self.aggregate(map_func, reduce_func, self.target_tasks)
+
     def _agg(
             self,
             map_func: Callable[[FlowNode], Any],
@@ -368,6 +410,11 @@ class Graph:
 
     @cached_property
     def requirements_map(self) -> Dict[str, List[str]]:
+        """
+        record all tasks that need to be run in value as list
+        before running this key task
+        """
+
         def map_func(node: FlowNode) -> List[str]:
             return node.depend_on
 
@@ -413,14 +460,14 @@ class ExecEnv:
             os.chdir(self.cwd)
         assert self.cwd is not None
         self.stdout_file = open(os.path.join(self.cwd, 'stdout.txt'), 'w')
-        self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
-        self.redirect_stdout.__enter__()
+        # self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
+        # self.redirect_stdout.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        assert self.redirect_stdout is not None
+        # assert self.redirect_stdout is not None
+        # self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
         assert self.stdout_file is not None
-        self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
         self.stdout_file.close()
         if self.cwd:
             os.chdir(self.previous_dir)
@@ -448,22 +495,56 @@ def execute_task(spec: RunnerTaskSpec):
             mod = importlib.reload(sys.modules[task_module_path])
         else:
             mod = importlib.import_module(task_module_path)
-        mod.__dict__['work_dir'] = '.'
+        # mod.__dict__['work_dir'] = '.'
         if not hasattr(mod, 'run'):
             raise NotImplementedError()
         args, kwargs = load_input(spec, storage)
         output = mod.run(*args, **kwargs)
-        if inspect.isgeneratorfunction(mod.run):
-            # if output is generator, iter over it and return the last item
-            # with open('_progress.pipe', 'w') as f:
-            while True:
-                try:
-                    _ = next(output)
-                except StopIteration as e:
-                    output = e.value
-                    break
         storage.store(spec.output_path, output)
     return 0
+
+
+class IteratorTaskExecutor():
+    def __init__(self):
+        self.storage = None
+        self.env = None
+        self.mod = None
+        self.generator = None
+
+    def _call_run(self, spec: RunnerTaskSpec):
+        if self.env is None:
+            self.env = ExecEnv(spec.root, spec.work_dir)
+        with self.env:
+            if self.mod is None:
+                self.mod = importlib.import_module(spec.task.replace('/', '.')[1:])
+                self.storage = storage_factory(spec.storage_path)
+            try:
+                if self.generator is None:
+                    args, kwargs = load_input(spec, self.storage)
+                    self.generator = self.mod.run(*args, **kwargs)
+                    assert isinstance(self.generator, types.GeneratorType)
+                output = next(self.generator)
+                return output
+            except StopIteration as e:
+                self.generator = None
+                return e
+            except Exception as e:
+                self.generator = None
+                return e
+
+    def call_run(self, spec: RunnerTaskSpec):
+        """
+        Execute the task by importing the task module and iter over the iterator.
+        return:
+            StopIteration: for no more data and call finish
+            Exception: for error and call finish
+            str: for data_output_key
+        """
+        output = self._call_run(spec)
+        if isinstance(output, Exception):
+            return output
+        self.storage.store(spec.output_path, output)
+        return spec.output_path
 
 
 if __name__ == '__main__':

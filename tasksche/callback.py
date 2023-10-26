@@ -1,9 +1,9 @@
 import asyncio
 import dataclasses
-import inspect
 from collections import defaultdict
 from functools import cached_property
-from typing import Callable, Dict, List, Any, TypeVar, Optional, Generator, Tuple, AsyncGenerator
+from typing import (
+    Callable, Dict, List, Any, TypeVar, Optional, Generator, Tuple, AsyncGenerator)
 
 from pydantic import BaseModel, field_validator, Field
 
@@ -30,6 +30,8 @@ class CallBackEvent(BaseModel):
     value: Dict[str, Any] = Field(default_factory=dict)
     result_storage: Optional[ResultStorage] = None
     status_storage: Optional[StatusStorage] = None
+    n_iter: Optional[List[int]] = None
+    result_key_map: Dict[str, str] = Field(default_factory=dict)
 
     class Config:
         arbitrary_types_allowed = True
@@ -98,6 +100,24 @@ class CallbackBase:
     def on_task_start(self, event: CallBackEvent):
         """
         Called when a task is started. Mainly used by RUNNER to initiate the task.
+        """
+        raise NotImplementedError
+
+    def on_iterate(self, event: CallBackEvent):
+        """
+        Called when a task is iterated.
+        """
+        raise NotImplementedError
+
+    def on_iter_finish(self, event: CallBackEvent):
+        """
+        Called when a root generator is exhausted.
+        """
+        raise NotImplementedError
+
+    def on_task_error(self, event: CallBackEvent):
+        """
+        Called when a task is interrupted. should kill all running tasks and return
         """
         raise NotImplementedError
 
@@ -186,7 +206,7 @@ class _CallbackRunnerMeta(type):
         # get list of args using inspect package, and transfer to kwargs
         # list_of_args_name = inspect.getfullargspec(func).args
         # if len(list_of_args_name) > 0 and list_of_args_name[0] == 'self':
-            # list_of_args_name = list_of_args_name[1:]
+        # list_of_args_name = list_of_args_name[1:]
         # assert list_of_args_name[0] == 'event', f'invalid args {list_of_args_name}'
         # list_of_args_name = list_of_args_name[1:]
 
@@ -211,6 +231,7 @@ class _CallbackRunnerMeta(type):
                     logger.debug(
                         f'[{cb_name:15s}][{str(cb.__self__.__class__.__name__):15s}] '
                         f'{str(event.task_name):15s} '
+                        f'{str(event.n_iter):15s} '
                         f'{event.run_id}'
                     )
                     if asyncio.iscoroutinefunction(cb):

@@ -2,7 +2,7 @@ import abc
 import os
 import pickle
 from hashlib import md5
-from typing import Any
+from typing import Any, Optional, List
 
 
 class KVStorageBase(abc.ABC):
@@ -102,26 +102,33 @@ class ResultStorage:
         Returns:
             str: A string representing the generated key.
         """
-        return '.'.join(args)
+        return '.'.join([str(x) for x in args])
 
     @classmethod
-    def key_for(cls, task_name: str, run_id: str, i_iter: int = -1):
-        return cls._key_for(task_name, run_id, str(i_iter))
+    def key_for(cls, task_name: str, run_id: str, i_iter: Optional[List[int]]):
+        if i_iter is None:
+            i_iter = []
+        return cls._key_for(task_name, run_id, *i_iter)
 
     def __init__(self, storage_path: str = 'file:default', **kwargs):
         self.storage = storage_factory(storage_path)
         self.storage_path = storage_path
 
-    def store(self, task_name: str, run_id: str, i_iter: int = -1, value: Any = 0):
+    def store(
+            self,
+            task_name: str,
+            run_id: str,
+            i_iter: Optional[List[int]],
+            value: Any = 0):
         self.storage.store(self.key_for(task_name, run_id, i_iter), value=value)
 
-    def get(self, task_name: str, run_id: str, i_iter: int = -1):
+    def get(self, task_name: str, run_id: str, i_iter: Optional[List[int]]):
         return self.storage.get(self.key_for(task_name, run_id, i_iter))
 
-    def get_hash(self, task_name: str, run_id: str, i_iter: int = -1):
+    def get_hash(self, task_name: str, run_id: str, i_iter: Optional[List[int]]):
         return self.storage.get_hash(self.key_for(task_name, run_id, i_iter))
 
-    def has(self, task_name: str, run_id: str, i_iter: int = -1):
+    def has(self, task_name: str, run_id: str, i_iter: Optional[List[int]]):
         return self.key_for(task_name, run_id, i_iter) in self.storage
 
 

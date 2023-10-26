@@ -1,15 +1,14 @@
 import asyncio
 import os
 import uuid
+from pprint import pprint
 from typing import Any, List, Optional
 
-from tasksche.cbs.FileWatcher import FileWatcher
 from .callback import (
     CALLBACK_TYPE, CallbackRunner, CallbackBase, CallBackEvent, InvokeSignal)
 from .cbs.EndTask import EndTask
 from .cbs.FinishChecker import FinishChecker
 from .cbs.LocalRunner import LocalRunner
-from .cbs.PRunner import PRunner
 from .cbs.ROOT_starter import RootStarter
 from .functional import (
     Graph, search_for_root, Status, ROOT_NODE)
@@ -46,24 +45,28 @@ class Scheduler(CallbackBase):
 
     def on_feed(self, event: CallBackEvent):
         for n in event.graph.node_map.keys():
-            self.status_storage.store(n, event.run_id, value=Status.STATUS_PENDING)
+            self.status_storage.store(
+                n, event.run_id, event.n_iter,
+                value=Status.STATUS_PENDING)
         return InvokeSignal(
             'on_task_start', event.new_inst(task_name=ROOT_NODE.NAME))
 
     def on_task_ready(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
-        self.status_storage.store(task_name, run_id, value=Status.STATUS_RUNNING)
+        self.status_storage.store(
+            task_name,
+            run_id, i_iter=event.n_iter, value=Status.STATUS_RUNNING)
         return InvokeSignal('on_task_start', event)
 
     def on_task_finish(self, event: CallBackEvent):
         task_name, run_id, graph = event.task_name, event.run_id, event.graph
-        self.status_storage.store(task_name, run_id, value=Status.STATUS_FINISHED)
+        self.status_storage.store(task_name, run_id, event.n_iter, value=Status.STATUS_FINISHED)
         for k, v in self.graph.node_map.items():
             if task_name not in v.depend_on:
                 continue
             ready = True
             for n in v.depend_on:
-                if self.status_storage.get(n, run_id) != Status.STATUS_FINISHED:
+                if self.status_storage.get(n, run_id, event.n_iter) != Status.STATUS_FINISHED:
                     ready = False
                     break
             if ready:
@@ -71,6 +74,9 @@ class Scheduler(CallbackBase):
 
     def on_run_finish(self, event: CallBackEvent):
         pass
+
+    def on_task_error(self, event: CallBackEvent):
+        raise NotImplementedError
 
     def on_interrupt(self, event: CallBackEvent):
         self.graph = Graph(self.graph.root, self.graph.target_tasks)
@@ -102,10 +108,11 @@ def run(
         StatusStorage(storage_status),
         [
             EndTask(),
-            FinishChecker(storage_result),
+            # FinishChecker(storage_result),
             RootStarter(),
-            PRunner(),
-            FileWatcher(),
+            # PRunner(),
+            LocalRunner(),
+            # FileWatcher(),
         ]
     )
     scheduler.feed(run_id=str(run_id), payload=payload)
@@ -121,7 +128,8 @@ if __name__ == '__main__':
     # from pprint import pprint
     # pprint(sche.graph.requirements_map)
     # sche.feed()
-    run(['test/simple_task_set/task.py'], run_id='test', payload={})
+    run(['test/generator_task_set/task4.py'], run_id='test', payload={})
+    # run(['test/simple_task_set/task.py'], run_id='test', payload={})
     # import fire
     #
     # fire.Fire(run)
