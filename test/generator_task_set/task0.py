@@ -4,4 +4,4 @@ require: {}
 
 
 def run():
-    return 5
+    return 1
