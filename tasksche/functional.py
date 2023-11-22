@@ -1,20 +1,19 @@
 import abc
-from audioop import reverse
-from collections import defaultdict
 import contextlib
 import hashlib
 import importlib
 import io
+from operator import le
 import os.path
 import queue
 import sys
-import threading
 import types
+from collections import defaultdict
 from enum import Enum, auto
-from functools import cache, cached_property, lru_cache
+from functools import cached_property
 from io import BytesIO
 from itertools import chain
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml.scanner
 from pydantic import BaseModel, Field, ValidationError
@@ -38,7 +37,73 @@ class __INVALIDATE__:
         return "<INVALID>"
 
 
-_INVALIDATE = __INVALIDATE__()
+class ARG_TYPE(Enum):
+    RAW = auto()
+    TASK_OUTPUT = auto()
+    TASK_ITER = auto()
+    VIRTUAL = auto()
+
+
+class RequirementArg(BaseModel):
+    arg_type: ARG_TYPE
+    from_task: Optional[str] = Field(default=None)
+    value: Optional[Any] = Field(default=None)
+
+
+class RunnerArgSpec(BaseModel):
+    arg_type: ARG_TYPE
+    value: Optional[Any] = Field(default=None)
+    storage_path: Optional[str] = Field(default=None)
+
+
+class ISSUE_TASK_TYPE(str, Enum):
+    START_TASK = "start_task"
+    ITER_TASK = "iter_task"
+    NORMAL_TASK = "normal_task"
+    PUSH_TASK = "push_task"
+    PULL_RESULT = "pull_result"
+
+
+# define a singleton class and return counter, that add 1 automically
+class _Counter:
+    def __init__(self, prefix="") -> None:
+        self._counter = 0
+        self.prefix = prefix
+
+    def get_counter(self):
+        self._counter += 1
+        return f"{self.prefix}_{self._counter}"
+
+
+_task_counter = _Counter("_tt")
+_output_counter = _Counter("_oo")
+
+
+class TaskIssueInfo(BaseModel):
+    reqs: Dict[str | int, str] = Field(default_factory=dict)
+    wait_for: Tuple[str, ...] = Field(default_factory=lambda: ())
+    task_name: str
+    output: Optional[str] = Field(default_factory=_output_counter.get_counter)
+    task_type: ISSUE_TASK_TYPE
+    task_id: str = Field(default_factory=_task_counter.get_counter)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.task_name + ':' + self.task_id + '->' + str(self.output):25s}"
+            f"[{str(self.wait_for):20s}]"
+            f"{self.task_type}"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    @property
+    def node_repr(self) -> str:
+        return (
+            f'["{self.task_name}<br/>'
+            f"{self.task_id}<br/>"
+            f'{str(self.task_type.value)}"]'
+        )
 
 
 class Status(Enum):
@@ -94,25 +159,6 @@ class TaskSpecFmt(BaseModel):
     iter_args: Optional[List[int | str]] = Field(default=None)
 
 
-class ARG_TYPE(Enum):
-    RAW = auto()
-    TASK_OUTPUT = auto()
-    TASK_ITER = auto()
-    VIRTUAL = auto()
-
-
-class RequirementArg(BaseModel):
-    arg_type: ARG_TYPE
-    from_task: Optional[str] = Field(default=None)
-    value: Optional[Any] = Field(default=None)
-
-
-class RunnerArgSpec(BaseModel):
-    arg_type: ARG_TYPE
-    value: Optional[Any] = Field(default=None)
-    storage_path: Optional[str] = Field(default=None)
-
-
 class RunnerTaskSpec(BaseModel):
     """
     define how a single task should be run by a task runner,
@@ -120,10 +166,9 @@ class RunnerTaskSpec(BaseModel):
 
     task: str
     root: str
-    args: List[RunnerArgSpec]
-    kwargs: Dict[str, RunnerArgSpec]
+    requires: Dict[str | int, RunnerArgSpec]
     storage_path: str
-    output_path: str
+    output_path: Optional[str]
     work_dir: Optional[str]
 
 
@@ -226,7 +271,7 @@ class FlowNode:
         return RequirementArg(arg_type=ARG_TYPE.RAW, value=arg)
 
     @cached_property
-    def _dep_arg_parse(self) -> Dict[int | str, RequirementArg]:
+    def dep_arg_parse(self) -> Dict[int | str, RequirementArg]:
         # if self.task_spec is list, convert it to dict
         arg_dict = self.task_spec.require
         if isinstance(arg_dict, list):
@@ -257,17 +302,15 @@ class FlowNode:
         self,
     ) -> Tuple[List[RequirementArg], Dict[str, RequirementArg]]:
         args = []
-        int_keys = [
-            k for k in self._dep_arg_parse.keys() if isinstance(k, int)
-        ]
+        int_keys = [k for k in self.dep_arg_parse.keys() if isinstance(k, int)]
         int_keys.sort()
         if len(int_keys) > 0 and int_keys[0] == -1:
             int_keys = int_keys[1:]
         for k in range(len(int_keys)):
             assert k == int_keys[k], (k, int_keys)
-        args = [self._dep_arg_parse[k] for k in int_keys]
+        args = [self.dep_arg_parse[k] for k in int_keys]
         kwargs = {
-            k: v for k, v in self._dep_arg_parse.items() if isinstance(k, str)
+            k: v for k, v in self.dep_arg_parse.items() if isinstance(k, str)
         }
         return args, kwargs
 
@@ -375,6 +418,10 @@ class END_NODE(FlowNode):
     def __repr__(self) -> str:
         return f"<END_NODE depend_on: {self.depend_on}>"
 
+    @cached_property
+    def is_generator(self) -> bool:
+        return False
+
 
 class ROOT_NODE(FlowNode):
     NAME = "_ROOT_"
@@ -480,66 +527,6 @@ class Graph:
                 cmap[n].append(k)
         return cmap
 
-    @cached_property
-    def execution_order(self) -> List[str]:
-        o = []
-
-        def _dfs(node: str) -> None:
-            if node in o:
-                return
-            o.append(node)
-            for n in self.node_map[node].depend_on:
-                _dfs(n)
-
-        _dfs(END_NODE.NAME)
-        return list(reversed(o))
-
-    @cached_property
-    def all_child_map(self) -> Dict[str, List[str]]:
-        cmap = dict()
-
-        def _dfs(node: str) -> Set[str]:
-            if node in cmap:
-                return cmap[node]
-            nl = set()
-            for n in self.child_map[node]:
-                nl.add(n)
-                nls = _dfs(n)
-                for n in nls:
-                    if n not in nl:
-                        nl.add(n)
-            cmap[node] = nl
-            return nl
-
-        _dfs(ROOT_NODE.NAME)
-        return {
-            k: [x for x in self.execution_order if x in v]
-            for k, v in cmap.items()
-        }
-
-
-def load_RunnerArgSpec(arg: RunnerArgSpec, storage: KVStorageBase) -> Any:
-    if arg.arg_type == ARG_TYPE.RAW:
-        return arg.value
-    elif arg.arg_type in (
-        ARG_TYPE.TASK_OUTPUT,
-        ARG_TYPE.TASK_ITER,
-    ):
-        assert storage is not None
-        assert arg.storage_path is not None
-        return storage.get(arg.storage_path)
-    else:
-        raise ValueError(f"unknown arg type {arg.arg_type}")
-
-
-def load_input(
-    args: List[RunnerArgSpec],
-    kwargs: Dict[str, RunnerArgSpec],
-    storage: KVStorageBase,
-):
-    _args = [load_RunnerArgSpec(node_arg, storage) for node_arg in args]
-    _kwargs = {k: load_RunnerArgSpec(v, storage) for k, v in kwargs.items()}
-    return _args, _kwargs
 
 
 class ExecEnv:
@@ -574,35 +561,6 @@ class ExecEnv:
             sys.path.remove(self.pythonpath)
 
 
-def execute_task(spec: RunnerTaskSpec):
-    """
-    Execute the task by importing the task module and calling the
-    'run' function.
-
-    NOTE: this function should only be called when all dependent
-    task finished. No dirty check or dependency check will be invoked
-    in this function.
-
-    Returns:
-        None
-    """
-    task_module_path = spec.task.replace("/", ".")[1:]
-    storage = storage_factory(spec.storage_path)
-    with ExecEnv(spec.root, spec.work_dir):
-        if task_module_path in sys.modules:
-            logger.info(f"reloading module {task_module_path}")
-            mod = importlib.reload(sys.modules[task_module_path])
-        else:
-            mod = importlib.import_module(task_module_path)
-        # mod.__dict__['work_dir'] = '.'
-        if not hasattr(mod, "run"):
-            raise NotImplementedError()
-        args, kwargs = load_input(spec.args, spec.kwargs, storage)
-        output = mod.run(*args, **kwargs)
-        storage.store(spec.output_path, value=output)
-    return 0
-
-
 class IteratorArg:
     def __init__(self, iter_items: Optional[queue.Queue] = None) -> None:
         if iter_items is None:
@@ -621,9 +579,22 @@ class IteratorArg:
                 yield output
 
 
+def int_iterator(t: Dict[str | int, Any]):
+    int_keys = sorted([k for k in t.keys() if isinstance(k, int)])
+    if len(int_keys) == 0:
+        return
+    max_val = max(int_keys)
+    for i in range(max_val + 1):
+        if i in t:
+            yield t[i]
+        else:
+            yield None
+
+
 class BaseTaskExecutor(abc.ABC):
     def __init__(self):
         self._task_spec_first: Optional[RunnerTaskSpec] = None
+        self.iter_map: Dict[str | int, IteratorArg] = defaultdict(IteratorArg)
 
     @property
     def spec(self) -> RunnerTaskSpec:
@@ -646,9 +617,65 @@ class BaseTaskExecutor(abc.ABC):
     def storage(self):
         return storage_factory(self.spec.storage_path)
 
-    @abc.abstractmethod
-    def _call_run(self, spec: RunnerTaskSpec):
-        raise NotImplementedError
+    def load_input(self, key: str | int, arg: Optional[RunnerArgSpec]):
+        if arg is None:
+            logger.warning(f"arg is None for {key}")
+            return None
+        assert arg is not None
+        if arg.arg_type == ARG_TYPE.RAW:
+            return arg.value
+        elif arg.arg_type == ARG_TYPE.TASK_OUTPUT:
+            assert self.storage is not None
+            assert arg.storage_path is not None
+            return self.storage.get(arg.storage_path)
+        elif arg.arg_type == ARG_TYPE.TASK_ITER:
+            iter_obj = self.iter_map[key]
+            if arg.storage_path is not None:
+                iter_obj.put_payload(self.storage.get(arg.storage_path))
+            return iter_obj
+        else:
+            logger.error(f"unknown arg type {arg.arg_type}")
+            raise ValueError(f"unknown arg type {arg.arg_type}")
+
+    def exec_func(self, spec: RunnerTaskSpec, reload: bool = False):
+        """
+        Execute the task by importing the task module and calling the
+        'run' function. return the raw value
+
+        NOTE: this function should only be called when all dependent
+        task finished. No dirty check or dependency check will be invoked
+        in this function.
+
+        Returns:
+            anything returned by 'run' function
+        """
+        task_module_path = self.mod_name
+        with ExecEnv(spec.root, spec.work_dir):
+            if task_module_path in sys.modules and reload:
+                logger.info(f"reloading module {task_module_path}")
+                importlib.reload(sys.modules[task_module_path])
+            mod = self.mod
+            if not hasattr(mod, "run"):
+                raise NotImplementedError("task must have 'run' function")
+
+            args = [
+                self.load_input(*x)
+                for x in enumerate(int_iterator(spec.requires))
+            ]
+            kwargs = {
+                k: self.load_input(k, v)
+                for k, v in spec.requires.items()
+                if isinstance(k, str)
+            }
+            logger.info(
+                f"executing task {spec.task} with args {args} and kwargs {kwargs}"
+            )
+            for v in chain(args, kwargs.values()):
+                if isinstance(v, StopIteration):
+                    return v
+            logger.info(spec.requires)
+            output = mod.run(*args, **kwargs)
+            return output
 
     def call_run(self, spec: RunnerTaskSpec):
         """
@@ -660,124 +687,63 @@ class BaseTaskExecutor(abc.ABC):
             str: for data_output_key
         """
         self._task_spec_first = spec
-        output = self._call_run(spec)
-        if not isinstance(output, Exception) or isinstance(
-            output, StopIteration
-        ):
-            self.storage.store(spec.output_path, value=output)
+        output = self.exec_func(spec)
         if isinstance(output, Exception):
-            return output
-        return spec.output_path
+            if not isinstance(output, StopIteration):
+                return output
+        logger.info(
+            f"task {spec.task} stored {str(output)[:20]} to {spec.output_path}"
+        )
+        if spec.output_path is not None:
+            self.storage.store(spec.output_path, value=output)
+
+    def call_push(self, spec: RunnerTaskSpec):
+        for k, arg in spec.requires.items():
+            assert k in self.iter_map, f"{k} is not in iter_map {self.iter_map}"
+            assert arg.storage_path is not None, f"{spec.requires} is None"
+            assert arg.arg_type == ARG_TYPE.TASK_ITER
+            self.load_input(k, arg)
+        return None
 
 
-class IteratorTaskExecutor(BaseTaskExecutor):
+class GeneratorTaskExecutor(BaseTaskExecutor):
     def __init__(self):
-        self._task_spec_first: Optional[RunnerTaskSpec] = None
+        super().__init__()
         self.generator = None
 
-    def _call_run(self, spec: RunnerTaskSpec):
+    def _init(self, spec: RunnerTaskSpec) -> bool:
+        self.generator = self.exec_func(spec)
+        assert self.generator is not None
+        return True
+
+    def call_start(self, spec: RunnerTaskSpec):
+        self._task_spec_first = spec
+        assert self.generator is None
+        output = self.exec_func(
+            spec,
+        )
+        assert output is not None
+        assert isinstance(output, types.GeneratorType)
+        self.generator = output
+
+    def call_iter(self, spec: RunnerTaskSpec):
+        assert self.generator is not None
+        assert spec.output_path is not None
         with self.env:
             try:
-                if self.generator is None:
-                    args, kwargs = load_input(
-                        spec.args, spec.kwargs, self.storage
-                    )
-                    self.generator = self.mod.run(*args, **kwargs)
-                    assert isinstance(self.generator, types.GeneratorType)
                 output = next(self.generator)
-                return output
+                self.storage.store(spec.output_path, value=output)
+                return None
             except StopIteration as e:
-                self.generator = None
+                self.storage.store(spec.output_path, value=e)
                 return e
             except Exception as e:
-                logger.error(e, stack_info=True)
-                self.generator = None
+                print(e)
                 return e
 
 
 class MapperTaskExecutor(BaseTaskExecutor):
-    @property
-    def mod(self):
-        if self.mod_name in sys.modules:
-            return importlib.reload(sys.modules[self.mod_name])
-        else:
-            return importlib.import_module(self.mod_name)
-
-    def _call_run(self, spec: RunnerTaskSpec):
-        with self.env:
-            try:
-                args, kwargs = load_input(spec.args, spec.kwargs, self.storage)
-                output = self.mod.run(*args, **kwargs)
-                return output
-            except Exception as e:
-                logger.error(e)
-                return e
-
-
-class CollectorTaskExecutor(BaseTaskExecutor):
-    def __init__(self):
-        super().__init__()
-        self.thread = None
-        self.queue = None
-
-    @cached_property
-    def iter_args(self) -> Tuple[Tuple[int, IteratorArg]]:
-        iter_args = []
-        for index, arg in enumerate(self.spec.args):
-            if arg.arg_type == ARG_TYPE.TASK_ITER:
-                iter_args.append((index, IteratorArg()))
-        return tuple(iter_args)
-
-    @cached_property
-    def iter_kwargs(self) -> Tuple[Tuple[str, IteratorArg]]:
-        iter_kwargs = []
-        for k, arg in self.spec.kwargs.items():
-            if arg.arg_type == ARG_TYPE.TASK_ITER:
-                iter_kwargs.append((k, IteratorArg()))
-        return tuple(iter_kwargs)
-
-    @cached_property
-    def args(self) -> Tuple[Any]:
-        args, _ = load_input(self.spec.args, {}, self.storage)
-        for i, iter_obj in self.iter_args:
-            iter_obj.put_payload(args[i])
-            args[i] = iter_obj
-        return tuple(args)
-
-    @cached_property
-    def kwargs(self) -> Dict[str, Any]:
-        _, kwargs = load_input([], self.spec.kwargs, self.storage)
-        for k, iter_obj in self.iter_kwargs:
-            iter_obj.put_payload(kwargs[k])
-            kwargs[k] = iter_obj
-        return kwargs
-
-    def _worker_thread(self, *args, **kwargs):
-        with self.env:
-            try:
-                self.mod.run(*args, **kwargs)
-            except Exception as e:
-                return e
-
-    def _call_run(self, spec: RunnerTaskSpec):
-        if self.thread is None:
-            assert self.spec is spec
-            self.thread = threading.Thread(
-                target=self._worker_thread,
-                args=self.args,
-                kwargs=self.kwargs,
-            )
-            self.thread.start()
-        else:
-            for i, iter_arg in self.iter_args:
-                iter_arg.put_payload(
-                    load_RunnerArgSpec(spec.args[i], self.storage)
-                )
-            for k, iter_arg in self.iter_kwargs:
-                iter_arg.put_payload(
-                    load_RunnerArgSpec(spec.kwargs[k], self.storage)
-                )
-        return None
+    pass
 
 
 if __name__ == "__main__":

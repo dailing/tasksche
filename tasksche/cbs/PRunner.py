@@ -4,23 +4,13 @@ import signal
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Queue, Process
 
-from ..callback import CallbackBase, CallBackEvent, InvokeSignal
-from ..functional import execute_task, RunnerTaskSpec
+from ..callback import CallbackBase, CallBackEvent
+from ..functional import RunnerTaskSpec
 from ..logger import Logger
-from ..util import call_back_event_to_runner_task
+
+# from ..util import call_back_event_to_runner_task
 
 logger = Logger()
-
-
-def _execute_task(spec, queue):
-    try:
-        execute_task(spec)
-    except KeyboardInterrupt as e:
-        queue.put(e)
-        return
-    except Exception as e:
-        queue.put(e)
-        return
 
 
 def _start_process(p: Process, q: Queue):
@@ -29,11 +19,12 @@ def _start_process(p: Process, q: Queue):
     if not q.empty():
         err_msg = q.get()
         assert q.empty()
-        assert isinstance(err_msg, Exception) or isinstance(err_msg, KeyboardInterrupt)
+        assert isinstance(err_msg, Exception) or isinstance(
+            err_msg, KeyboardInterrupt
+        )
 
 
 class RunerProcessPool:
-
     def __init__(self, max_workers=None):
         if max_workers is None:
             max_workers = os.cpu_count()
@@ -53,14 +44,10 @@ class RunerProcessPool:
             await self.waiting_queue.get()
             return KeyboardInterrupt()
         q = Queue()
-        p = Process(
-            target=_execute_task,
-            args=(task, q))
+        p = Process(target=_execute_task, args=(task, q))
         self.processes.add(p)
         result = await asyncio.get_running_loop().run_in_executor(
-            self.threadPool,
-            _start_process,
-            p, q
+            self.threadPool, _start_process, p, q
         )
         self.processes.remove(p)
         await self.waiting_queue.get()
@@ -82,17 +69,16 @@ class PRunner(CallbackBase):
         self.max_workers = max_workers
         self.pool = RunerProcessPool(self.max_workers)
 
-    async def on_task_start(self, event: CallBackEvent):
+    async def on_task_start(self, spec: RunnerTaskSpec):
         if self.pool is None:
             self.pool = RunerProcessPool(self.max_workers)
-        spec = call_back_event_to_runner_task(event)
         result = await self.pool.run(spec)
         if isinstance(result, KeyboardInterrupt):
-            logger.info(f'Interrupted {event.task_name}')
+            logger.info(f"Interrupted {spec.task}")
         elif isinstance(result, Exception):
-            logger.error(f'exception: {type(result)}', exc_info=result, stack_info=True)
-            return InvokeSignal('on_task_error', event)
-        return InvokeSignal('on_task_finish', event)
+            logger.error(
+                f"exception: {type(result)}", exc_info=result, stack_info=True
+            )
 
     async def on_interrupt(self, event: CallBackEvent):
         if self.pool is None:

@@ -20,19 +20,19 @@ class FileWatcher(CallbackBase):
         self.watching = False
 
     async def _func(self, root):
-        logger.debug(f'watching {root} ...')
+        logger.debug(f"watching {root} ...")
         async for event in awatch(root, stop_event=self.stop_event):
             files = set([x[1] for x in event])
-            await self.event_queue.put((files, 'None'))
+            await self.event_queue.put((files, "None"))
 
     async def on_feed(self, event: CallBackEvent):
         if self.task is None:
-            logger.info(f'init should be called once')
+            logger.info("init should be called once")
             self.task = asyncio.create_task(self._func(event.graph.root))
         if not self.watching:
             self.watching = True
-            return InvokeSignal('on_feed', event, cb_instance=self)
+            return InvokeSignal("on_feed", event)
         changed_file = await self.event_queue.get()
         logger.info(changed_file)
         self.watching = False
-        return InvokeSignal('on_interrupt', event)
+        return InvokeSignal("on_interrupt", event)

@@ -1,9 +1,11 @@
 import asyncio
 import os
+import queue
 import uuid
-from collections import defaultdict
-from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
+
+from tasksche.cbs.EndTask import EndTask
+from tasksche.cbs.PRunner import PRunner
 
 from .callback import (
     CALLBACK_TYPE,
@@ -12,12 +14,20 @@ from .callback import (
     CallbackRunner,
     InvokeSignal,
 )
-from .cbs.EndTask import EndTask
 from .cbs.LocalRunner import LocalRunner
-from .cbs.ROOT_starter import RootStarter
-from .functional import ROOT_NODE, Graph, Status, search_for_root
+from .functional import (
+    ARG_TYPE,
+    END_NODE,
+    ISSUE_TASK_TYPE,
+    ROOT_NODE,
+    Graph,
+    RunnerArgSpec,
+    RunnerTaskSpec,
+    TaskIssueInfo,
+    search_for_root,
+)
 from .logger import Logger
-from .storage.storage import ResultStorage, StatusStorage
+from .storage.storage import storage_factory
 
 logger = Logger()
 
@@ -48,165 +58,194 @@ class SchedulerTaskGenerator:
 
     def __init__(self, graph: Graph) -> None:
         self.graph = graph
-        self.finished_set = set()
-        self.pending_set = set()
-        # contains (output_task, n_iter, current_task)
-        self.pushed_set = set()
-        self.pending_events = []
-        self.issued_events = set()
-        # record last pushed args, task_name, arg_from --> arg_niter
-        self.last_pushed_args: Dict[Tuple[str, str], int] = defaultdict(
-            lambda: -1
-        )
-        self.scheduele_for(ROOT_NODE.NAME)
-        self.set_finished(ROOT_NODE.NAME, 0)
+        self.finished_id = set()
+        self.pending_events: Dict[str, TaskIssueInfo] = {}
+        self.issued_task_id = set()
+        self._latest_output_dict = {}  # record the latest output of each task
 
-    def max_iter_finished_task(self, taskname: str):
-        max_i = -1
-        for t, i in chain(self.finished_set, self.pending_set):
-            if t == taskname:
-                max_i = max(max_i, i)
-        return max_i
+        self._last_push: Dict[Tuple[str, str], str] = {}
+        # record last push task id
+
+        self._last_iter: Dict[str, str] = {}
+        # record last iter task id
+
+        self.schedule_for(ROOT_NODE.NAME)
+
+    def get_latest_output_of_task(self, task_name: str):
+        return self._latest_output_dict[task_name]
+
+    def get_issue_info(self, task_id: str):
+        return self.pending_events[task_id]
 
     def graph_str(self):
         s = "```mermaid\n"
         s += "graph TD\n"
-        for reqs, name, output, dep in self.pending_events:
-            if output is None:
-                output = f"{name}_0"
-            else:
-                output = f"{output[0]}_{output[1]}"
-            for req in reqs:
-                s += f"{req[0]}_{req[1]} --> " f" |{name}| {output}\n"
-                for dd in dep:
-                    if dd[0] == req[0]:
-                        s += f"{dd[0]}_{dd[1]} -.->{req[0]}_{req[1]}\n"
+        for task in self.pending_events.values():
+            for dep in task.wait_for:
+                s += (
+                    f"{dep}{self.pending_events[dep].node_repr} "
+                    f"--->|{task.task_name}|{task.task_id}"
+                    f"{task.node_repr}\n"
+                )
         s += "```\n"
         s.replace("/", "_")
         return s
 
-    def set_finished(self, task_name: str, n_iter: int):
-        task = (task_name, n_iter)
-        assert task not in self.finished_set
-        assert task in self.pending_set
-        self.pending_set.remove(task)
-        self.finished_set.add(task)
-        node = self.graph.node_map[task_name]
-        if node.is_generator:
-            self.scheduele_for(task_name)
-
-    def set_pushed(self, task_name: str, from_task: str, n_iter: int):
-        assert self.last_pushed_args[(task_name, from_task)] == (n_iter - 1)
-        assert (from_task, n_iter) in self.finished_set
-        self.last_pushed_args[(task_name, from_task)] = n_iter
+    def set_finished(self, task_id: str, generate=True):
+        assert task_id not in self.finished_id, (task_id, self.finished_id)
+        assert task_id in self.issued_task_id
+        self.finished_id.add(task_id)
+        task_info = self.get_issue_info(task_id)
+        node = self.graph.node_map[task_info.task_name]
+        if node.is_generator and generate:
+            self.schedule_for(task_info.task_name)
+        logger.info(f"finished {str(task_info)}")
 
     def in_pending(self, task_name: str):
-        for t, _ in self.pending_set:
-            if t == task_name:
+        for t in self.pending_events.values():
+            if (
+                (t.task_name == task_name)
+                and (t.task_id not in self.finished_id)
+                and (t.output is not None)
+            ):
                 return True
         return False
 
     def task_started(self, task_name: str):
-        if (task_name, 0) in self.finished_set:
-            return True
-        if (task_name, 0) in self.pending_set:
-            return True
+        for t in self.pending_events.values():
+            if t.task_name == task_name:
+                return True
         return False
 
-    def scheduele_for(self, task_name_: str, ready_dict=None, parent=None):
+    def schedule_for(self, task_name_: str):
         # logger.info(f"Schedule for {task_name_}")
         # check dependency of this task,
         # if ready, generate running schedules
-        ready_dict = {}
-        # new_item_to_run = []
-        node = self.graph.node_map[task_name_]
 
-        for task_name in [task_name_] + self.graph.all_child_map[task_name_]:
-            output = (task_name, self.max_iter_finished_task(task_name) + 1)
+        ready_dict: Dict[str, TaskIssueInfo] = {}
+        # ready_dict saves task_name, TaskInfo for tasks with output ready
+        search_queue = queue.Queue()
+        search_queue.put(task_name_)
+        visited_task_names = set()
+
+        def pend_task(task_: TaskIssueInfo):
+            self.pending_events[task_.task_id] = task_
+            if task_.output is not None:
+                ready_dict[task_.task_name] = task_
+                self._latest_output_dict[task_.task_name] = task_
+                for t in self.graph.child_map[task_.task_name]:
+                    if t not in visited_task_names:
+                        search_queue.put(t)
+                        visited_task_names.add(t)
+            if task_.task_type is ISSUE_TASK_TYPE.PUSH_TASK:
+                from_task = self.pending_events[task_.wait_for[0]].task_name
+                push_pair = (task_.task_name, from_task)
+                if push_pair in self._last_push:
+                    task_.wait_for = task_.wait_for + (
+                        self._last_push[push_pair],
+                    )
+                self._last_push[push_pair] = task_.task_id
+            if task_.task_type is ISSUE_TASK_TYPE.ITER_TASK:
+                task_.wait_for = task_.wait_for + (
+                    self._last_iter[task_.task_name],
+                )
+            if (
+                task_.task_type
+                in (ISSUE_TASK_TYPE.START_TASK, ISSUE_TASK_TYPE.ITER_TASK)
+                and node.is_generator
+            ):
+                self._last_iter[task_.task_name] = task_.task_id
+            requirements = {}
+            for arg_key, arg in node.dep_arg_parse.items():
+                if arg.arg_type in (ARG_TYPE.VIRTUAL, ARG_TYPE.RAW):
+                    continue
+                tt = arg.from_task
+                if tt in ready_dict:
+                    requirements[arg_key] = ready_dict[tt].output
+            task_.reqs = requirements
+            logger.info(f"Pending  {str(task_)}")
+            return task_
+
+        while not search_queue.empty():
+            # for task_name in loop_tasks:
+            task_name = search_queue.get()
             node = self.graph.node_map[task_name]
+            new_params = node.TASK_OUTPUT_DEPEND_ON.intersection(
+                ready_dict.keys()
+            )
+            iter_push = node.TASK_ITER_DEPEND_ON.intersection(
+                ready_dict.keys()
+            )
+            start_task = None
             if not self.task_started(task_name):
                 # starter of node instance
-                logger.debug(f"Start {task_name}")
-                ready_dict[task_name] = output
-                self.pending_set.add(output)
+                node = self.graph.node_map[task_name]
+                req = tuple(
+                    ready_dict[t].task_id for t in node.TASK_OUTPUT_DEPEND_ON
+                )
+                start_task = TaskIssueInfo(
+                    task_name=task_name,
+                    task_type=ISSUE_TASK_TYPE.START_TASK,
+                    wait_for=req,
+                )
                 if node.is_persistent_node:
-                    output = None
-                req = tuple(ready_dict[t] for t in node.TASK_OUTPUT_DEPEND_ON)
-                self.pending_events.append(
-                    (
-                        req,
-                        task_name,
-                        output,
-                        (),
+                    start_task.output = None
+                pend_task(start_task)
+                if not node.is_generator and node.is_persistent_node:
+                    pend_task(
+                        TaskIssueInfo(
+                            task_name=task_name,
+                            task_type=ISSUE_TASK_TYPE.PULL_RESULT,
+                            wait_for=(start_task.task_id,),
+                        )
+                    )
+            if len(new_params) > 0 and start_task is None:
+                assert len(iter_push) == 0
+                assert not node.is_generator
+                # generate new map output
+                for task in new_params:
+                    dep = self._latest_output_dict[task].task_id
+                    pend_task(
+                        TaskIssueInfo(
+                            task_name=task_name,
+                            task_type=ISSUE_TASK_TYPE.NORMAL_TASK,
+                            wait_for=(dep,),
+                        )
+                    )
+            if node.is_generator and not self.in_pending(task_name):
+                # generate new output from generator
+                pend_task(
+                    TaskIssueInfo(
+                        task_name=task_name,
+                        task_type=ISSUE_TASK_TYPE.ITER_TASK,
                     )
                 )
-            else:
-                if node.is_generator and not self.in_pending(task_name):
-                    # generate new output
-                    ready_dict[task_name] = output
-                    self.pending_set.add(output)
-                    self.pending_events.append(
-                        (
-                            (),
-                            task_name,
-                            output,
-                            (),
-                        )
-                    )
-            if len(node.TASK_ITER_DEPEND_ON) > 0:
+            if len(iter_push) > 0:
+                assert (len(new_params) == 0) or start_task is not None
                 # push new value to iterator
-                for t in node.TASK_OUTPUT_DEPEND_ON:
-                    assert ready_dict.get(t, None) is None
-                for t in node.TASK_ITER_DEPEND_ON:
-                    req = ready_dict.get(t, None)
-                    if req is None:
-                        continue
-                    self.pending_events.append(
-                        (
-                            (req,),
-                            task_name,
-                            None,
-                            ((req[0], req[1] - 1),) if req[1] > 0 else (),
+                for task in iter_push:
+                    dep = (ready_dict[task].task_id,)
+                    if start_task is not None:
+                        dep = dep + (start_task.task_id,)
+                    pend_task(
+                        TaskIssueInfo(
+                            task_name=task_name,
+                            task_type=ISSUE_TASK_TYPE.PUSH_TASK,
+                            wait_for=dep,
+                            output=None,
                         )
                     )
-
-    def set_issued(self, events: List[Any]):
-        self.issued_events.update(events)
 
     def get_ready_to_issue(self):
-        for event in self.pending_events:
-            if event in self.issued_events:
+        for event in self.pending_events.values():
+            if event.task_name == END_NODE.NAME:
                 continue
-            reqs, name, output, dep = event
-            if output in self.finished_set:
-                self.issued_events.add(event)
+            if event.task_id in self.issued_task_id:
                 continue
-            # logger.info(name)
-            if not all(map(lambda x: x in self.finished_set, dep)):
-                # logger.info(
-                #     f"{all(map(lambda x: x in self.finished_set, dep))}"
-                # )
-                # logger.debug(f"{name} dep  {dep} {self.finished_set}")
+            if not all(map(lambda x: x in self.finished_id, event.wait_for)):
                 continue
-            if not all(
-                map(
-                    lambda x: x[1] == (self.last_pushed_args[(name, x[0])]),
-                    dep,
-                )
-            ):
-                # logger.debug(f"{event} dep  {dep} {self.last_pushed_args}")
-                # for x in dep:
-                #     logger.info(
-                #         f"{self.last_pushed_args[(name, x[0])]} {x[1]}"
-                #     )
-                continue
-
-            if not all(map(lambda x: x in self.finished_set, reqs)):
-                # logger.debug(f"issue req {self.finished_set}")
-                # logger.debug(f"{name} req {reqs}, {self.finished_set}")
-                continue
-            # logger.info(f"issue {reqs} {name} {output}")
-            self.issued_events.add(event)
+            self.issued_task_id.add(event.task_id)
+            logger.info(f"issued   {str(event)}")
             yield event
 
 
@@ -214,145 +253,183 @@ class Scheduler(CallbackBase):
     def __init__(
         self,
         graph: Graph,
-        result_storage: ResultStorage,
-        status_storage: StatusStorage,
+        result_storage: str,
         cbs: List[CALLBACK_TYPE],
     ) -> None:
         self.graph = graph
         self.cb = CallbackRunner(cbs + [self])
         self.runner = LocalRunner()
-        self.task_status = {}
-        self.result_storage = result_storage
-        self.status_storage = status_storage
-        self.iter_issue_order = defaultdict(list)
-        self.finished_idx_in_issue = defaultdict(lambda: -1)
+        self.result_storage_path = result_storage
+        self.result_storage = storage_factory(result_storage)
         self.sc = SchedulerTaskGenerator(graph)
 
-        # map_from (task_name, run_num) --> arg_deps
-        self.dep_map = defaultdict(dict)
-        # set (task_name run_num)
-        self.finished_task = set()
+        self.latest_result = dict()
 
     def feed(self, run_id: Optional[str] = None, payload: Any = None):
         if run_id is None:
             run_id = uuid.uuid4().hex
         event = CallBackEvent(
-            graph=self.graph,
             run_id=run_id,
-            result_storage=self.result_storage,
-            status_storage=self.status_storage,
+            task_id="",
+            task_name=ROOT_NODE.NAME,
+            task_spec=None,
         )
         self.result_storage.store(
             ROOT_NODE.NAME,
-            run_id=run_id,
-            i_iter=0,
             value=None,
         )
-        asyncio.run(self.cb.on_feed(event))
+        asyncio.run(self.cb.on_task_finish(event))
 
-    def on_feed(self, event: CallBackEvent):
-        for n in event.graph.node_map.keys():
-            self.status_storage.store(
-                n,
-                event.run_id,
-                event.n_iter,
-                value=Status.STATUS_PENDING,
+    def _transfer_arg_all(self, task: TaskIssueInfo, search_past: bool = True):
+        node = self.graph.node_map[task.task_name]
+        reqs = {}
+        for k, arg in node.dep_arg_parse.items():
+            if arg.arg_type == ARG_TYPE.VIRTUAL:
+                continue
+            path = task.reqs.get(k, None)
+            if not search_past and path is None:
+                continue
+            if path is None:
+                path = self.latest_result.get(arg.from_task, None)
+            if arg.arg_type == ARG_TYPE.TASK_ITER and search_past:
+                path = None
+            assert path is not None or arg.arg_type != ARG_TYPE.TASK_OUTPUT
+            reqs[k] = RunnerArgSpec(
+                arg_type=arg.arg_type,
+                value=arg.value,
+                storage_path=path,
             )
-        return InvokeSignal(
-            "on_task_finish", event.new_inst(task_name=ROOT_NODE.NAME)
-        )
+        return reqs
 
-    def on_task_check(self, event: CallBackEvent):
-        task_name = event.task_name
-        assert task_name is not None
-        assert event.status_storage is not None
-        v = event.graph.node_map[task_name]
-        if event.status_storage.has(task_name, event.run_id, event.n_iter):
-            current_status = event.status_storage.get(
-                task_name, event.run_id, event.n_iter
-            )
-            if current_status in {
-                Status.STATUS_FINISHED,
-                Status.STATUS_RUNNING,
-            }:
-                return
-        for n in v.depend_on:
-            if (
-                event.status_storage.get(n, event.run_id, event.n_iter)
-                != Status.STATUS_FINISHED
-            ):
-                return
-
-        return InvokeSignal("on_task_ready", event.new_inst())
-
-    def on_task_ready(self, event: CallBackEvent):
-        task_name, run_id = event.task_name, event.run_id
-        assert task_name is not None
-        # TODO: change to set no exist
-        self.status_storage.store(
-            task_name,
-            run_id,
-            event.n_iter,
-            value=Status.STATUS_RUNNING,
-        )
-        return InvokeSignal("on_task_start", event)
-
-    def on_task_start(self, event: CallBackEvent):
-        if event.is_generator:
-            if event.n_iter != 0:
-                logger.warning(
-                    f"on_task_start {event.task_name}, iter: {event.n_iter}"
+    def _issue_new(self, run_id):
+        pending_tasks = list(self.sc.get_ready_to_issue())
+        for t in pending_tasks:
+            node = self.graph.node_map[t.task_name]
+            if t.task_name == ROOT_NODE.NAME:
+                continue
+            if t.task_name == END_NODE.NAME:
+                continue
+            if t.task_type is ISSUE_TASK_TYPE.START_TASK:
+                event = CallBackEvent(
+                    graph=self.graph,
+                    run_id=run_id,
+                    task_id=t.task_id,
+                    task_name=t.task_name,
+                    task_spec=RunnerTaskSpec(
+                        task=t.task_name,
+                        root=self.graph.root,
+                        requires=self._transfer_arg_all(t),
+                        storage_path=self.result_storage_path,
+                        output_path=t.output,
+                        work_dir=f"/tmp/workdir/{t.task_id}",
+                    ),
                 )
-            return InvokeSignal("on_task_iterate", event.new_inst())
-        return InvokeSignal("on_task_run", event)
+                if node.is_generator:
+                    yield InvokeSignal("on_gen_start", event)
+                elif node.is_persistent_node:
+                    yield InvokeSignal("on_per_start", event)
+                else:
+                    yield InvokeSignal("on_task_run", event)
+            elif t.task_type is ISSUE_TASK_TYPE.ITER_TASK:
+                yield InvokeSignal(
+                    "on_task_iterate",
+                    CallBackEvent(
+                        run_id=run_id,
+                        task_id=t.task_id,
+                        task_name=t.task_name,
+                        task_spec=RunnerTaskSpec(
+                            task=t.task_name,
+                            root=self.graph.root,
+                            requires={},
+                            storage_path=self.result_storage_path,
+                            output_path=t.output,
+                            work_dir=f"/tmp/workdir/{t.task_id}",
+                        ),
+                    ),
+                )
+            elif t.task_type is ISSUE_TASK_TYPE.PUSH_TASK:
+                logger.info(
+                    f"on_task_push {t.reqs} {self._transfer_arg_all(t, False)}"
+                )
+                yield InvokeSignal(
+                    "on_task_push",
+                    CallBackEvent(
+                        run_id=run_id,
+                        task_id=t.task_id,
+                        task_name=t.task_name,
+                        task_spec=RunnerTaskSpec(
+                            task=t.task_name,
+                            root=self.graph.root,
+                            requires=self._transfer_arg_all(t, False),
+                            storage_path=self.result_storage_path,
+                            output_path=t.output,
+                            work_dir=f"/tmp/workdir/{t.task_id}",
+                        ),
+                    ),
+                )
+            elif t.task_type is ISSUE_TASK_TYPE.NORMAL_TASK:
+                event = CallBackEvent(
+                    run_id=run_id,
+                    task_id=t.task_id,
+                    task_name=t.task_name,
+                    task_spec=RunnerTaskSpec(
+                        task=t.task_name,
+                        root=self.graph.root,
+                        requires=self._transfer_arg_all(t),
+                        storage_path=self.result_storage_path,
+                        output_path=t.output,
+                        work_dir=f"/tmp/workdir/{t.task_id}",
+                    ),
+                )
+                assert not node.is_generator
+                assert not node.is_persistent_node
+                yield InvokeSignal("on_task_run", event)
+            elif t.task_type is ISSUE_TASK_TYPE.PULL_RESULT:
+                event = CallBackEvent(
+                    run_id=run_id,
+                    task_id=t.task_id,
+                    task_name=t.task_name,
+                    task_spec=RunnerTaskSpec(
+                        task=t.task_name,
+                        root=self.graph.root,
+                        requires=self._transfer_arg_all(t),
+                        storage_path=self.result_storage_path,
+                        output_path=t.output,
+                        work_dir=f"/tmp/workdir/{t.task_id}",
+                    ),
+                )
+                assert not node.is_generator
+                assert node.is_persistent_node
+                yield InvokeSignal("on_task_pull", event)
+            else:
+                raise ValueError(f"{t.task_type}")
+
+    def on_gen_finish(self, event: CallBackEvent):
+        self.sc.set_finished(event.task_id, False)
+        yield from self._issue_new(event.run_id)
 
     def on_task_finish(self, event: CallBackEvent):
-        task_name, run_id = event.task_name, event.run_id
-        self.finished_task.add((task_name, event.n_iter))
-
-        assert task_name is not None
-        self.status_storage.store(
-            task_name,
-            run_id,
-            event.n_iter,
-            value=Status.STATUS_FINISHED,
-        )
-
-        for k, v in self.graph.node_map.items():
-            if task_name in v.depend_on:
-                yield InvokeSignal(
-                    "on_task_check", event.new_inst(task_name=k)
-                )
-        if event.is_generator:
-            yield InvokeSignal("on_task_iterate", event)
+        if event.task_name == ROOT_NODE.NAME:
+            yield from self._issue_new(event.run_id)
+            return
+        assert event.task_spec is not None
+        self.sc.set_finished(event.task_id)
+        if event.task_spec.output_path is not None:
+            self.latest_result[event.task_name] = event.task_spec.output_path
+        yield from self._issue_new(event.run_id)
 
     def on_task_error(self, event: CallBackEvent):
-        logger.error(f"{event.task_name} {event.run_id} {str(event.n_iter)}")
-        raise NotImplementedError
-
-    def on_task_iterend(self, event: CallBackEvent):
-        assert event.task_name is not None
-        assert event.result_storage is not None
-        assert event.n_iter is not None
-
-    def on_interrupt(self, event: CallBackEvent):
-        self.graph = Graph(self.graph.root, self.graph.target_tasks)
-        return InvokeSignal(
-            "on_feed",
-            CallBackEvent(
-                graph=self.graph,
-                run_id=event.run_id,
-                result_storage=self.result_storage,
-                status_storage=self.status_storage,
-            ),
+        logger.error(
+            f"{event.task_name} {event.run_id} {event.task_id}",
+            stack_info=True,
         )
+        raise NotImplementedError
 
 
 def run(
     tasks: List[str],
     run_id: Optional[str] = None,
     storage_result: str = "file:default",
-    storage_status: str = "mem:default",
     payload: Any = None,
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
@@ -364,75 +441,43 @@ def run(
     task_names = [task[len(root) : -3] for task in tasks]
     scheduler = Scheduler(
         Graph(root, task_names),
-        ResultStorage(storage_result),
-        StatusStorage(storage_status),
+        storage_result,
         [
             EndTask(),
             # FinishChecker(storage_result),
-            RootStarter(),
-            # PRunner(),
+            # RootStarter(),
+            PRunner(),
             LocalRunner(),
             # FileWatcher(),
         ],
     )
 
-    from pprint import pprint
-
-    pprint(scheduler.graph.all_child_map)
-
-    # pprint(scheduler.graph.node_map)
-    # for k, v in scheduler.graph.node_map.items():
-    #     print(k)
-    #     pprint(v._dep_arg_parse)
-    #     print("---")
-    # scheduler.sc.scheduele_for(ROOT_NODE.NAME, -1)
-    # scheduler.sc.scheduele_for(ROOT_NODE.NAME)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    # pprint(scheduler.sc.pending_events)
-    print("finished task0, 0")
-    scheduler.sc.set_finished("/task0", 0)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    print("finished task1, 0")
-    scheduler.sc.set_finished("/task1", 0)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    print("finished task1, 1")
-    scheduler.sc.set_finished("/task1", 1)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    print("pushed task1, 0")
-    scheduler.sc.set_pushed("/task2", "/task1", 0)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    print("pushed task1, 1")
-    # scheduler.sc.set_finished("/task1", 1)
-    scheduler.sc.set_pushed("/task2", "/task1", 1)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-    print("finished task1, 2")
-    scheduler.sc.set_finished("/task1", 2)
-    pprint(list(scheduler.sc.get_ready_to_issue()))
-
-    # logger.info("start")
-    # scheduler.sc.set_finished("/task1", 0)
-    # scheduler.sc.set_finished("/task1", 1)
-    # scheduler.sc.set_finished("/task2", 0)
+    scheduler.feed(run_id, payload)
+    logger.info("feed end")
+    #
+    # # # TODO add to test
+    # list(scheduler.sc.get_ready_to_issue())
+    # scheduler.sc.set_finished("_tt_2")
+    # list(scheduler.sc.get_ready_to_issue())
+    # scheduler.sc.set_finished("_tt_3")
+    # list(scheduler.sc.get_ready_to_issue())
+    # scheduler.sc.set_finished("_tt_4")
+    # list(scheduler.sc.get_ready_to_issue())
+    # scheduler.sc.set_finished("_tt_5")
+    # list(scheduler.sc.get_ready_to_issue())
+    # scheduler.sc.set_finished("_tt_7")
+    # list(scheduler.sc.get_ready_to_issue())
     with open("./out.md", "w") as f:
         f.write(scheduler.sc.graph_str())
-    return
-    scheduler.feed(run_id=str(run_id), payload=payload)
-    with open("./out.md", "w") as f:
+
+    with open("run_dep.md", "w") as f:
         f.write("```mermaid\n")
         f.write("graph TD\n")
-        for idx, (from_node, to_node) in enumerate(scheduler.cb.call_graph):
-            from_node_ = from_node.replace("-", "<br/>")
-            to_node_ = to_node.replace("-", "<br/>")
-            f.write(
-                f'{from_node}["{from_node_}"] '
-                f"-->|{idx}|"
-                f' {to_node}["{to_node_}"]\n'
-            )
+        for a, b in scheduler.cb.call_graph:
+            f.write(f"{a}-->{b}\n")
         f.write("```")
-    from pprint import pprint
-
-    pprint(scheduler.iter_issue_order)
-    print(scheduler.graph.node_map["/task4"])
+    logger.info("run end")
+    return
 
 
 if __name__ == "__main__":

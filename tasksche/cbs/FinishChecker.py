@@ -2,7 +2,7 @@ from itertools import chain
 
 from ..callback import CallbackBase, CallBackEvent, InterruptSignal
 from ..logger import Logger
-from ..storage.storage import ResultStorage
+from ..storage.storage import KVStorageBase
 
 logger = Logger()
 
@@ -15,8 +15,8 @@ class FinishChecker(CallbackBase):
         result_storage: str = "file:default",
         hash_storage: str = "file:hash",
     ):
-        self.result_storage = ResultStorage(result_storage)
-        self.hash_storage = ResultStorage(hash_storage)
+        self.result_storage = KVStorageBase(result_storage)
+        self.hash_storage = KVStorageBase(hash_storage)
 
     def on_task_finish(self, event: CallBackEvent):
         if event.value.get("FinishChecker", None) is NOT_DUMP_HASH:

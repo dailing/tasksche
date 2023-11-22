@@ -2,7 +2,6 @@ import asyncio
 from collections import defaultdict
 from functools import cached_property
 from typing import (
-    Any,
     AsyncGenerator,
     Callable,
     Dict,
@@ -13,24 +12,20 @@ from typing import (
     TypeVar,
 )
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
-from .functional import ROOT_NODE, Graph
+from .functional import RunnerTaskSpec
 from .logger import Logger
-from .storage.storage import ResultStorage, StatusStorage, IterRecord
 
 logger = Logger()
 
 
 class CallBackEvent(BaseModel):
-    graph: Graph
+    # graph: Graph
     run_id: str
-    task_name: Optional[str] = None
-    result_storage: Optional[ResultStorage] = None
-    status_storage: Optional[StatusStorage] = None
-    output_map: Dict[str, str] = {}
-    n_iter: int = 0
-    previous_task: Optional[str] = None
+    task_id: str
+    task_name: str
+    task_spec: Optional[RunnerTaskSpec]
 
     class Config:
         arbitrary_types_allowed = True
@@ -39,71 +34,17 @@ class CallBackEvent(BaseModel):
         assert "previous_event" not in kwargs
         return self.model_copy(update=kwargs | dict(previous_event=self))
 
-    @field_validator("graph")
-    def validate_graph(cls, v):
-        if not isinstance(v, Graph):
-            raise ValueError(f"{type(v)} is not Graph")
-        return v
-
-    @field_validator("result_storage")
-    def validate_result_storage(cls, v):
-        if not isinstance(v, ResultStorage) and v is not None:
-            raise ValueError(f"{type(v)} is not ResultStorage")
-        return v
-
-    @field_validator("status_storage")
-    def validate_status_storage(cls, v):
-        if not isinstance(v, StatusStorage) and v is not None:
-            raise ValueError(f"{type(v)} is not StatusStorage")
-        return v
-
-    @property
-    def is_generator(self) -> bool:
-        assert self.task_name is not None
-        return self.graph.node_map[self.task_name].is_generator
-
-    @property
-    def event_str(self) -> str:
-        task_name = self.task_name
-        # assert task_name is not None
-        if task_name is None:
-            task_name = ""
-        n_iter = self.n_iter
-        if n_iter is not None:
-            task_name = task_name + "-".join(
-                map(lambda x: f"{x[0]}:{x[1]}", n_iter)
-            )
-        return task_name
-
-    @property
-    def iter_tasks(self) -> str:
-        assert self.n_iter is not None
-        return ".".join(map(lambda x: f"{x[0]}", self.n_iter))
-
-    @property
-    def iter_nums(self) -> Tuple[int]:
-        assert self.n_iter is not None
-        return tuple(map(lambda x: x[1], self.n_iter))
-
-    @property
-    def iter_layer_number(self) -> int:
-        """
-        Returns the layer number of iteration.
-
-        :return: An integer representing the layer number of the task.
-        :rtype: int
-        """
-        assert self.task_name is not None
-        return self.graph.layer_map[self.task_name]
+    # @property
+    # def is_generator(self) -> bool:
+    #     assert self.task_name is not None
+    #     return self.graph.node_map[self.task_name].is_generator
 
 
 class CallBackSignal:
-    def __init__(self, signal: str, event: CallBackEvent, *args, **kwargs):
+    def __init__(self, signal: str, event: CallBackEvent):
         super().__init__()
         self.signal = signal
         self.event = event
-        self.args = args
-        self.kwargs = kwargs
 
 
 class InterruptSignal(CallBackSignal, Exception):
@@ -124,13 +65,9 @@ class InvokeSignal(CallBackSignal):
 
 
 class CallbackBase:
-    IGNORE_ROOT_NODE = False
     """
     Abstract Base Class for callback system.
     """
-
-    def on_feed(self, event: CallBackEvent):
-        raise NotImplementedError()
 
     def on_task_check(self, event: CallBackEvent):
         """
@@ -138,13 +75,21 @@ class CallbackBase:
         """
         raise NotImplementedError
 
-    def on_task_ready(self, event: CallBackEvent):
-        """
-        Called when a task is ready.
-        """
-        raise NotImplementedError()
-
     def on_task_start(self, event: CallBackEvent):
+        """
+        Called when a task is started. Mainly used by RUNNER to initiate the
+        task.
+        """
+        raise NotImplementedError
+
+    def on_gen_start(self, event: CallBackEvent):
+        """
+        Called when a task is started. Mainly used by RUNNER to initiate the
+        task.
+        """
+        raise NotImplementedError
+
+    def on_per_start(self, event: CallBackEvent):
         """
         Called when a task is started. Mainly used by RUNNER to initiate the
         task.
@@ -164,16 +109,15 @@ class CallbackBase:
         """
         raise NotImplementedError
 
-    def on_task_iterend(self, event: CallBackEvent):
+    def on_task_pull(self, event: CallBackEvent):
         """
-        Called when a root generator is exhausted.
+        Called when a task is pulled.
         """
         raise NotImplementedError
 
-    def on_task_collect(self, event: CallBackEvent):
+    def on_gen_finish(self, event: CallBackEvent):
         """
-        Called when a task is collected. Mainly used by RUNNER to collect the
-        task.
+        Called when a task is finished.
         """
         raise NotImplementedError
 
@@ -187,6 +131,12 @@ class CallbackBase:
     def on_task_finish(self, event: CallBackEvent):
         """
         Called when a task is finished.
+        """
+        raise NotImplementedError
+
+    def on_task_push(self, event: CallBackEvent):
+        """
+        Called when a task is pushed.
         """
         raise NotImplementedError
 
@@ -211,7 +161,7 @@ CALL_BACK_DICT: Dict[str, Callable] = {
 
 
 async def _handle_call_back_output(
-    retval=None | Generator | InvokeSignal,
+    retval: Generator | InvokeSignal | AsyncGenerator,
 ) -> List[InvokeSignal]:
     if retval is None:
         return []
@@ -282,15 +232,13 @@ class _CallbackRunnerMeta(type):
                         and cb_instance is not cb.__self__
                     ):
                         continue
-                    if event.task_name == ROOT_NODE.NAME and getattr(
-                        cb.__self__, "IGNORE_ROOT_NODE"
-                    ):
-                        continue
+                    # if event.task_name == ROOT_NODE.NAME
+                    #     continue
                     logger.debug(
                         f"[{cb_name:15s}]"
-                        f"[{str(cb.__self__.__class__.__name__):15s}] "
+                        f"[{str(cb.__self__.__class__.__name__):14s}] "
                         f"{str(event.task_name):15s} "
-                        f"{str(event.n_iter):15s} "
+                        f"{str(event.task_id):15s} "
                         f"{event.run_id}"
                     )
                     if asyncio.iscoroutinefunction(cb):
@@ -307,23 +255,15 @@ class _CallbackRunnerMeta(type):
                 se = sig.event
                 cg.append(
                     (
-                        f"{event.task_name}-{event.n_iter}-{func.__name__}",
-                        f"{se.task_name}-{se.n_iter}-{sig.signal}",
+                        f"{event.task_name}-{event.task_id}-{func.__name__}",
+                        f"{se.task_name}-{se.task_id}-{sig.signal}",
                     )
                 )
                 assert asyncio.iscoroutinefunction(func_to_call)
                 _event = sig.event
-                _event.previous_task = event.task_name
-                coroutines_to_call.append(
-                    func_to_call(_event, *sig.args, **sig.kwargs)
-                )
-            if _instance.single_issue:
-                for i in coroutines_to_call:
-                    await i
-            else:
-                fs = [asyncio.create_task(i) for i in coroutines_to_call]
-                if len(fs) > 0:
-                    await asyncio.wait(fs)
+                # _event.previous_task = event.task_name
+                coroutines_to_call.append(func_to_call(_event))
+            await asyncio.gather(*coroutines_to_call)
             return kwargs
 
         f.__doc__ = func.__doc__
@@ -344,7 +284,7 @@ class CallbackRunner(CallbackBase, metaclass=_CallbackRunnerMeta):
         :param callbacks: List of callback objects
         """
         self.cbs = callbacks
-        self.single_issue = True
+        self.single_issue = False
         self.call_graph = []
 
     @cached_property

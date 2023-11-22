@@ -2,7 +2,7 @@ import abc
 import os
 import pickle
 from hashlib import md5
-from typing import Any, Optional, Tuple, List
+from typing import Any, Tuple, List
 
 
 class IterRecord(list):
@@ -145,70 +145,3 @@ def storage_factory(
         return MemKVStorage(storage_name)
     else:
         raise ValueError(f"{storage_type} error")
-
-
-class ResultStorage:
-    @classmethod
-    def _key_for(cls, *args):
-        """
-        Generates a key based on the given arguments.
-
-        Args:
-            *args: Variable number of arguments.
-
-        Returns:
-            str: A string representing the generated key.
-        """
-        return ".".join(map(str, filter(lambda x: x is not None, args)))
-
-    @classmethod
-    def key_for(cls, task_name: str, run_id: str, i_iter: int):
-        return cls._key_for(task_name, run_id, i_iter)
-
-    def __init__(self, storage_path: str = "file:default", **kwargs):
-        self.storage = storage_factory(storage_path)
-        self.storage_path = storage_path
-
-    def store(
-        self,
-        task_name: str,
-        run_id: str,
-        i_iter: int,
-        *,
-        value: Any = 0,
-    ):
-        self.storage.store(
-            self.key_for(task_name, run_id, i_iter), value=value
-        )
-
-    def get(
-        self,
-        task_name: str,
-        run_id: str,
-        i_iter: int,
-    ):
-        return self.storage.get(self.key_for(task_name, run_id, i_iter))
-
-    def get_hash(
-        self,
-        task_name: str,
-        run_id: str,
-        i_iter: int,
-    ):
-        return self.storage.get_hash(self.key_for(task_name, run_id, i_iter))
-
-    def has(
-        self,
-        task_name: str,
-        run_id: str,
-        i_iter: int,
-    ):
-        return self.key_for(task_name, run_id, i_iter) in self.storage
-
-
-class StatusStorage(ResultStorage):
-    def __init__(self, storage_path: str = "mem:default"):
-        super().__init__(storage_path)
-
-    def get_hash(self, task_name: str, run_id: str, i_iter: int = -1):
-        raise NotImplementedError

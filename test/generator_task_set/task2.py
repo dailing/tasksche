@@ -11,5 +11,6 @@ print("___task2 importing___")
 def run(data):
     print(f"___task2 running", data)
     for i in data:
-        print("$$$", i)
-        yield i
+        for j in i:
+            print("$$$ yield task2  ", j)
+            yield j
