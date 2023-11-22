@@ -1,6 +1,7 @@
 import asyncio
 import os
 import queue
+from tracemalloc import start
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,199 @@ from .logger import Logger
 from .storage.storage import storage_factory
 
 logger = Logger()
+
+
+class Sc2:
+    def __init__(self, graph: Graph) -> None:
+        self.graph = graph
+        self.finished_id = set()
+        self.pending_events: Dict[str, TaskIssueInfo] = {}
+        self.issued_task_id = set()
+        self._latest_output_dict = {}  # record the latest output of each task
+        self._last_push: Dict[Tuple[str, str], str] = {}
+        # record last push task id
+        self._last_iter: Dict[str, str] = {}
+        # record last iter task id
+        self.finished_generator = set()
+        self.schedule_for()
+
+    def get_latest_output_of_task(self, task_name: str):
+        return self._latest_output_dict[task_name]
+
+    def get_issue_info(self, task_id: str):
+        return self.pending_events[task_id]
+
+    def graph_str(self):
+        s = "```mermaid\n"
+        s += "graph TD\n"
+        for task in self.pending_events.values():
+            for dep in task.wait_for:
+                s += (
+                    f"{dep}{self.pending_events[dep].node_repr} "
+                    f"--->|{task.task_name}|{task.task_id}"
+                    f"{task.node_repr}\n"
+                )
+        s += "```\n"
+        s.replace("/", "_")
+        return s
+
+    def set_finished(self, task_id: str, generate=True):
+        assert task_id not in self.finished_id, (task_id, self.finished_id)
+        assert task_id in self.issued_task_id
+        self.finished_id.add(task_id)
+        task_info = self.get_issue_info(task_id)
+        node = self.graph.node_map[task_info.task_name]
+        if not generate:
+            self.finished_generator.add(task_info.task_name)
+        if node.is_generator and generate:
+            self.schedule_for()
+        logger.info(f"finished {str(task_info)}")
+
+    def in_pending(self, task_name: str):
+        for t in self.pending_events.values():
+            if (
+                (t.task_name == task_name)
+                and (t.task_id not in self.finished_id)
+                and (t.output is not None)
+            ):
+                return True
+        return False
+
+    def task_started(self, task_name: str):
+        for t in self.pending_events.values():
+            if t.task_name == task_name:
+                return True
+        return False
+
+    def schedule_for(
+        self, task_name_: Optional[str] = None, ready_dict=None
+    ) -> Optional[TaskIssueInfo]:
+        if ready_dict is None:
+            ready_dict = {}
+        if task_name_ is None:
+            task_name_ = END_NODE.NAME
+        if task_name_ in ready_dict:
+            return ready_dict[task_name_]
+
+        def pend_task(task_: TaskIssueInfo):
+            self.pending_events[task_.task_id] = task_
+            if task_.output is not None:
+                ready_dict[task_.task_name] = task_
+                self._latest_output_dict[task_.task_name] = task_
+            if task_.task_type is ISSUE_TASK_TYPE.PUSH_TASK:
+                from_task = self.pending_events[task_.wait_for[0]].task_name
+                push_pair = (task_.task_name, from_task)
+                if push_pair in self._last_push:
+                    task_.wait_for = task_.wait_for + (
+                        self._last_push[push_pair],
+                    )
+                self._last_push[push_pair] = task_.task_id
+            if task_.task_type is ISSUE_TASK_TYPE.ITER_TASK:
+                task_.wait_for = task_.wait_for + (
+                    self._last_iter[task_.task_name],
+                )
+            if task_.task_type in (
+                ISSUE_TASK_TYPE.START_TASK,
+                ISSUE_TASK_TYPE.ITER_TASK,
+            ):
+                self._last_iter[task_.task_name] = task_.task_id
+            if task_.task_type == ISSUE_TASK_TYPE.PULL_RESULT:
+                task_.wait_for = task_.wait_for + (
+                    self._last_iter[task_.task_name],
+                )
+            requirements = {}
+            for arg_key, arg in node.dep_arg_parse.items():
+                if arg.arg_type in (ARG_TYPE.VIRTUAL, ARG_TYPE.RAW):
+                    continue
+                tt = arg.from_task
+                if tt in ready_dict:
+                    requirements[arg_key] = ready_dict[tt].output
+            task_.reqs = requirements
+            logger.info(f"Pending  {str(task_)}")
+            return task_
+
+        node = self.graph.node_map[task_name_]
+        starter = None
+
+        if not self.task_started(task_name_):
+            wait_for = []
+            for task in node.depend_on_no_virt:
+                w = self.schedule_for(task, ready_dict)
+                if w is not None:
+                    wait_for.append(w)
+            task_info = TaskIssueInfo(
+                task_name=task_name_,
+                task_type=ISSUE_TASK_TYPE.START_TASK,
+                wait_for=tuple(
+                    t.task_id
+                    for t in wait_for
+                    if t.task_name in node.TASK_OUTPUT_DEPEND_ON
+                ),
+            )
+            if node.is_generator:
+                task_info.output = None
+                starter = pend_task(task_info)
+            elif node.is_persistent_node:
+                task_info.output = None
+                starter = pend_task(task_info)
+                starter = pend_task(
+                    TaskIssueInfo(
+                        task_name=task_name_,
+                        task_type=ISSUE_TASK_TYPE.PULL_RESULT,
+                        wait_for=(starter.task_id,),
+                    )
+                )
+            else:
+                starter = pend_task(task_info)
+                return starter
+            assert starter is not None
+
+        for k in node.TASK_ITER_DEPEND_ON:
+            task = self.schedule_for(k, ready_dict)
+            if task is not None:
+                pend_task(
+                    TaskIssueInfo(
+                        task_name=task_name_,
+                        task_type=ISSUE_TASK_TYPE.PUSH_TASK,
+                        wait_for=(task.task_id,),
+                        output=None,
+                    )
+                )
+        if starter is None:
+            for k in node.TASK_OUTPUT_DEPEND_ON:
+                task = self.schedule_for(k, ready_dict)
+                if task is not None:
+                    assert not node.is_persistent_node, node
+                    return pend_task(
+                        TaskIssueInfo(
+                            task_name=task_name_,
+                            task_type=ISSUE_TASK_TYPE.NORMAL_TASK,
+                            wait_for=(task.task_id,),
+                        )
+                    )
+        if (
+            node.is_generator
+            and not self.in_pending(task_name_)
+            and (task_name_ not in self.finished_generator)
+        ):
+            return pend_task(
+                TaskIssueInfo(
+                    task_name=task_name_,
+                    task_type=ISSUE_TASK_TYPE.ITER_TASK,
+                )
+            )
+
+    def get_ready_to_issue(self):
+        for event in self.pending_events.values():
+            if event.task_name == END_NODE.NAME:
+                continue
+            if event.task_id in self.issued_task_id:
+                continue
+            if not all(map(lambda x: x in self.finished_id, event.wait_for)):
+                continue
+            self.issued_task_id.add(event.task_id)
+            logger.info(f"issued   {str(event)}")
+            yield event
 
 
 class SchedulerTaskGenerator:
@@ -261,7 +455,8 @@ class Scheduler(CallbackBase):
         self.runner = LocalRunner()
         self.result_storage_path = result_storage
         self.result_storage = storage_factory(result_storage)
-        self.sc = SchedulerTaskGenerator(graph)
+        # self.sc = SchedulerTaskGenerator(graph)
+        self.sc = Sc2(graph)
 
         self.latest_result = dict()
 
@@ -311,7 +506,6 @@ class Scheduler(CallbackBase):
                 continue
             if t.task_type is ISSUE_TASK_TYPE.START_TASK:
                 event = CallBackEvent(
-                    graph=self.graph,
                     run_id=run_id,
                     task_id=t.task_id,
                     task_name=t.task_name,
@@ -414,8 +608,8 @@ class Scheduler(CallbackBase):
             return
         assert event.task_spec is not None
         self.sc.set_finished(event.task_id)
-        if event.task_spec.output_path is not None:
-            self.latest_result[event.task_name] = event.task_spec.output_path
+        # if event.task_spec.output_path is not None:
+        #     self.latest_result[event.task_name] = event.task_spec.output_path
         yield from self._issue_new(event.run_id)
 
     def on_task_error(self, event: CallBackEvent):

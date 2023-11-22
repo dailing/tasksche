@@ -1,10 +1,5 @@
 PyYAML
-nicegui
-numpy
-matplotlib
-tqdm
-fastapi
-pydantic
+pydantic>2.0.0
 click
 watchfiles
 

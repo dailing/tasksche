@@ -352,7 +352,7 @@ class FlowNode:
     def depend_on_no_virt(self) -> List[str]:
         return [
             val.from_task
-            for val in chain(self.args, self.kwargs.values())
+            for val in self.dep_arg_parse.values()
             if (
                 val.arg_type
                 in [
@@ -421,6 +421,10 @@ class END_NODE(FlowNode):
     @cached_property
     def is_generator(self) -> bool:
         return False
+
+    @property
+    def TASK_OUTPUT_DEPEND_ON(self) -> set[str]:
+        return set(self.depend_on)
 
 
 class ROOT_NODE(FlowNode):
@@ -526,7 +530,6 @@ class Graph:
             for n in v.depend_on:
                 cmap[n].append(k)
         return cmap
-
 
 
 class ExecEnv:
@@ -699,7 +702,9 @@ class BaseTaskExecutor(abc.ABC):
 
     def call_push(self, spec: RunnerTaskSpec):
         for k, arg in spec.requires.items():
-            assert k in self.iter_map, f"{k} is not in iter_map {self.iter_map}"
+            assert (
+                k in self.iter_map
+            ), f"{k} is not in iter_map {self.iter_map}"
             assert arg.storage_path is not None, f"{spec.requires} is None"
             assert arg.arg_type == ARG_TYPE.TASK_ITER
             self.load_input(k, arg)
