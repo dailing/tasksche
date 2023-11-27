@@ -1,5 +1,4 @@
 import asyncio
-from math import log
 import os
 import pickle
 import uuid
@@ -8,7 +7,6 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from tasksche.cbs.EndTask import EndTask
-from tasksche.cbs.PRunner import PRunner
 from .callback import (
     CALLBACK_TYPE,
     CallbackBase,
@@ -137,7 +135,8 @@ class Sc2:
     ):
         for k in updated:
             if k.task_type in (
-                ISSUE_TASK_TYPE.START_TASK,
+                ISSUE_TASK_TYPE.START_GENERATOR,
+                ISSUE_TASK_TYPE.START_ITERATOR,
                 ISSUE_TASK_TYPE.ITER_TASK,
             ):
                 val[k.task_name] = k.task_id
@@ -230,7 +229,6 @@ class Sc2:
             self.finished_task_name.add(task_info.task_name)
         if node.is_generator and generate:
             self.schedule_for()
-        logger.info(f"finished {str(task_info)}")
 
     def in_pending(self, task_name: str):
         for t in self.event_log:
@@ -265,6 +263,8 @@ class Sc2:
             wait_for_: tuple = (),
             output: Optional[Any] = not_specified,
         ) -> TaskIssueInfo:
+            if task_name_ == END_NODE.NAME:
+                return None
             task_name = task_name_
             if output is not_specified:
                 output = f"{task_name}_{self.task_cnt[task_name]:03d}.out"
@@ -291,8 +291,14 @@ class Sc2:
                 tt = arg.from_task
                 if tt in ready_dict:
                     requirements[arg_key] = ready_dict[tt].output
+                if task_type in (
+                    ISSUE_TASK_TYPE.START_GENERATOR,
+                    ISSUE_TASK_TYPE.START_ITERATOR,
+                ) and (arg.arg_type == ARG_TYPE.TASK_ITER):
+                    requirements[arg_key] = None
+
             task_.reqs = requirements
-            logger.info(f"Pending  {str(task_)}")
+            logger.info(f"[Pending        ][              ]{str(task_)}")
             self.event_log.append(task_)
             return task_
 
@@ -313,14 +319,14 @@ class Sc2:
             if node.is_generator:
                 # task_info.output = None
                 starter = pend_task(
-                    task_type=ISSUE_TASK_TYPE.START_TASK,
+                    task_type=ISSUE_TASK_TYPE.START_GENERATOR,
                     wait_for_=wait_for,
                     output=None,
                 )
             elif node.is_persistent_node:
                 # task_info.output = None
                 starter = pend_task(
-                    task_type=ISSUE_TASK_TYPE.START_TASK,
+                    task_type=ISSUE_TASK_TYPE.START_ITERATOR,
                     wait_for_=wait_for,
                     output=None,
                 )
@@ -332,7 +338,7 @@ class Sc2:
                 # )
             else:
                 starter = pend_task(
-                    task_type=ISSUE_TASK_TYPE.START_TASK, wait_for_=wait_for
+                    task_type=ISSUE_TASK_TYPE.NORMAL_TASK, wait_for_=wait_for
                 )
                 return starter
             assert starter is not None
@@ -340,9 +346,13 @@ class Sc2:
         for k in node.TASK_ITER_DEPEND_ON:
             task = self.schedule_for(k, ready_dict)
             if task is not None:
+                push_pair = (task_name_, task.task_name)
+                wait_for_ = (task.task_id,)
+                if push_pair in self._last_push:
+                    wait_for_ = wait_for_ + (self._last_push[push_pair],)
                 pend_task(
                     task_type=ISSUE_TASK_TYPE.PUSH_TASK,
-                    wait_for_=(task.task_id,),
+                    wait_for_=wait_for_,
                     output=None,
                 )
         if starter is None:
@@ -372,8 +382,16 @@ class Sc2:
             if not all(map(lambda x: x in self.finished_id, event.wait_for)):
                 continue
             self.issued_task_id.add(event.task_id)
-            logger.info(f"issued   {str(event)}")
+            logger.info(f"[issued         ][              ]{str(event)}")
             yield event
+        if len(self.finished_id) >= len(self.event_log):
+            for e in self.event_log:
+                if e.task_id not in self.finished_id:
+                    return
+            yield TaskIssueInfo(
+                task_name="END_NODE.NAME",
+                task_type=ISSUE_TASK_TYPE.END_TASK,
+            )
 
 
 class Scheduler(CallbackBase):
@@ -414,20 +432,24 @@ class Scheduler(CallbackBase):
         )
         asyncio.run(self.cb.on_task_finish(event))
 
-    def _transfer_arg_all(self, task: TaskIssueInfo, search_past: bool = True):
+    def _transfer_arg_all(
+        self, task: TaskIssueInfo, search_past: bool = False
+    ):
         node = self.graph.node_map[task.task_name]
         reqs = {}
         for k, arg in node.dep_arg_parse.items():
             if arg.arg_type == ARG_TYPE.VIRTUAL:
                 continue
             path = task.reqs.get(k, None)
-            if not search_past and path is None:
+            # if not search_past and path is None:
+            #     continue
+            # if path is None:
+            #     path = self.latest_result.get(arg.from_task, None)
+            # if arg.arg_type == ARG_TYPE.TASK_ITER and search_past:
+            #     path = None
+            # assert path is not None or arg.arg_type != ARG_TYPE.TASK_OUTPUT
+            if arg.arg_type == ARG_TYPE.TASK_OUTPUT and path is None:
                 continue
-            if path is None:
-                path = self.latest_result.get(arg.from_task, None)
-            if arg.arg_type == ARG_TYPE.TASK_ITER and search_past:
-                path = None
-            assert path is not None or arg.arg_type != ARG_TYPE.TASK_OUTPUT
             reqs[k] = RunnerArgSpec(
                 arg_type=arg.arg_type,
                 value=arg.value,
@@ -438,114 +460,49 @@ class Scheduler(CallbackBase):
     def _issue_new(self, run_id):
         pending_tasks = list(self.sc.get_ready_to_issue())
         for t in pending_tasks:
-            node = self.graph.node_map[t.task_name]
+            # node = self.graph.node_map[t.task_name]
             if t.task_name == ROOT_NODE.NAME:
                 continue
             if t.task_name == END_NODE.NAME:
                 continue
-            if t.task_type is ISSUE_TASK_TYPE.START_TASK:
-                event = CallBackEvent(
-                    run_id=run_id,
-                    task_id=t.task_id,
-                    task_name=t.task_name,
-                    task_spec=RunnerTaskSpec(
-                        task=t.task_name,
-                        root=self.graph.root,
-                        requires=self._transfer_arg_all(t),
-                        storage_path=self.result_storage_path,
-                        output_path=t.output,
-                        work_dir=f"/tmp/workdir/{t.task_id}",
-                    ),
-                )
-                if node.is_generator:
-                    yield InvokeSignal("on_gen_start", event)
-                elif node.is_persistent_node:
-                    yield InvokeSignal("on_per_start", event)
-                else:
-                    yield InvokeSignal("on_task_run", event)
-            elif t.task_type is ISSUE_TASK_TYPE.ITER_TASK:
+            if t.task_type is ISSUE_TASK_TYPE.END_TASK:
                 yield InvokeSignal(
-                    "on_task_iterate",
+                    "on_run_finish",
                     CallBackEvent(
                         run_id=run_id,
                         task_id=t.task_id,
                         task_name=t.task_name,
-                        task_spec=RunnerTaskSpec(
-                            task=t.task_name,
-                            root=self.graph.root,
-                            requires={},
-                            storage_path=self.result_storage_path,
-                            output_path=t.output,
-                            work_dir=f"/tmp/workdir/{t.task_id}",
-                        ),
+                        task_spec=None,
                     ),
                 )
-            elif t.task_type is ISSUE_TASK_TYPE.PUSH_TASK:
-                logger.info(
-                    f"on_task_push {t.reqs} {self._transfer_arg_all(t, False)}"
-                )
-                yield InvokeSignal(
-                    "on_task_push",
-                    CallBackEvent(
-                        run_id=run_id,
-                        task_id=t.task_id,
-                        task_name=t.task_name,
-                        task_spec=RunnerTaskSpec(
-                            task=t.task_name,
-                            root=self.graph.root,
-                            requires=self._transfer_arg_all(t, False),
-                            storage_path=self.result_storage_path,
-                            output_path=t.output,
-                            work_dir=f"/tmp/workdir/{t.task_id}",
-                        ),
-                    ),
-                )
-            elif t.task_type is ISSUE_TASK_TYPE.NORMAL_TASK:
-                event = CallBackEvent(
-                    run_id=run_id,
+                return
+            event = CallBackEvent(
+                run_id=run_id,
+                task_id=t.task_id,
+                task_name=t.task_name,
+                task_spec=RunnerTaskSpec(
+                    task=t.task_name,
+                    root=self.graph.root,
+                    requires=self._transfer_arg_all(t),
+                    storage_path=self.result_storage_path,
+                    output_path=t.output,
+                    work_dir=f"/tmp/workdir/{t.task_id}",
+                    task_type=t.task_type,
                     task_id=t.task_id,
-                    task_name=t.task_name,
-                    task_spec=RunnerTaskSpec(
-                        task=t.task_name,
-                        root=self.graph.root,
-                        requires=self._transfer_arg_all(t),
-                        storage_path=self.result_storage_path,
-                        output_path=t.output,
-                        work_dir=f"/tmp/workdir/{t.task_id}",
-                    ),
-                )
-                assert not node.is_generator
-                assert not node.is_persistent_node
-                yield InvokeSignal("on_task_run", event)
-            elif t.task_type is ISSUE_TASK_TYPE.PULL_RESULT:
-                event = CallBackEvent(
-                    run_id=run_id,
-                    task_id=t.task_id,
-                    task_name=t.task_name,
-                    task_spec=RunnerTaskSpec(
-                        task=t.task_name,
-                        root=self.graph.root,
-                        requires=self._transfer_arg_all(t),
-                        storage_path=self.result_storage_path,
-                        output_path=t.output,
-                        work_dir=f"/tmp/workdir/{t.task_id}",
-                    ),
-                )
-                assert not node.is_generator
-                assert node.is_persistent_node
-                yield InvokeSignal("on_task_pull", event)
-            else:
-                raise ValueError(f"{t.task_type}")
+                ),
+            )
+            yield InvokeSignal("on_task_start", event)
 
     def on_gen_finish(self, event: CallBackEvent):
         self.sc.set_finished(event.task_id, False)
+        # logger.info(self.sc.finished_task_name)
         yield from self._issue_new(event.run_id)
 
     def on_task_finish(self, event: CallBackEvent):
         if event.task_name == ROOT_NODE.NAME:
             yield from self._issue_new(event.run_id)
             return
-        assert event.task_spec is not None
+        # assert event.task_spec is not None
         self.sc.set_finished(event.task_id)
         # if event.task_spec.output_path is not None:
         #     self.latest_result[event.task_name] = event.task_spec.output_path
@@ -579,14 +536,14 @@ def run(
             EndTask(),
             # FinishChecker(storage_result),
             # RootStarter(),
-            PRunner(),
+            # PRunner(),
             LocalRunner(),
             # FileWatcher(),
         ],
     )
-    if os.path.exists("dump.pkl"):
-        logger.info("load dump")
-        scheduler.load(open("dump.pkl", "rb").read())
+    # if os.path.exists("dump.pkl"):
+    #     logger.info("load dump")
+    #     scheduler.load(open("dump.pkl", "rb").read())
     scheduler.feed(run_id, payload)
     logger.info("feed end")
     with open("dump.pkl", "wb") as f:

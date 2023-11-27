@@ -1,10 +1,10 @@
-
 from typing import Dict
 
-from ..functional import Status
+from tqdm import tqdm
+
 # from ..task_spec import TaskSpec
 from ..callback import CallbackBase
-from tqdm import tqdm
+from ..functional import Status
 
 
 class ProgressCB(CallbackBase):
@@ -17,7 +17,7 @@ class ProgressCB(CallbackBase):
         if self.total_tasks < 0:
             # Initiate bars
             assert task.task_dict is not None
-            self.total_tasks = len(task.task_dict)-1
+            self.total_tasks = len(task.task_dict) - 1
             total_finished = sum(
                 [
                     v.status == Status.STATUS_FINISHED

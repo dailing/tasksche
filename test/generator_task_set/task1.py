@@ -4,6 +4,8 @@ require:
 task_type: generator
 """
 
+print("TASK1 importing")
+
 
 def run(n_iter):
     print(f"TASK1 running {n_iter}")

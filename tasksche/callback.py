@@ -69,27 +69,7 @@ class CallbackBase:
     Abstract Base Class for callback system.
     """
 
-    def on_task_check(self, event: CallBackEvent):
-        """
-        Can be called any time, Invoke call task_ready if possible
-        """
-        raise NotImplementedError
-
     def on_task_start(self, event: CallBackEvent):
-        """
-        Called when a task is started. Mainly used by RUNNER to initiate the
-        task.
-        """
-        raise NotImplementedError
-
-    def on_gen_start(self, event: CallBackEvent):
-        """
-        Called when a task is started. Mainly used by RUNNER to initiate the
-        task.
-        """
-        raise NotImplementedError
-
-    def on_per_start(self, event: CallBackEvent):
         """
         Called when a task is started. Mainly used by RUNNER to initiate the
         task.
@@ -100,18 +80,6 @@ class CallbackBase:
         """
         Called when a task is started. Mainly used by RUNNER to initiate the
         task.
-        """
-        raise NotImplementedError
-
-    def on_task_iterate(self, event: CallBackEvent):
-        """
-        Called when a task is iterated.
-        """
-        raise NotImplementedError
-
-    def on_task_pull(self, event: CallBackEvent):
-        """
-        Called when a task is pulled.
         """
         raise NotImplementedError
 
@@ -131,12 +99,6 @@ class CallbackBase:
     def on_task_finish(self, event: CallBackEvent):
         """
         Called when a task is finished.
-        """
-        raise NotImplementedError
-
-    def on_task_push(self, event: CallBackEvent):
-        """
-        Called when a task is pushed.
         """
         raise NotImplementedError
 
