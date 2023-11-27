@@ -3,7 +3,6 @@ import contextlib
 import hashlib
 import importlib
 import io
-from operator import le
 import os.path
 import queue
 import sys
@@ -19,7 +18,7 @@ import yaml.scanner
 from pydantic import BaseModel, Field, ValidationError
 
 from .logger import Logger
-from .storage.storage import KVStorageBase, storage_factory
+from .storage.storage import storage_factory
 
 logger = Logger()
 
@@ -72,7 +71,7 @@ class _Counter:
 
     def get_counter(self):
         self._counter += 1
-        return f"{self.prefix}_{self._counter}"
+        return f"{self.prefix}_{self._counter:03d}"
 
 
 _task_counter = _Counter("_tt")
@@ -88,10 +87,13 @@ class TaskIssueInfo(BaseModel):
     task_id: str = Field(default_factory=_task_counter.get_counter)
 
     def __repr__(self) -> str:
+        output = self.output
+        if output is None:
+            output = ""
         return (
-            f"{self.task_name + ':' + self.task_id + '->' + str(self.output):25s}"
-            f"[{str(self.wait_for):20s}]"
-            f"{self.task_type}"
+            f"{self.task_name:>10s}:{self.task_id:10s}->{output:18s}"
+            f"[{' '.join(self.wait_for):^28s}]"
+            f"{self.task_type.value:^20s}"
         )
 
     def __str__(self) -> str:
@@ -178,7 +180,7 @@ def task_name_to_file_path(task_name: str, root: str) -> str:
 
 
 def file_path_to_task_name(
-    file_path: str, root: Optional[str] = None
+        file_path: str, root: Optional[str] = None
 ) -> Tuple[str, str]:
     """
     Generate a task name from a file path.
@@ -201,7 +203,7 @@ def file_path_to_task_name(
         raise Exception(f"Cannot find task root! {file_path}")
     file_path = os.path.abspath(file_path)
     assert file_path.startswith(root)
-    return file_path[len(root) : -len(".py")], file_path
+    return file_path[len(root): -len(".py")], file_path
 
 
 def process_inherent(child: TaskSpecFmt, parent: TaskSpecFmt) -> TaskSpecFmt:
@@ -209,7 +211,7 @@ def process_inherent(child: TaskSpecFmt, parent: TaskSpecFmt) -> TaskSpecFmt:
     if new_fmt.require is None:
         new_fmt.require = parent.require
     elif isinstance(parent.require, dict) and isinstance(
-        new_fmt.require, dict
+            new_fmt.require, dict
     ):
         new_fmt.require.update(parent.require)
     else:
@@ -242,7 +244,7 @@ def parse_task_specs(task_name: str, root: str) -> TaskSpecFmt:
         if task_info.require is None:
             task_info.require = inh_task.require
         elif isinstance(inh_task.require, dict) and isinstance(
-            task_info.require, dict
+                task_info.require, dict
         ):
             updated_dep = inh_task.require.copy()
             updated_dep.update(task_info.require)
@@ -252,10 +254,10 @@ def parse_task_specs(task_name: str, root: str) -> TaskSpecFmt:
 
 class FlowNode:
     def __init__(
-        self,
-        task_name: str,
-        task_root: str,
-        task_spec: Optional[TaskSpecFmt] = None,
+            self,
+            task_name: str,
+            task_root: str,
+            task_spec: Optional[TaskSpecFmt] = None,
     ) -> None:
         assert task_name is not None
         self._task_spec = task_spec
@@ -286,8 +288,8 @@ class FlowNode:
         dep_cnt = 0
         for arg in arg_dict.values():
             if arg.arg_type in (
-                ARG_TYPE.TASK_OUTPUT,
-                ARG_TYPE.TASK_ITER,
+                    ARG_TYPE.TASK_OUTPUT,
+                    ARG_TYPE.TASK_ITER,
             ):
                 dep_cnt += 1
         if dep_cnt == 0:
@@ -299,7 +301,7 @@ class FlowNode:
 
     @cached_property
     def _arg_kwarg_parse(
-        self,
+            self,
     ) -> Tuple[List[RequirementArg], Dict[str, RequirementArg]]:
         args = []
         int_keys = [k for k in self.dep_arg_parse.keys() if isinstance(k, int)]
@@ -338,13 +340,13 @@ class FlowNode:
             val.from_task
             for val in chain(self.args, self.kwargs.values())
             if (
-                val.arg_type
-                in [
-                    ARG_TYPE.TASK_OUTPUT,
-                    ARG_TYPE.VIRTUAL,
-                    ARG_TYPE.TASK_ITER,
-                ]
-                and val.from_task is not None
+                    val.arg_type
+                    in [
+                        ARG_TYPE.TASK_OUTPUT,
+                        ARG_TYPE.VIRTUAL,
+                        ARG_TYPE.TASK_ITER,
+                    ]
+                    and val.from_task is not None
             )
         ]
 
@@ -354,13 +356,13 @@ class FlowNode:
             val.from_task
             for val in self.dep_arg_parse.values()
             if (
-                val.arg_type
-                in [
-                    ARG_TYPE.TASK_OUTPUT,
-                    ARG_TYPE.TASK_ITER,
-                ]
-                and val.from_task is not None
-                and val.from_task != ROOT_NODE.NAME
+                    val.arg_type
+                    in [
+                        ARG_TYPE.TASK_OUTPUT,
+                        ARG_TYPE.TASK_ITER,
+                    ]
+                    and val.from_task is not None
+                    and val.from_task != ROOT_NODE.NAME
             )
         ]
 
@@ -373,7 +375,7 @@ class FlowNode:
                 if (
                     val.arg_type in (ARG_TYPE.TASK_OUTPUT,)
                     and val.from_task is not None
-                )
+            )
             ]
         )
 
@@ -384,7 +386,7 @@ class FlowNode:
                 val.from_task
                 for val in chain(self.args, self.kwargs.values())
                 if (val.arg_type == ARG_TYPE.TASK_ITER)
-                and val.from_task is not None
+                   and val.from_task is not None
             ]
         )
 
@@ -393,7 +395,7 @@ class FlowNode:
         return task_name_to_file_path(self.task_name, self.task_root)
 
     @cached_property
-    def hash_code(self) -> str:
+    def code_hash(self) -> str:
         with open(self.code_file, "rb") as f:
             return hashlib.md5(f.read()).hexdigest()
 
@@ -426,6 +428,10 @@ class END_NODE(FlowNode):
     def TASK_OUTPUT_DEPEND_ON(self) -> set[str]:
         return set(self.depend_on)
 
+    @cached_property
+    def code_hash(self) -> str:
+        return "_END_"
+
 
 class ROOT_NODE(FlowNode):
     NAME = "_ROOT_"
@@ -439,6 +445,10 @@ class ROOT_NODE(FlowNode):
     @cached_property
     def depend_on(self) -> List[str]:
         return []
+
+    @cached_property
+    def code_hash(self) -> str:
+        return "_ROOT_"
 
     @cached_property
     def hash_code(self) -> str:
@@ -474,11 +484,11 @@ class Graph:
         return nmap
 
     def _agg(
-        self,
-        map_func: Callable[[FlowNode], Any],
-        reduce_func: Callable[[List[Any]], Any],
-        target: str,
-        result: Optional[Dict[str, Any]] = None,
+            self,
+            map_func: Callable[[FlowNode], Any],
+            reduce_func: Callable[[List[Any]], Any],
+            target: str,
+            result: Optional[Dict[str, Any]] = None,
     ):
         if result is None:
             result = {}
@@ -492,10 +502,10 @@ class Graph:
         return result[target]
 
     def aggregate(
-        self,
-        map_func: Callable,
-        reduce_func: Callable,
-        targets: Optional[List[str] | str] = None,
+            self,
+            map_func: Callable,
+            reduce_func: Callable,
+            targets: Optional[List[str] | str] = None,
     ):
         result = {}
         if targets is None:
@@ -653,32 +663,32 @@ class BaseTaskExecutor(abc.ABC):
             anything returned by 'run' function
         """
         task_module_path = self.mod_name
-        with ExecEnv(spec.root, spec.work_dir):
-            if task_module_path in sys.modules and reload:
-                logger.info(f"reloading module {task_module_path}")
-                importlib.reload(sys.modules[task_module_path])
+        if task_module_path in sys.modules and reload:
+            logger.info(f"reloading module {task_module_path}")
+            importlib.reload(sys.modules[task_module_path])
+
+        args = [
+            self.load_input(*x)
+            for x in enumerate(int_iterator(spec.requires))
+        ]
+        kwargs = {
+            k: self.load_input(k, v)
+            for k, v in spec.requires.items()
+            if isinstance(k, str)
+        }
+        logger.info(
+            f"executing task {spec.task} with args {args} and kwargs {kwargs}"
+        )
+        for v in chain(args, kwargs.values()):
+            if isinstance(v, StopIteration):
+                return v
+        logger.info(spec.requires)
+        with self.env:
             mod = self.mod
             if not hasattr(mod, "run"):
                 raise NotImplementedError("task must have 'run' function")
-
-            args = [
-                self.load_input(*x)
-                for x in enumerate(int_iterator(spec.requires))
-            ]
-            kwargs = {
-                k: self.load_input(k, v)
-                for k, v in spec.requires.items()
-                if isinstance(k, str)
-            }
-            logger.info(
-                f"executing task {spec.task} with args {args} and kwargs {kwargs}"
-            )
-            for v in chain(args, kwargs.values()):
-                if isinstance(v, StopIteration):
-                    return v
-            logger.info(spec.requires)
             output = mod.run(*args, **kwargs)
-            return output
+        return output
 
     def call_run(self, spec: RunnerTaskSpec):
         """
@@ -703,7 +713,7 @@ class BaseTaskExecutor(abc.ABC):
     def call_push(self, spec: RunnerTaskSpec):
         for k, arg in spec.requires.items():
             assert (
-                k in self.iter_map
+                    k in self.iter_map
             ), f"{k} is not in iter_map {self.iter_map}"
             assert arg.storage_path is not None, f"{spec.requires} is None"
             assert arg.arg_type == ARG_TYPE.TASK_ITER
@@ -734,17 +744,18 @@ class GeneratorTaskExecutor(BaseTaskExecutor):
     def call_iter(self, spec: RunnerTaskSpec):
         assert self.generator is not None
         assert spec.output_path is not None
-        with self.env:
-            try:
-                output = next(self.generator)
-                self.storage.store(spec.output_path, value=output)
-                return None
-            except StopIteration as e:
-                self.storage.store(spec.output_path, value=e)
-                return e
-            except Exception as e:
-                print(e)
-                return e
+        assert isinstance(self.generator, types.GeneratorType)
+        # with self.env:
+        try:
+            output = next(self.generator)
+            self.storage.store(spec.output_path, value=output)
+            return None
+        except StopIteration as e:
+            self.storage.store(spec.output_path, value=e)
+            return e
+        except Exception as e:
+            print(e)
+            return e
 
 
 class MapperTaskExecutor(BaseTaskExecutor):
