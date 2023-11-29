@@ -1,12 +1,12 @@
 import asyncio
 import os
 import pickle
+from tkinter import N
 import uuid
 from collections import defaultdict
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Tuple
 
-from tasksche.cbs.EndTask import EndTask
 from .callback import (
     CALLBACK_TYPE,
     CallbackBase,
@@ -25,6 +25,8 @@ from .functional import (
     RunnerTaskSpec,
     TaskIssueInfo,
     search_for_root,
+    group_task_issue_info_by_name,
+    GroupOfTaskInfo,
 )
 from .logger import Logger
 from .storage.storage import storage_factory
@@ -103,7 +105,7 @@ class Sc2:
             payload = {}
         for k in updated:
             if k.output is not None:
-                payload[k.task_id] = k.output
+                payload[k.output] = k.task_id
         return payload
 
     @lazy_property("event_log", dict)
@@ -133,22 +135,77 @@ class Sc2:
         val: Optional[Dict[str, str]],
         updated: List[TaskIssueInfo],
     ):
+        """
+        records the last iteration task
+        maps task_name -> task_id of last iter or start task
+        this function is used to add dependency to following iter tasks
+        so the iter is done in order
+        """
         for k in updated:
             if k.task_type in (
                 ISSUE_TASK_TYPE.START_GENERATOR,
-                ISSUE_TASK_TYPE.START_ITERATOR,
                 ISSUE_TASK_TYPE.ITER_TASK,
             ):
                 val[k.task_name] = k.task_id
         return val
 
     @lazy_property("event_log", dict)
-    def _last_push(self, val, updated):
+    def _mail_box(
+        self,
+        val: Dict[str, List[TaskIssueInfo]],
+        updated: List[TaskIssueInfo],
+    ):
+        for i in updated:
+            for k in self.graph.child_map[i.task_name]:
+                if k not in val:
+                    val[k] = [i]
+                else:
+                    val[k].append(i)
+        return val
+
+    @lazy_property("event_log", dict)
+    def task_started(self, val: Dict[str, bool], updated: List[TaskIssueInfo]):
+        for t in updated:
+            val[t.task_name] = True
+        return val
+
+    @lazy_property("event_log", dict)
+    def latest_parameter(
+        self,
+        val: Dict[str, Dict[int | str, str]],
+        updated: List[TaskIssueInfo],
+    ):
+        """maps task_name.req_key.task_id"""
+        for t in updated:
+            if t.task_name not in val:
+                val[t.task_name] = {}
+            val[t.task_name].update(t.reqs)
+        return val
+
+    @lazy_property("event_log", dict)
+    def _last_push(
+        self,
+        val: Dict[Tuple[str, str | int], str],
+        updated: List[TaskIssueInfo],
+    ):
+        """
+        returds latese push of (task_name, push_key) -> push task_id
+        This function is used to add dependency to following push tasks
+        so the push is done in order
+        """
         for k in updated:
             if k.task_type == ISSUE_TASK_TYPE.PUSH_TASK:
-                from_task = self.pending_events[k.wait_for[0]].task_name
-                push_pair = (k.task_name, from_task)
-                val[push_pair] = k.task_id
+                for req_key, req_body in k.reqs.items():
+                    val[(k.task_name, req_key)] = k.task_id
+            elif k.task_type in (
+                ISSUE_TASK_TYPE.START_ITERATOR,
+                ISSUE_TASK_TYPE.START_GENERATOR,
+            ):
+                # add initial dependent tasks
+                for req_key in self.graph.node_map[
+                    k.task_name
+                ].task_iter_depend_on_.keys():
+                    val[(k.task_name, req_key)] = k.task_id
         return val
 
     def __init__(self, graph: Graph) -> None:
@@ -158,25 +215,38 @@ class Sc2:
         self.issued_task_id = set()
         self.finished_task_name = set()
 
-        self.schedule_for()
+        # self.schedule_for()
 
     @cached_property
     def code_hash(self) -> Dict[str, str]:
         return {k: v.code_hash for k, v in self.graph.node_map.items()}
 
-    def dump(self) -> bytes:
-        return pickle.dumps(
-            (
-                self.event_log,
-                self.finished_task_name,
-                self.code_hash,
-            )
+    def check_task_finished(self, task_name):
+        """check if this task is finished and no more sub-tasks tobe run"""
+        if task_name in self.finished_task_name:
+            return True
+        for t in self.graph.node_map[task_name].depend_on_no_virt:
+            if not self.check_task_finished(t):
+                return False
+        for tasks in self.event_log:
+            if tasks.task_name == task_name:
+                if tasks.task_id not in self.finished_id:
+                    return False
+        self.finished_task_name.add(task_name)
+        return True
+
+    def dump(self):
+        for t in self.graph.node_map.keys():
+            self.check_task_finished(t)
+        return (
+            self.event_log,
+            self.finished_task_name,
+            self.code_hash,
         )
 
-    def load(self, payload: bytes):
-        event_log, finished_id, finished_task_name, code_hash = pickle.loads(
-            payload
-        )
+    def load(self, payload):
+        event_log, finished_task_name, code_hash = payload
+        logger.info(finished_task_name)
         dirty_map = {}
 
         def _dirty(task_name: str):
@@ -194,13 +264,22 @@ class Sc2:
             dirty_map[task_name] = dirty
             return dirty
 
-        for task in finished_task_name:
-            if not _dirty(task):
-                self.finished_task_name.add(task)
-        for event in event_log:
-            if event.task_name in self.finished_task_name:
-                self.event_log.append(event)
-                self.finished_id.add(event.task_id)
+        _dirty(END_NODE.NAME)
+        logger.info("\n".join([str(x) for x in dirty_map.items()]))
+
+        self.finished_task_name.update(
+            filter(lambda x: not dirty_map[x], dirty_map.keys())
+        )
+        logger.info(self.finished_task_name)
+        self.event_log = list(
+            filter(lambda x: x.task_name in self.finished_task_name, event_log)
+        )
+        self.finished_id.update((x.task_id for x in self.event_log))
+        self.issued_task_id.update(self.finished_id)
+        logger.info(self.finished_id)
+        self.schedule_for()
+        self.get_ready_to_issue()
+        # sys.exit(0)
 
     def get_issue_info(self, task_id: str):
         return self.pending_events[task_id]
@@ -240,140 +319,120 @@ class Sc2:
                 return True
         return False
 
-    def task_started(self, task_name: str):
-        for t in self.event_log:
-            if t.task_name == task_name:
-                return True
-        return False
-
     def schedule_for(
-        self, task_name_: Optional[str] = None, ready_dict=None
+        self, task_name_: Optional[str] = None, ready_dict=None, req=None
     ) -> Optional[TaskIssueInfo]:
         if ready_dict is None:
             ready_dict = {}
         if task_name_ is None:
             task_name_ = END_NODE.NAME
         if task_name_ in ready_dict:
-            return ready_dict[task_name_]
+            return
 
         not_specified = object()
+        ready_dict[task_name_] = True
+        for i in self.graph.node_map[task_name_].depend_on:
+            self.schedule_for(i, ready_dict)
+        if task_name_ == END_NODE.NAME or task_name_ == ROOT_NODE.NAME:
+            return
 
         def pend_task(
             task_type: ISSUE_TASK_TYPE,
             wait_for_: tuple = (),
+            require_: Dict[str | int, str] = not_specified,
             output: Optional[Any] = not_specified,
         ) -> TaskIssueInfo:
+            if require_ is not_specified:
+                require_ = {}
             if task_name_ == END_NODE.NAME:
                 return None
-            task_name = task_name_
+            assert task_name_ is not None
             if output is not_specified:
-                output = f"{task_name}_{self.task_cnt[task_name]:03d}.out"
+                output = f"{task_name_}_{self.task_cnt[task_name_]:03d}.out"
+            wait_for_ = wait_for_ + tuple(
+                self._output_dict[x] for x in require_.values()
+            )
             task_ = TaskIssueInfo(
-                task_name=task_name,
+                task_name=task_name_,
                 task_type=task_type,
                 wait_for=wait_for_,
                 output=output,
-                task_id=f"{task_name}_{self.task_cnt[task_name]:03d}",
+                reqs=require_,
+                task_id=f"{task_name_}_{self.task_cnt[task_name_]:03d}",
             )
-            if task_.output is not None:
-                ready_dict[task_.task_name] = task_
-            if task_.task_type in (
-                ISSUE_TASK_TYPE.ITER_TASK,
-                ISSUE_TASK_TYPE.PULL_RESULT,
-            ):
-                task_.wait_for = task_.wait_for + (
-                    self._last_iter[task_.task_name],
-                )
-            requirements = {}
-            for arg_key, arg in node.dep_arg_parse.items():
-                if arg.arg_type in (ARG_TYPE.VIRTUAL, ARG_TYPE.RAW):
-                    continue
-                tt = arg.from_task
-                if tt in ready_dict:
-                    requirements[arg_key] = ready_dict[tt].output
-                if task_type in (
-                    ISSUE_TASK_TYPE.START_GENERATOR,
-                    ISSUE_TASK_TYPE.START_ITERATOR,
-                ) and (arg.arg_type == ARG_TYPE.TASK_ITER):
-                    requirements[arg_key] = None
-
-            task_.reqs = requirements
             logger.info(f"[Pending        ][              ]{str(task_)}")
             self.event_log.append(task_)
             return task_
 
         node = self.graph.node_map[task_name_]
         starter = None
+        mails: List[TaskIssueInfo] = self._mail_box.get(task_name_, [])
+        mail_group = GroupOfTaskInfo(mails)
+        mails.clear()
 
-        if not self.task_started(task_name_):
-            wait_for = []
-            for task in node.depend_on_no_virt:
-                w = self.schedule_for(task, ready_dict)
-                if w is not None:
-                    wait_for.append(w)
-            wait_for = tuple(
-                t.task_id
-                for t in wait_for
-                if t.task_name in node.TASK_OUTPUT_DEPEND_ON
-            )
+        if not self.task_started.get(task_name_, False):
+            reqs = mail_group.pop_reqs(node.task_output_depend_on_)
+
             if node.is_generator:
                 # task_info.output = None
                 starter = pend_task(
                     task_type=ISSUE_TASK_TYPE.START_GENERATOR,
-                    wait_for_=wait_for,
+                    require_=reqs,
                     output=None,
                 )
             elif node.is_persistent_node:
                 # task_info.output = None
                 starter = pend_task(
                     task_type=ISSUE_TASK_TYPE.START_ITERATOR,
-                    wait_for_=wait_for,
+                    require_=reqs,
                     output=None,
                 )
-                # starter = pend_task(task_info)
                 starter = pend_task(
                     task_type=ISSUE_TASK_TYPE.PULL_RESULT,
                     wait_for_=(starter.task_id,),
                 )
-                # )
             else:
                 starter = pend_task(
-                    task_type=ISSUE_TASK_TYPE.NORMAL_TASK, wait_for_=wait_for
+                    task_type=ISSUE_TASK_TYPE.NORMAL_TASK, require_=reqs
                 )
                 return starter
             assert starter is not None
 
-        for k in node.TASK_ITER_DEPEND_ON:
-            task = self.schedule_for(k, ready_dict)
-            if task is not None:
-                push_pair = (task_name_, task.task_name)
-                wait_for_ = (task.task_id,)
-                if push_pair in self._last_push:
-                    wait_for_ = wait_for_ + (self._last_push[push_pair],)
-                pend_task(
-                    task_type=ISSUE_TASK_TYPE.PUSH_TASK,
-                    wait_for_=wait_for_,
-                    output=None,
-                )
-        if starter is None:
-            for k in node.TASK_OUTPUT_DEPEND_ON:
-                task = self.schedule_for(k, ready_dict)
-                if task is not None:
-                    assert not node.is_persistent_node, node
-                    return pend_task(
-                        task_type=ISSUE_TASK_TYPE.NORMAL_TASK,
-                        wait_for_=(task.task_id,),
-                    )
+        for req_key, req_body, from_task_spec in mail_group.items(
+            node.task_output_depend_on_
+        ):
+            assert not node.is_persistent_node
+            assert from_task_spec.output is not None
+            assert req_body.arg_type == ARG_TYPE.TASK_OUTPUT
+            pend_task(
+                task_type=ISSUE_TASK_TYPE.NORMAL_TASK,
+                require_={req_key: from_task_spec.output},
+            )
+
+        for req_key, req_body, from_task_spec in mail_group.items(
+            node.task_iter_depend_on_
+        ):
+            assert from_task_spec.output is not None
+            assert req_body.arg_type == ARG_TYPE.TASK_ITER
+            pend_task(
+                task_type=ISSUE_TASK_TYPE.PUSH_TASK,
+                require_={req_key: from_task_spec.output},
+                wait_for_=(self._last_push[(task_name_, req_key)],),
+                output=None,
+            )
         if (
             node.is_generator
             and not self.in_pending(task_name_)
             and (task_name_ not in self.finished_task_name)
         ):
-            return pend_task(
+            pend_task(
                 task_type=ISSUE_TASK_TYPE.ITER_TASK,
+                wait_for_=(self._last_iter[task_name_],),
             )
 
     def get_ready_to_issue(self):
+        if len(self.event_log) <= 0:
+            self.schedule_for()
         for event in self.event_log:
             if event.task_name == END_NODE.NAME:
                 continue
@@ -499,13 +558,8 @@ class Scheduler(CallbackBase):
         yield from self._issue_new(event.run_id)
 
     def on_task_finish(self, event: CallBackEvent):
-        if event.task_name == ROOT_NODE.NAME:
-            yield from self._issue_new(event.run_id)
-            return
-        # assert event.task_spec is not None
-        self.sc.set_finished(event.task_id)
-        # if event.task_spec.output_path is not None:
-        #     self.latest_result[event.task_name] = event.task_spec.output_path
+        if event.task_name != ROOT_NODE.NAME:
+            self.sc.set_finished(event.task_id)
         yield from self._issue_new(event.run_id)
 
     def on_task_error(self, event: CallBackEvent):
@@ -533,7 +587,7 @@ def run(
         Graph(root, task_names),
         storage_result,
         [
-            EndTask(),
+            # EndTask(),
             # FinishChecker(storage_result),
             # RootStarter(),
             # PRunner(),

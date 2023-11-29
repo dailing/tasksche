@@ -11,8 +11,8 @@ from collections import defaultdict
 from enum import Enum, auto
 from functools import cached_property
 from io import BytesIO
-from itertools import chain
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from itertools import chain, groupby
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import yaml.scanner
 from pydantic import BaseModel, Field, ValidationError
@@ -110,6 +110,44 @@ class TaskIssueInfo(BaseModel):
             f"{self.task_id}<br/>"
             f'{str(self.task_type.value)}"]'
         )
+
+
+def group_task_issue_info_by_name(
+    task_issue_infos: Iterable[TaskIssueInfo],
+) -> Dict[str, List[TaskIssueInfo]]:
+    return {
+        k: list(v) for k, v in groupby(task_issue_infos, lambda x: x.task_name)
+    }
+
+
+class GroupOfTaskInfo:
+    def __init__(self, task_issue_infos: List[TaskIssueInfo]):
+        self.gp = group_task_issue_info_by_name(
+            filter(lambda x: x.output is not None, task_issue_infos)
+        )
+
+    def pop_reqs(
+        self, req: Dict[int | str, RequirementArg]
+    ) -> Dict[int | str, str]:
+        output = {}
+        for k, v in req.items():
+            tks = self.gp[v.from_task]
+            tk_ = None
+            for i in tks:
+                if i.output is not None:
+                    tk_ = i
+                    break
+            if tk_ is None:
+                raise Exception(f"can't find task {v.from_task}")
+            output[k] = tk_.output
+            tks.remove(tk_)
+        return output
+
+    def items(self, req: Dict[int | str, RequirementArg]):
+        for k, r in req.items():
+            assert r.from_task is not None
+            for tk in self.gp.get(r.from_task, []):
+                yield k, r, tk
 
 
 class Status(Enum):
@@ -323,14 +361,6 @@ class FlowNode:
         return args, kwargs
 
     @cached_property
-    def args(self) -> List[RequirementArg]:
-        return self._arg_kwarg_parse[0]
-
-    @cached_property
-    def kwargs(self) -> Dict[str, RequirementArg]:
-        return self._arg_kwarg_parse[1]
-
-    @cached_property
     def task_spec(self) -> TaskSpecFmt:
         if self._task_spec is None:
             return parse_task_specs(self.task_name, self.task_root)
@@ -344,7 +374,7 @@ class FlowNode:
     def depend_on(self) -> List[str]:
         return [
             val.from_task
-            for val in chain(self.args, self.kwargs.values())
+            for val in self.dep_arg_parse.values()
             if (
                 val.arg_type
                 in [
@@ -373,11 +403,27 @@ class FlowNode:
         ]
 
     @cached_property
+    def task_output_depend_on_(self) -> Dict[int | str, RequirementArg]:
+        return {
+            k: val
+            for k, val in self.dep_arg_parse.items()
+            if val.from_task in self.TASK_OUTPUT_DEPEND_ON
+        }
+
+    @cached_property
+    def task_iter_depend_on_(self) -> Dict[int | str, RequirementArg]:
+        return {
+            k: val
+            for k, val in self.dep_arg_parse.items()
+            if val.from_task in self.TASK_ITER_DEPEND_ON
+        }
+
+    @cached_property
     def TASK_OUTPUT_DEPEND_ON(self) -> set[str]:
         return set(
             [
                 val.from_task
-                for val in chain(self.args, self.kwargs.values())
+                for val in self.dep_arg_parse.values()
                 if (
                     val.arg_type in (ARG_TYPE.TASK_OUTPUT,)
                     and val.from_task is not None
@@ -390,7 +436,7 @@ class FlowNode:
         return set(
             [
                 val.from_task
-                for val in chain(self.args, self.kwargs.values())
+                for val in self.dep_arg_parse.values()
                 if (val.arg_type == ARG_TYPE.TASK_ITER)
                 and val.from_task is not None
             ]
@@ -706,12 +752,14 @@ class BaseTaskExecutorWorker(multiprocessing.Process):
 
     def handle_input(self, spec: RunnerTaskSpec):
         if spec.task_type == ISSUE_TASK_TYPE.START_GENERATOR:
-            logger.info(f"executing generator {spec.task}")
+            print(f"executing generator {spec.task}")
             self.generator = self.exec_func(spec)
-            logger.info(f"generator {spec.task} started")
+            print(f"generator {spec.task} started")
         elif spec.task_type == ISSUE_TASK_TYPE.START_ITERATOR:
+            print(f"executing iterator {spec.task}")
             output = self.exec_func(spec)
             self.iter_output = output
+            return
         elif spec.task_type == ISSUE_TASK_TYPE.NORMAL_TASK:
             output = self.exec_func(spec)
             assert spec.output_path is not None
@@ -738,7 +786,7 @@ class BaseTaskExecutorWorker(multiprocessing.Process):
             self.to_pool_thread.join()
             self.storage.store(spec.output_path, value=self.iter_output)
         else:
-            print(f"===========unknown task type {spec.task_type}")
+            # print(f"===========unknown task type {spec.task_type}")
             raise NotImplementedError(f"unknown task type {spec.task_type}")
         self.output_queue.put((spec.task_id, None))
 
@@ -752,12 +800,14 @@ class BaseTaskExecutorWorker(multiprocessing.Process):
             try:
                 t = threading.Thread(target=self.handle_input, args=(spec,))
                 t.start()
+                print("757 started")
                 if spec.task_type == ISSUE_TASK_TYPE.START_ITERATOR:
                     assert self.to_pool_thread is None
                     self.to_pool_thread = t
+                    self.output_queue.put((spec.task_id, None))
             except Exception as e:
-                logger.error(spec)
-                logger.error(e)
+                print("ERROR", spec)
+                print("ERROR", e)
                 print(e)
                 print("-----------------------------------------")
                 break
@@ -778,6 +828,7 @@ class BaseTaskExecutor:
                 self.output_queue,
             )
             self.process.start()
+            logger.info(f"worker process started")
         # assert self.process.is_alive()
         self.task_queue.put(spec)
         result = self.output_queue.get()

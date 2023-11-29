@@ -15,3 +15,4 @@ def run(data: Iterable[int]):
         sum += i
     print("SUM VALUE IS :", sum)
     return sum
+
