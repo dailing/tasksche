@@ -611,13 +611,13 @@ class ExecEnv:
             os.chdir(self.cwd)
         assert self.cwd is not None
         self.stdout_file = open(os.path.join(self.cwd, "stdout.txt"), "w")
-        # self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
-        # self.redirect_stdout.__enter__()
+        self.redirect_stdout = contextlib.redirect_stdout(self.stdout_file)
+        self.redirect_stdout.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # assert self.redirect_stdout is not None
-        # self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
+        assert self.redirect_stdout is not None
+        self.redirect_stdout.__exit__(exc_type, exc_value, traceback)
         assert self.stdout_file is not None
         self.stdout_file.close()
         if self.cwd:
@@ -743,20 +743,20 @@ class BaseTaskExecutorWorker(multiprocessing.Process):
         for v in chain(args, kwargs.values()):
             if isinstance(v, StopIteration):
                 return v
-        with self.env:
-            mod = self.mod
-            if not hasattr(mod, "run"):
-                raise NotImplementedError("task must have 'run' function")
-            output = mod.run(*args, **kwargs)
+        # with self.env:
+        mod = self.mod
+        if not hasattr(mod, "run"):
+            raise NotImplementedError("task must have 'run' function")
+        output = mod.run(*args, **kwargs)
         return output
 
     def handle_input(self, spec: RunnerTaskSpec):
         if spec.task_type == ISSUE_TASK_TYPE.START_GENERATOR:
-            print(f"executing generator {spec.task}")
+            # print(f"executing generator {spec.task}")
             self.generator = self.exec_func(spec)
-            print(f"generator {spec.task} started")
+            # print(f"generator {spec.task} started")
         elif spec.task_type == ISSUE_TASK_TYPE.START_ITERATOR:
-            print(f"executing iterator {spec.task}")
+            # print(f"executing iterator {spec.task}")
             output = self.exec_func(spec)
             self.iter_output = output
             return
@@ -791,27 +791,34 @@ class BaseTaskExecutorWorker(multiprocessing.Process):
         self.output_queue.put((spec.task_id, None))
 
     def run(self):
-        while True:
-            spec = self.task_queue.get()
-            # print(f"746handling {spec.task}----------")
-            if spec is None:
-                break
-            self._task_spec_first = spec
-            try:
-                t = threading.Thread(target=self.handle_input, args=(spec,))
-                t.start()
-                print("757 started")
-                if spec.task_type == ISSUE_TASK_TYPE.START_ITERATOR:
-                    assert self.to_pool_thread is None
-                    self.to_pool_thread = t
-                    self.output_queue.put((spec.task_id, None))
-            except Exception as e:
-                print("ERROR", spec)
-                print("ERROR", e)
-                print(e)
-                print("-----------------------------------------")
-                break
-        print("exit-------------------------------")
+        spec = self.task_queue.get()
+        if spec is None:
+            return
+        self._task_spec_first = spec
+        with self.env:
+            while True:
+                try:
+                    t = threading.Thread(
+                        target=self.handle_input, args=(spec,)
+                    )
+                    t.start()
+                    # print("757 started")
+                    if spec.task_type == ISSUE_TASK_TYPE.START_ITERATOR:
+                        assert self.to_pool_thread is None
+                        self.to_pool_thread = t
+                        self.output_queue.put((spec.task_id, None))
+                except Exception as e:
+                    print("ERROR", spec)
+                    print("ERROR", e)
+                    print(e)
+                    print("-----------------------------------------")
+                    break
+                spec = self.task_queue.get()
+                # print(f"746handling {spec.task}----------")
+                if spec is None:
+                    break
+                self._task_spec_first = spec
+        # print("exit-------------------------------\n", end="")
 
 
 class BaseTaskExecutor:

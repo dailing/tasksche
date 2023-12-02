@@ -22,16 +22,13 @@ class FinishChecker(CallbackBase):
         if event.value.get("FinishChecker", None) is NOT_DUMP_HASH:
             del event.value["FinishChecker"]
             return
-        task_name, run_id, graph = (
+        task_name, graph = (
             event.task_name,
-            event.run_id,
             event.graph,
         )
         code_hash_map = {
             k: graph.node_map[k].hash_code
-            for k in chain(
-                graph.requirements_map[task_name], [task_name]
-            )
+            for k in chain(graph.requirements_map[task_name], [task_name])
         }
 
         result_map = {
@@ -51,9 +48,7 @@ class FinishChecker(CallbackBase):
             event.run_id,
             event.graph,
         )
-        if not self.result_storage.has(
-            task_name, run_id, event.n_iter
-        ):
+        if not self.result_storage.has(task_name, run_id, event.n_iter):
             return
         # logger.info('check hash')
         if not self.hash_storage.has(task_name, run_id, event.n_iter):
@@ -65,15 +60,10 @@ class FinishChecker(CallbackBase):
         if code_hash_map is None or result_map is None:
             return
         for k in graph.requirements_map[task_name]:
-            if (
-                code_hash_map.get(k, None)
-                != graph.node_map[k].hash_code
-            ):
+            if code_hash_map.get(k, None) != graph.node_map[k].hash_code:
                 # logger.info(f'{k} code hash not match')
                 return
-            if result_map.get(
-                k, None
-            ) != self.result_storage.get_hash(
+            if result_map.get(k, None) != self.result_storage.get_hash(
                 k, run_id, event.n_iter
             ):
                 # logger.info(f'{k} result not match')

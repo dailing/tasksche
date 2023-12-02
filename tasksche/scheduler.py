@@ -1,11 +1,10 @@
 import asyncio
 import os
 import pickle
-from tkinter import N
 import uuid
 from collections import defaultdict
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from .callback import (
     CALLBACK_TYPE,
@@ -21,12 +20,11 @@ from .functional import (
     ISSUE_TASK_TYPE,
     ROOT_NODE,
     Graph,
+    GroupOfTaskInfo,
     RunnerArgSpec,
     RunnerTaskSpec,
     TaskIssueInfo,
     search_for_root,
-    group_task_issue_info_by_name,
-    GroupOfTaskInfo,
 )
 from .logger import Logger
 from .storage.storage import storage_factory
@@ -228,12 +226,13 @@ class Sc2:
         for t in self.graph.node_map[task_name].depend_on_no_virt:
             if not self.check_task_finished(t):
                 return False
+        task_cnt = 0
         for tasks in self.event_log:
             if tasks.task_name == task_name:
+                task_cnt += 1
                 if tasks.task_id not in self.finished_id:
                     return False
-        self.finished_task_name.add(task_name)
-        return True
+        return False
 
     def dump(self):
         for t in self.graph.node_map.keys():
@@ -246,7 +245,7 @@ class Sc2:
 
     def load(self, payload):
         event_log, finished_task_name, code_hash = payload
-        logger.info(finished_task_name)
+        # logger.info(finished_task_name)
         dirty_map = {}
 
         def _dirty(task_name: str):
@@ -260,23 +259,26 @@ class Sc2:
                     dirty = True
                 break
             if not dirty and self.code_hash[task_name] != code_hash[task_name]:
+                logger.info(f"{task_name} code changed code hash not match")
                 dirty = True
             dirty_map[task_name] = dirty
             return dirty
 
         _dirty(END_NODE.NAME)
-        logger.info("\n".join([str(x) for x in dirty_map.items()]))
+        for task, is_dirty in dirty_map.items():
+            if is_dirty:
+                logger.info(f"{task} is dirty reruning")
 
         self.finished_task_name.update(
             filter(lambda x: not dirty_map[x], dirty_map.keys())
         )
-        logger.info(self.finished_task_name)
+        # logger.info(self.finished_task_name)
         self.event_log = list(
             filter(lambda x: x.task_name in self.finished_task_name, event_log)
         )
         self.finished_id.update((x.task_id for x in self.event_log))
         self.issued_task_id.update(self.finished_id)
-        logger.info(self.finished_id)
+        # logger.info(self.finished_id)
         self.schedule_for()
         self.get_ready_to_issue()
         # sys.exit(0)
@@ -328,7 +330,9 @@ class Sc2:
             task_name_ = END_NODE.NAME
         if task_name_ in ready_dict:
             return
-
+        if self.check_task_finished(task_name_):
+            # logger.info(f"{task_name_} finished")
+            return
         not_specified = object()
         ready_dict[task_name_] = True
         for i in self.graph.node_map[task_name_].depend_on:
@@ -395,7 +399,6 @@ class Sc2:
                 starter = pend_task(
                     task_type=ISSUE_TASK_TYPE.NORMAL_TASK, require_=reqs
                 )
-                return starter
             assert starter is not None
 
         for req_key, req_body, from_task_spec in mail_group.items(
@@ -469,18 +472,16 @@ class Scheduler(CallbackBase):
 
         self.latest_result = dict()
 
-    def dump(self) -> bytes:
-        return pickle.dumps((self.sc.dump(),))
+    def dump(self):
+        self.result_storage.store("__LSAT_DUMP__", value=(self.sc.dump(),))
 
-    def load(self, payload: bytes):
-        (sc_dump,) = pickle.loads(payload)
-        self.sc.load(sc_dump)
+    def load(self):
+        if "__LSAT_DUMP__" in self.result_storage:
+            (sc_dump,) = self.result_storage.get("__LSAT_DUMP__")
+            self.sc.load(sc_dump)
 
-    def feed(self, run_id: Optional[str] = None, payload: Any = None):
-        if run_id is None:
-            run_id = uuid.uuid4().hex
+    def feed(self, payload: Any = None):
         event = CallBackEvent(
-            run_id=run_id,
             task_id="",
             task_name=ROOT_NODE.NAME,
             task_spec=None,
@@ -516,7 +517,7 @@ class Scheduler(CallbackBase):
             )
         return reqs
 
-    def _issue_new(self, run_id):
+    def _issue_new(self):
         pending_tasks = list(self.sc.get_ready_to_issue())
         for t in pending_tasks:
             # node = self.graph.node_map[t.task_name]
@@ -528,7 +529,6 @@ class Scheduler(CallbackBase):
                 yield InvokeSignal(
                     "on_run_finish",
                     CallBackEvent(
-                        run_id=run_id,
                         task_id=t.task_id,
                         task_name=t.task_name,
                         task_spec=None,
@@ -536,7 +536,6 @@ class Scheduler(CallbackBase):
                 )
                 return
             event = CallBackEvent(
-                run_id=run_id,
                 task_id=t.task_id,
                 task_name=t.task_name,
                 task_spec=RunnerTaskSpec(
@@ -545,7 +544,7 @@ class Scheduler(CallbackBase):
                     requires=self._transfer_arg_all(t),
                     storage_path=self.result_storage_path,
                     output_path=t.output,
-                    work_dir=f"/tmp/workdir/{t.task_id}",
+                    work_dir=f"{self.result_storage.storage_path}/{t.task_name}",
                     task_type=t.task_type,
                     task_id=t.task_id,
                 ),
@@ -555,16 +554,16 @@ class Scheduler(CallbackBase):
     def on_gen_finish(self, event: CallBackEvent):
         self.sc.set_finished(event.task_id, False)
         # logger.info(self.sc.finished_task_name)
-        yield from self._issue_new(event.run_id)
+        yield from self._issue_new()
 
     def on_task_finish(self, event: CallBackEvent):
         if event.task_name != ROOT_NODE.NAME:
             self.sc.set_finished(event.task_id)
-        yield from self._issue_new(event.run_id)
+        yield from self._issue_new()
 
     def on_task_error(self, event: CallBackEvent):
         logger.error(
-            f"{event.task_name} {event.run_id} {event.task_id}",
+            f"{event.task_name} {event.task_id}",
             stack_info=True,
         )
         raise NotImplementedError
@@ -572,10 +571,10 @@ class Scheduler(CallbackBase):
 
 def run(
     tasks: List[str],
-    run_id: Optional[str] = None,
-    storage_result: str = "file:default",
-    payload: Any = None,
+    storage_path: Optional[str] = None,
 ) -> None:
+    if storage_path is None:
+        storage_path = f"file:{os.getcwd()}/__default"
     tasks = [os.path.abspath(task) for task in tasks]
     root = search_for_root(tasks[0])
     assert isinstance(root, str)
@@ -585,7 +584,7 @@ def run(
     task_names = [task[len(root) : -3] for task in tasks]
     scheduler = Scheduler(
         Graph(root, task_names),
-        storage_result,
+        storage_path,
         [
             # EndTask(),
             # FinishChecker(storage_result),
@@ -597,12 +596,10 @@ def run(
     )
     # if os.path.exists("dump.pkl"):
     #     logger.info("load dump")
-    #     scheduler.load(open("dump.pkl", "rb").read())
-    scheduler.feed(run_id, payload)
-    logger.info("feed end")
-    with open("dump.pkl", "wb") as f:
-        logger.info(os.path.abspath("dump.pkl"))
-        f.write(scheduler.dump())
+    scheduler.load()
+    scheduler.feed({})
+    # logger.info("feed end")
+    scheduler.dump()
     #
     # # # TODO add to test
     # list(scheduler.sc.get_ready_to_issue())
@@ -616,10 +613,10 @@ def run(
     # list(scheduler.sc.get_ready_to_issue())
     # scheduler.sc.set_finished("_tt_7")
     # list(scheduler.sc.get_ready_to_issue())
-    from pprint import pprint
+    # from pprint import pprint
 
-    pprint(scheduler.sc.pending_events)
-    pprint(scheduler.sc.finished_id)
+    # pprint(scheduler.sc.pending_events)
+    # pprint(scheduler.sc.finished_id)
     with open("./out_.md", "w") as f:
         f.write(scheduler.sc.graph_str())
 
@@ -630,7 +627,7 @@ def run(
             f.write(f"{a}-->{b}\n")
         f.write("```")
     logger.info("run end")
-    pprint(scheduler.sc._output_dict)
+    # pprint(scheduler.sc._output_dict)
 
     return
 
@@ -647,10 +644,4 @@ if __name__ == "__main__":
     # sche.feed()
     run(
         ["test/generator_task_set/task4.py"],
-        run_id="test",
-        payload={},
     )
-    # run(['test/simple_task_set/task.py'], run_id='test', payload={})
-    # import fire
-    #
-    # fire.Fire(run)

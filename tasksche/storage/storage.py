@@ -91,9 +91,9 @@ class KVStorageBase(abc.ABC):
 
 class FileKVStorageBase(KVStorageBase):
     def _init_storage(self, name: str = ""):
-        self.root_path = f"/tmp/storage_{name}"
+        self.root_path = os.path.abspath(name)
         if not os.path.exists(self.root_path):
-            os.makedirs(self.root_path)
+            os.makedirs(self.root_path, exist_ok=True)
 
     def _to_file_path(self, key: str) -> str:
         key = key.replace("/", "_")

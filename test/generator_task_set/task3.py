@@ -5,4 +5,4 @@ require:
 
 
 def run(data):
-    return data ** 2
+    return data**2

@@ -32,7 +32,6 @@ class LocalRunner(CallbackBase):
             task_id=task_id,
             task_name="",
             task_spec=None,
-            run_id=event.run_id,
         )
         # output = executor.call(event.task_spec)
         if isinstance(output, StopIteration):

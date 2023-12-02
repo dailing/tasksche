@@ -14,5 +14,6 @@ def run(data: Iterable[int]):
         print(f"$$$ TASK4:: {i}")
         sum += i
     print("SUM VALUE IS :", sum)
+    with open("result.txt", "w") as f:
+        f.write(f"{sum}\n")
     return sum
-

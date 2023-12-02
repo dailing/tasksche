@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 
 import click
@@ -13,29 +14,21 @@ def cli():
 @click.command()
 @click.argument("tasks", nargs=-1)
 @click.option(
-    "-r",
-    "--run-id",
-    "run_id",
-    default=None,
-)
-@click.option(
     "-s",
-    "--storage-result",
-    "storage_result",
-    default="file:default",
-)
-@click.option(
-    "--storage-status",
-    "storage_status",
-    default="mem:default",
+    "--storage-path",
+    "storage_path",
+    default=None,
 )
 def run(
     tasks: List[str],
-    run_id: Optional[str] = None,
-    storage_result: str = "file:default",
-    storage_status: str = "mem:default",
+    storage_path: Optional[str] = None,
 ):
-    _run(tasks, run_id, storage_result, storage_status)
+    if storage_path is None:
+        storage_path = f"file:{os.getcwd()}/__default"
+    else:
+        storage_path = os.path.abspath(storage_path)
+        storage_path = f"file:{storage_path}"
+    _run(tasks, storage_path)
 
 
 cli.add_command(run)

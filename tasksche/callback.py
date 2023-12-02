@@ -22,7 +22,7 @@ logger = Logger()
 
 class CallBackEvent(BaseModel):
     # graph: Graph
-    run_id: str
+    # run_id: str
     task_id: str
     task_name: str
     task_spec: Optional[RunnerTaskSpec]
@@ -201,7 +201,7 @@ class _CallbackRunnerMeta(type):
                         f"[{str(cb.__self__.__class__.__name__):14s}] "
                         f"{str(event.task_name):15s} "
                         f"{str(event.task_id):15s} "
-                        f"{event.run_id}"
+                        # f"{event.run_id}"
                     )
                     if asyncio.iscoroutinefunction(cb):
                         retval = await cb(event, *args, **kwargs)
