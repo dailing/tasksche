@@ -15,6 +15,8 @@ TODO:
 * [x] Dirty check, rerun dirty tasks
 * [x] Resume on restart
 * [ ] cluster support
+* [ ] init signal to interrupt the task
+* [ ] file watcher
 
 generator design:
 

@@ -258,7 +258,10 @@ class Sc2:
                 if _dirty(dep):
                     dirty = True
                 break
-            if not dirty and self.code_hash[task_name] != code_hash[task_name]:
+            if not dirty and (
+                task_name not in code_hash
+                or self.code_hash[task_name] != code_hash[task_name]
+            ):
                 logger.info(f"{task_name} code changed code hash not match")
                 dirty = True
             dirty_map[task_name] = dirty

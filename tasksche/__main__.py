@@ -1,3 +1,6 @@
+"""
+RUN TASKS
+"""
 import os
 from typing import List, Optional
 
@@ -34,4 +37,5 @@ def run(
 cli.add_command(run)
 
 if __name__ == "__main__":
+    """run the cli by default"""
     cli()
