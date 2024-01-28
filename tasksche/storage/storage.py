@@ -92,12 +92,13 @@ class KVStorageBase(abc.ABC):
 class FileKVStorageBase(KVStorageBase):
     def _init_storage(self, name: str = ""):
         self.root_path = os.path.abspath(name)
-        if not os.path.exists(self.root_path):
-            os.makedirs(self.root_path, exist_ok=True)
+        act_storage = os.path.join(self.root_path, "results")
+        if not os.path.exists(act_storage):
+            os.makedirs(act_storage, exist_ok=True)
 
     def _to_file_path(self, key: str) -> str:
         key = key.replace("/", "_")
-        return os.path.join(self.root_path, key)
+        return os.path.join(self.root_path, "results", key)
 
     def store(self, key: str, value: Any):
         with open(self._to_file_path(key), "wb") as f:
@@ -136,12 +137,15 @@ class MemKVStorage(KVStorageBase):
 
 
 def storage_factory(
-    storage_path: str = "file:default",
-) -> KVStorageBase:
-    storage_type, storage_name = storage_path.split(":")
-    if storage_type == "file":
-        return FileKVStorageBase(storage_name)
-    elif storage_type == "mem":
-        return MemKVStorage(storage_name)
-    else:
-        raise ValueError(f"{storage_type} error")
+    storage_path: str,
+):
+    from ..new_sch import Storage
+
+    return Storage(storage_path)
+    # storage_type, storage_name = storage_path.split(":")
+    # if storage_type == "file":
+    #     return FileKVStorageBase(storage_name)
+    # elif storage_type == "mem":
+    #     return MemKVStorage(storage_name)
+    # else:
+    #     raise ValueError(f"{storage_type} error")

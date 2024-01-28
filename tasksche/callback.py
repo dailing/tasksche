@@ -115,6 +115,13 @@ class CallbackBase:
         """
         raise NotImplementedError
 
+    def on_iter_stop(self, event: CallBackEvent):
+        """
+        Called when a task is interrupted. should kill all running tasks and
+        return
+        """
+        raise NotImplementedError
+
 
 CALLBACK_TYPE = TypeVar("CALLBACK_TYPE", bound=CallbackBase)
 CALL_BACK_DICT: Dict[str, Callable] = {
@@ -194,14 +201,12 @@ class _CallbackRunnerMeta(type):
                         and cb_instance is not cb.__self__
                     ):
                         continue
-                    # if event.task_name == ROOT_NODE.NAME
-                    #     continue
                     logger.debug(
                         f"[{cb_name:15s}]"
                         f"[{str(cb.__self__.__class__.__name__):14s}] "
                         f"{str(event.task_name):15s} "
                         f"{str(event.task_id):15s} "
-                        # f"{event.run_id}"
+                        f"{event.task_spec.process_id if event.task_spec is not None else '':15s} "
                     )
                     if asyncio.iscoroutinefunction(cb):
                         retval = await cb(event, *args, **kwargs)

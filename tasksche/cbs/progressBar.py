@@ -1,6 +1,5 @@
 from typing import Dict
 
-from tqdm import tqdm
 
 # from ..task_spec import TaskSpec
 from ..callback import CallbackBase
@@ -22,14 +21,17 @@ class ProgressCB(CallbackBase):
                 [
                     v.status == Status.STATUS_FINISHED
                     for v in task.task_dict.values()
-                ])
-            self.bars['ALL'] = tqdm(
-                position=0, total=self.total_tasks,
-                desc='ALL', initial=total_finished
+                ]
+            )
+            self.bars["ALL"] = tqdm(
+                position=0,
+                total=self.total_tasks,
+                desc="ALL",
+                initial=total_finished,
             )
         # add a new bar
         self.bars[task.task_name] = tqdm(
-            position=len(self.bars), total=100, desc=f'{task.task_name}'
+            position=len(self.bars), total=100, desc=f"{task.task_name}"
         )
 
     def on_task_finish(self, task):
@@ -41,4 +43,4 @@ class ProgressCB(CallbackBase):
         # for bar in self.bars.values():
         #     if bar.pos > pos:
         #         bar.pos -= 1
-        self.bars['ALL'].update(1)
+        self.bars["ALL"].update(1)
