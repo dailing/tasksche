@@ -1,15 +1,12 @@
-from collections import defaultdict
-from dataclasses import dataclass
 import hashlib
 import os.path
 import pickle
-from enum import auto, Enum
+from collections import defaultdict
+from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, Dict, Generator, List, Optional, Self, Set
+from typing import Dict, Generator, List, Optional, Set
 
 from pydantic import BaseModel, Field, model_validator
-
-from .logger import Logger
 
 from .functional import (
     ARG_TYPE,
@@ -23,6 +20,7 @@ from .functional import (
     lazy_property,
     EVENT_TYPE,
 )
+from .logger import Logger
 
 logger = Logger()
 
@@ -80,6 +78,14 @@ class TaskSpec:
             k: v
             for k, v in self.requires.items()
             if v.arg_type == ARG_TYPE.TASK_ITER
+        }
+
+    @cached_property
+    def call_args(self) -> Dict[int | str, RequirementArg]:
+        return {
+            k: v
+            for k, v in self.requires.items()
+            if v.arg_type == ARG_TYPE.TASK_OUTPUT
         }
 
     @cached_property
@@ -169,6 +175,16 @@ class Graph:
         self.root = os.path.abspath(root)
         self.target_tasks: List[str] = target_tasks
 
+    def to_markdown(self, file_path: str):
+        with open(file_path, "w") as f:
+            f.write("```mermaid\n")
+            f.write("graph TD\n")
+            for node_name, node in self.node_map.items():
+                f.write(f"{node_name}['{node_name}']\n")
+                for dep in node.depend_on.values():
+                    f.write(f"{dep} -->{node_name}\n")
+            f.write("```\n")
+
     def _build_node(self, task_name: str, node_map: Dict[str, GraphNodeBase]):
         if f"call:{task_name}" in node_map:
             return node_map[f"call:{task_name}"]
@@ -253,6 +269,9 @@ class Storage:
         with open(os.path.join(self.path, key), "rb") as f:
             return pickle.load(f)
 
+    def __contains__(self, key):
+        return os.path.exists(os.path.join(self.path, key))
+
 
 class N_Scheduler:
     def __init__(self, graph: Graph):
@@ -260,7 +279,18 @@ class N_Scheduler:
         self.storage = Storage(os.path.join(graph.root, "__default"))
         self.event_log: List[ScheEvent] = []
         self.pending_task_id: Set[str] = set()
-        self.runnint_task_id: Set[str] = set()
+        self.running_task_id: Set[str] = set()
+        self.error_task_id: Set[str] = set()
+        self.fixed_tasks: Set[str] = set()
+
+    def dump(self):
+        finished_tasks = self.finished_tasks()
+        finished_events = []
+        for event in self.event_log:
+            if event.task_name in finished_tasks:
+                finished_events.append(event)
+        self.storage.set("__finished_events", finished_events)
+        self.storage.set("__finished_tasks", finished_tasks)
 
     def event_log_to_md(self, output_file):
         new_line = "\n"
@@ -268,18 +298,53 @@ class N_Scheduler:
             f.write("```mermaid\n")
             f.write("graph TD\n")
             for event in self.event_log:
+                output = None
+                if event.output is not None and event.command_id not in (
+                    self.running_task_id | self.pending_task_id
+                ):
+                    output = self.storage.get(event.output)
+                output_str = str(output)
                 f.write(
                     f"{event.command_id}"
                     f'["{event.task_name}\n'
                     f"{event.command_id}\n"
                     f"{event.cmd_type}\n"
-                    f'{(str(self.storage.get(event.output))+new_line) if event.output is not None and event.command_id not in (self.runnint_task_id|self.pending_task_id) else ""}'
+                    f"OUTPUT: {output_str}\n"
                     f"PID {event.process_id}\n"
                     f'"]\n'
                 )
+                color = "#04cf41"
+                if event.command_id in self.pending_task_id:
+                    color = "#cccccc"
+                elif event.command_id in self.running_task_id:
+                    color = "#d4c604"
+                elif event.command_id in self.error_task_id:
+                    color = "#d44204"
+                f.write(f"style {event.command_id} fill:{color}\n")
                 for dep in event.exec_after:
                     f.write(f"{dep} -->{event.command_id}\n")
             f.write("```\n")
+
+    def finished_tasks(self) -> Set[str]:
+        retval = set()
+        pending_tasks = set()
+        for i in (
+            self.pending_task_id | self.running_task_id | self.error_task_id
+        ):
+            pending_tasks.add(self.task_id_map[i].task_name)
+        pending_task_suffix = set([k.split(":")[-1] for k in pending_tasks])
+        for node_name in self.graph.handle_secquence:
+            if node_name.split(":")[-1] in pending_task_suffix:
+                continue
+            node = self.graph.node_map[node_name]
+            for dep in node.depend_on.values():
+                if dep.split(":")[-1] in pending_task_suffix:
+                    break
+                if dep not in retval:
+                    break
+            else:
+                retval.add(node_name)
+        return retval
 
     @lazy_property(updating_member="event_log", default_factory=dict)
     def output_map(
@@ -374,6 +439,9 @@ class N_Scheduler:
         if _output_dict is not None:
             output_dict.update(_output_dict)
         for task_name in self.graph.handle_secquence:
+            if task_name in self.fixed_tasks:
+                # skip finished tasks
+                continue
             node = self.graph.node_map[task_name]
             started = self.started_map.get(task_name, False)
             args = {}
@@ -439,7 +507,7 @@ class N_Scheduler:
     def set_finish_command(self, task_id: str, generate=True):
         assert task_id in self.pending_task_id
         self.pending_task_id.remove(task_id)
-        self.runnint_task_id.remove(task_id)
+        self.running_task_id.remove(task_id)
         event = self.task_id_map[task_id]
         if event.cmd_type != EVENT_TYPE.POP_AND_NEXT or not generate:
             return
@@ -454,9 +522,13 @@ class N_Scheduler:
         output_dict[new_event.task_name].append(new_event)
         self.sche_once(output_dict)
 
+    def set_error_command(self, task_id: str):
+        self.error_task_id.add(task_id)
+        self.set_finish_command(task_id, generate=False)
+
     def get_issue_tasks(self) -> Generator[ScheEvent, None, None]:
         for task_id_to_check in list(
-            self.pending_task_id - self.runnint_task_id
+            self.pending_task_id - self.running_task_id
         ):
             task = self.task_id_map[task_id_to_check]
             for dep in task.exec_after:
@@ -464,7 +536,7 @@ class N_Scheduler:
                     break
             else:
                 yield self.task_id_map[task_id_to_check]
-                self.runnint_task_id.add(task_id_to_check)
+                self.running_task_id.add(task_id_to_check)
 
 
 if __name__ == "__main__":
@@ -486,7 +558,7 @@ if __name__ == "__main__":
     # pprint(sche.event_log)
     pprint(list(sche.get_issue_tasks()))
     sche.set_finish_command("command__004")
-    sche.event_log_to_md("event_log.md")
+    # sche.event_log_to_md("event_log.md")
 
     # print("-----------------------")
     # sche.set_finish_command("command__003")

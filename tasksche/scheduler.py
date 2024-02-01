@@ -38,12 +38,10 @@ class Scheduler(CallbackBase):
         self.result_storage = storage_factory(result_storage)
         self.sc = N_Scheduler(graph)
 
-        self.latest_result = dict()
+    def dump(self):
+        # raise NotImplementedError
+        self.sc.dump()
 
-    # def dump(self):
-    #     raise NotImplementedError
-    #     self.result_storage.store("__LSAT_DUMP__", value=(self.sc.dump(),))
-    #
     # def load(self):
     #     raise NotImplementedError
     #     if "__LSAT_DUMP__" in self.result_storage:
@@ -57,7 +55,8 @@ class Scheduler(CallbackBase):
             task_spec=None,
         )
         self.sc.sche_init()
-        self.sc.event_log_to_md("event_log.md")
+        self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
+        self.sc.graph.to_markdown(os.path.join(self.graph.root, "graph.md"))
         asyncio.run(self.cb.on_task_finish(event))
 
     def _transfer_arg_all(self, task: ScheEvent):
@@ -76,7 +75,7 @@ class Scheduler(CallbackBase):
 
     def _issue_new(self):
         pending_tasks = list(self.sc.get_issue_tasks())
-        self.sc.event_log_to_md("event_log.md")
+        self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
         # pprint.pprint(pending_tasks)
         for t in pending_tasks:
             # node = self.graph.node_map[t.task_name]
@@ -100,20 +99,22 @@ class Scheduler(CallbackBase):
     def on_task_finish(self, event: CallBackEvent):
         if event.task_spec is not None:
             self.sc.set_finish_command(event.task_id)
-        logger.info(f"running tasks: {self.sc.runnint_task_id}")
+        logger.info(f"running tasks: {self.sc.running_task_id}")
         yield from self._issue_new()
 
     def on_iter_stop(self, event: CallBackEvent):
         self.sc.set_finish_command(event.task_id, generate=False)
-        logger.info(f"running tasks: {self.sc.runnint_task_id}")
+        logger.info(f"running tasks: {self.sc.running_task_id}")
         yield from self._issue_new()
 
     def on_task_error(self, event: CallBackEvent):
         logger.error(
             f"{event.task_name} {event.task_id}",
-            stack_info=True,
         )
-        raise NotImplementedError
+        # TODO add error handling, disable infected tasks
+        self.sc.set_error_command(event.task_id)
+        yield from self._issue_new()
+        # raise NotImplementedError
 
 
 def run(
@@ -146,6 +147,7 @@ def run(
     # scheduler.load()
     scheduler.feed({})
     logger.info("run end")
+    scheduler.dump()
     # pprint(scheduler.sc._output_dict)
 
     return
@@ -155,8 +157,8 @@ if __name__ == "__main__":
     import shutil
 
     shutil.rmtree("test/simple_task_set/_default", ignore_errors=True)
-    shutil.rmtree("test/generator_task_set/_default", ignore_errors=True)
-    shutil.rmtree("test/loop_task/_default", ignore_errors=True)
+    # shutil.rmtree("test/generator_task_set/_default", ignore_errors=True)
+    # shutil.rmtree("test/loop_task/_default", ignore_errors=True)
     run(["test/simple_task_set/task4.py"])
-    run(["test/generator_task_set/task4.py"])
-    run(["test/loop_task/task4.py"])
+    # run(["test/generator_task_set/task4.py"])
+    # run(["test/loop_task/task4.py"])

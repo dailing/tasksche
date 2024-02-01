@@ -45,13 +45,23 @@ def _get_logger(name: str, print_level=logging.DEBUG):
     return logger_obj
 
 
-class Logger:
-    logger = None
+# class _Logger:
+#     logger = None
 
-    def __new__(cls):
-        if cls.logger is None:
-            cls.logger = _get_logger("runner", print_level=logging.DEBUG)
-        return cls.logger
+#     def __new__(cls) -> logging.Logger:
+#         if cls.logger is None:
+#             cls.logger = _get_logger("runner", print_level=logging.DEBUG)
+#         return cls.logger
+
+
+_logger = None
+
+
+def Logger():
+    global _logger
+    if _logger is None:
+        _logger = _get_logger("runner", print_level=logging.DEBUG)
+    return _logger
 
 
 if __name__ == "__main__":

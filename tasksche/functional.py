@@ -53,7 +53,6 @@ class ARG_TYPE(Enum):
     RAW = auto()
     TASK_OUTPUT = auto()
     TASK_ITER = auto()
-    VIRTUAL = auto()
 
 
 class RequirementArg(BaseModel):
@@ -69,7 +68,6 @@ class RunnerArgSpec(BaseModel):
 
 
 class ISSUE_TASK_TYPE(str, Enum):
-    # START_TASK = "start_task"
     START_GENERATOR = "start_G"
     START_ITERATOR = "start_I"
     ITER_TASK = "iter_task"

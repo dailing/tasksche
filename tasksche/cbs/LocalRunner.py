@@ -30,6 +30,7 @@ from ..storage.storage import storage_factory
 
 logger = Logger()
 
+
 class RunnerHandle:
     def __init__(
         self,
@@ -128,6 +129,9 @@ class RunnerHandle:
                 self.exception = v
                 self.output_queue.put(v)
                 return
+            elif isinstance(v, Exception):
+                self.output_queue.put(v)
+                return
         self.process = multiprocessing.Process(
             target=self.worker,
             args=(self.spec, self.output_queue, self.args, self.kwargs),
@@ -189,7 +193,8 @@ class RunnerHandle:
                     output_queue.put(output)
                     logger.debug(f"put queue: {spec.task} {output}")
             except Exception as e:
-                logger.error(f"ERROR {e}", stack_info=True)
+                logger.error(f"ERROR {e}", exc_info=e)
+                output_queue.put(e)
         logger.debug(f"worker end: {spec.task}")
 
 
@@ -221,6 +226,8 @@ class LocalRunner(CallbackBase):
             )
             if isinstance(exception, StopIteration):
                 return InvokeSignal("on_iter_stop", event)
+            elif exception is not None:
+                return InvokeSignal("on_task_error", event)
             return InvokeSignal("on_task_finish", event)
         elif event.task_spec.task_type == EVENT_TYPE.PUSH:
             assert event.task_spec.process_id in self.processes
