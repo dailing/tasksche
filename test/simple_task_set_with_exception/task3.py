@@ -8,5 +8,5 @@ import time
 
 def run(*args, **kwargs):
     time.sleep(1)
-    # raise Exception("test")
+    raise Exception("test")
     return sum(args)

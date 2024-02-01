@@ -292,6 +292,14 @@ class N_Scheduler:
         self.storage.set("__finished_events", finished_events)
         self.storage.set("__finished_tasks", finished_tasks)
 
+    def load(self):
+        if '__finished_events' not in self.storage:
+            return
+        finished_events = self.storage.get("__finished_events")
+        finished_tasks = self.storage.get("__finished_tasks")
+        self.event_log.extend(finished_events)
+        self.fixed_tasks.update(finished_tasks)
+
     def event_log_to_md(self, output_file):
         new_line = "\n"
         with open(output_file, "w") as f:
@@ -320,6 +328,8 @@ class N_Scheduler:
                     color = "#d4c604"
                 elif event.command_id in self.error_task_id:
                     color = "#d44204"
+                elif event.task_name in self.fixed_tasks:
+                    color = '#ffffff'
                 f.write(f"style {event.command_id} fill:{color}\n")
                 for dep in event.exec_after:
                     f.write(f"{dep} -->{event.command_id}\n")
@@ -432,7 +442,12 @@ class N_Scheduler:
         TODO: handle if laoding finished tasks by initial stater from the
             first output
         """
-        self.sche_once()
+        output_dict = defaultdict(list)
+        for event in self.event_log:
+            assert event.task_name in self.fixed_tasks
+            if event.output is not None:
+                output_dict[event.task_name].append(event)
+        self.sche_once(output_dict)
 
     def sche_once(self, _output_dict=None):
         output_dict: Dict[str, List[ScheEvent]] = defaultdict(list)

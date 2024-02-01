@@ -138,6 +138,13 @@ class RunnerHandle:
         )
         self.process.start()
 
+    def term(self):
+        if self.process is not None:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join()
+            self.process = None
+
     def pop(self, spec: RunnerTaskSpec, join=True) -> Optional[Exception]:
         logger.debug(f"pop {spec.task}")
         assert spec.task_type in (EVENT_TYPE.POP, EVENT_TYPE.POP_AND_NEXT)
@@ -227,6 +234,8 @@ class LocalRunner(CallbackBase):
             if isinstance(exception, StopIteration):
                 return InvokeSignal("on_iter_stop", event)
             elif exception is not None:
+                p = self.processes[event.task_spec.process_id]
+                p.term()
                 return InvokeSignal("on_task_error", event)
             return InvokeSignal("on_task_finish", event)
         elif event.task_spec.task_type == EVENT_TYPE.PUSH:
