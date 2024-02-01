@@ -24,11 +24,11 @@ def run(
     storage_path: Optional[str] = None,
 ):
     if storage_path is None:
-        storage_path = f"file:{os.getcwd()}/__default"
+        storage_path = f"{os.getcwd()}/__default"
     else:
         storage_path = os.path.abspath(storage_path)
-        storage_path = f"file:{storage_path}"
-    _run(tasks, storage_path)
+        storage_path = f"{storage_path}"
+    _run(tasks)
 
 
 cli.add_command(run)

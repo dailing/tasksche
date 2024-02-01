@@ -157,10 +157,11 @@ if __name__ == "__main__":
     # shutil.rmtree("test/simple_task_set_with_exception/__default", ignore_errors=True)
     # run(["test/simple_task_set_with_exception/task4.py"])
     # shutil.copytree("test/simple_task_set_with_exception/__default", "test/simple_task_set/__default")
-    # run(["test/simple_task_set/task4.py"])
+    run(["test/simple_task_set/task4.py"])
 
-    shutil.rmtree("test/generator_task_set/__default", ignore_errors=True)
-    run(["test/generator_task_set/task4.py"])
-    run(["test/generator_task_set/task4.py"])
+    # shutil.rmtree("test/generator_task_set/__default", ignore_errors=True)
+    # run(["test/generator_task_set/task4.py"])
+    # run(["test/generator_task_set/task4.py"])
+
     # shutil.rmtree("test/loop_task/__default", ignore_errors=True)
     # run(["test/loop_task/task4.py"])

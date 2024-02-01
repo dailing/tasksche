@@ -1,6 +1,7 @@
 import hashlib
 import os.path
 import pickle
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
@@ -137,16 +138,16 @@ class GraphNodeBase:
     node_type: EVENT_TYPE
 
 
-_command_id_cnt = _Counter(prefix="command_")
-_output_id_cnt = _Counter(prefix="output_")
+# _command_id_cnt = _Counter(prefix="command_")
+# _output_id_cnt = _Counter(prefix="output_")
 
 
 class ScheEvent(BaseModel):
     cmd_type: EVENT_TYPE
     task_name: str
-    args: Dict[str | int, str]  # kward-> output_id
-    output: Optional[str] = Field(default_factory=_output_id_cnt.get_counter)
-    command_id: str = Field(default_factory=_command_id_cnt.get_counter)
+    args: Dict[str | int, str]  # kwards-> output_id
+    output: Optional[str] = Field(default_factory=lambda: uuid.uuid4().hex)
+    command_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     exec_after: List[str] = Field(default_factory=list)
     process_id: str
 
@@ -224,22 +225,22 @@ class Graph:
             self._build_node(task_name, nmap)
         return nmap
 
-    def _secq(self, nodes=None, name=None):
+    def _search_for_sequence(self, nodes=None, name=None):
         if nodes is None:
             nodes = []
             for k in self.node_map:
-                self._secq(nodes, k)
+                self._search_for_sequence(nodes, k)
             return nodes
         if name in nodes:
             return
         node = self.node_map[name]
         for k in node.depend_on.values():
-            self._secq(nodes, k)
+            self._search_for_sequence(nodes, k)
         nodes.append(name)
 
     @cached_property
-    def handle_secquence(self):
-        return self._secq()
+    def handle_sequence(self):
+        return self._search_for_sequence()
 
     @cached_property
     def child_node_map(self):
@@ -286,22 +287,40 @@ class N_Scheduler:
     def dump(self):
         finished_tasks = self.finished_tasks()
         finished_events = []
+        file_hash = {}
         for event in self.event_log:
             if event.task_name in finished_tasks:
                 finished_events.append(event)
+            node = self.graph.node_map[event.task_name]
+            file_hash[node.node.task_name] = node.node.code_hash
         self.storage.set("__finished_events", finished_events)
         self.storage.set("__finished_tasks", finished_tasks)
+        self.storage.set("__task_hash", file_hash)
 
     def load(self):
-        if '__finished_events' not in self.storage:
+        if "__finished_events" not in self.storage:
             return
         finished_events = self.storage.get("__finished_events")
         finished_tasks = self.storage.get("__finished_tasks")
+        file_hash = self.storage.get("__task_hash")
+        for task_name in self.graph.handle_sequence:
+            if task_name not in finished_tasks:
+                continue
+            node = self.graph.node_map[task_name]
+            if node.node.code_hash != file_hash[node.node.task_name]:
+                finished_tasks.remove(task_name)
+                continue
+            for dep in node.depend_on.values():
+                if dep not in finished_tasks:
+                    finished_tasks.remove(task_name)
+                    break
+        finished_events = [
+            e for e in finished_events if e.task_name in finished_tasks
+        ]
         self.event_log.extend(finished_events)
         self.fixed_tasks.update(finished_tasks)
 
     def event_log_to_md(self, output_file):
-        new_line = "\n"
         with open(output_file, "w") as f:
             f.write("```mermaid\n")
             f.write("graph TD\n")
@@ -329,7 +348,7 @@ class N_Scheduler:
                 elif event.command_id in self.error_task_id:
                     color = "#d44204"
                 elif event.task_name in self.fixed_tasks:
-                    color = '#ffffff'
+                    color = "#ffffff"
                 f.write(f"style {event.command_id} fill:{color}\n")
                 for dep in event.exec_after:
                     f.write(f"{dep} -->{event.command_id}\n")
@@ -343,7 +362,7 @@ class N_Scheduler:
         ):
             pending_tasks.add(self.task_id_map[i].task_name)
         pending_task_suffix = set([k.split(":")[-1] for k in pending_tasks])
-        for node_name in self.graph.handle_secquence:
+        for node_name in self.graph.handle_sequence:
             if node_name.split(":")[-1] in pending_task_suffix:
                 continue
             node = self.graph.node_map[node_name]
@@ -358,7 +377,7 @@ class N_Scheduler:
 
     @lazy_property(updating_member="event_log", default_factory=dict)
     def output_map(
-        self, payload: Optional[Dict[str, bool]], updated: List[ScheEvent]
+        self, payload: Optional[Dict[str, ScheEvent]], updated: List[ScheEvent]
     ):
         """
         maps output_id --> commandObject
@@ -453,7 +472,7 @@ class N_Scheduler:
         output_dict: Dict[str, List[ScheEvent]] = defaultdict(list)
         if _output_dict is not None:
             output_dict.update(_output_dict)
-        for task_name in self.graph.handle_secquence:
+        for task_name in self.graph.handle_sequence:
             if task_name in self.fixed_tasks:
                 # skip finished tasks
                 continue
@@ -564,7 +583,7 @@ if __name__ == "__main__":
         Graph("test/loop_task", ["/task4"])
     )
     pprint(sche.graph.node_map)
-    # print(sche.graph.handle_secquence)
+    # print(sche.graph.handle_sequence)
     sche.sche_init()
     # pprint(sche.event_log)
     print(list(sche.get_issue_tasks()))
