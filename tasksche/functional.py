@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import io
 import multiprocessing
 import os.path
@@ -346,6 +347,17 @@ class LazyProperty:
         setattr(instance, self._attr_name_, val)
         setattr(instance, self._last_index_name_, last_index)
         return val
+
+    def reset(self, func):
+        @functools.wraps(func)
+        def wrapper(instance, *args, **kwargs):
+            if hasattr(instance, self._attr_name_):
+                delattr(instance, self._attr_name_)
+            if hasattr(instance, self._last_index_name_):
+                delattr(instance, self._last_index_name_)
+            return func(instance, *args, **kwargs)
+
+        return wrapper
 
 
 def lazy_property(

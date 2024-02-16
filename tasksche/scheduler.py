@@ -10,8 +10,11 @@ from .callback import (
     InvokeSignal,
 )
 from .cbs.LocalRunner import LocalRunner
+from .cbs.FileWatcher import FileWatcher
+
 from .functional import (
     ARG_TYPE,
+    EVENT_TYPE,
     RunnerArgSpec,
     RunnerTaskSpec,
     search_for_root,
@@ -29,10 +32,10 @@ class Scheduler(CallbackBase):
         self,
         graph: Graph,
         result_storage: str,
-        cbs: List[CALLBACK_TYPE],
+        # cbs: List[CALLBACK_TYPE],
     ) -> None:
         self.graph = graph
-        self.cb = CallbackRunner(cbs + [self])
+        # self.cb = CallbackRunner(cbs + [self])
         self.runner = LocalRunner()
         self.result_storage_path = result_storage
         self.result_storage = storage_factory(result_storage)
@@ -45,7 +48,7 @@ class Scheduler(CallbackBase):
     def load(self):
         self.sc.load()
 
-    def feed(self, payload: Any = None):
+    def on_init(self, _):
         event = CallBackEvent(
             task_id="",
             task_name="ROOT",
@@ -54,10 +57,9 @@ class Scheduler(CallbackBase):
         self.sc.sche_init()
         self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
         self.sc.graph.to_markdown(os.path.join(self.graph.root, "graph.md"))
-        asyncio.run(self.cb.on_task_finish(event))
+        yield InvokeSignal("on_task_finish", event)
 
     def _transfer_arg_all(self, task: ScheEvent):
-        node = self.graph.node_map[task.task_name]
         reqs = {}
         for k, arg in task.args.items():
             path = arg
@@ -75,7 +77,10 @@ class Scheduler(CallbackBase):
         self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
         # pprint.pprint(pending_tasks)
         for t in pending_tasks:
-            # node = self.graph.node_map[t.task_name]
+            node = self.graph.node_map[t.task_name]
+            work_dir = os.path.join(
+                self.result_storage.path, node.node.task_name[1:]
+            )
             event = CallBackEvent(
                 task_id=t.command_id,
                 task_name=t.task_name,
@@ -85,7 +90,7 @@ class Scheduler(CallbackBase):
                     requires=t.args,
                     storage_path=self.result_storage_path,
                     output_path=t.output,
-                    work_dir=f"{self.result_storage.path}/{t.task_name}",
+                    work_dir=work_dir,
                     task_type=t.cmd_type,
                     task_id=t.command_id,
                     process_id=t.process_id,
@@ -113,6 +118,12 @@ class Scheduler(CallbackBase):
         yield from self._issue_new()
         # raise NotImplementedError
 
+    def on_file_change(self, event: CallBackEvent):
+        logger.info(f"file change: {event.task_name}")
+        logger.info(f"running tasks: {self.sc.running_task_id}")
+        self.sc.reload()
+        logger.info(f"running tasks: {self.sc.running_task_id}")
+
 
 def run(
     tasks: List[str],
@@ -120,6 +131,9 @@ def run(
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
     root = search_for_root(tasks[0])
+    if root is None:
+        logger.error(f"ROOT NOT FOUND {tasks[0]}")
+        return
     if storage_path is None:
         storage_path = f"{root}/__default"
     assert isinstance(root, str)
@@ -130,38 +144,17 @@ def run(
     scheduler = Scheduler(
         Graph(root, task_names),
         storage_path,
-        [
-            # EndTask(),
-            # FinishChecker(storage_result),
-            # RootStarter(),
-            # PRunner(),
-            LocalRunner(),
-            # FileWatcher(),
-        ],
     )
-    # if os.path.exists("dump.pkl"):
-    #     logger.info("load dump")
+    cb = CallbackRunner(
+        [
+            LocalRunner(),
+            FileWatcher(root=root),
+            scheduler,
+        ]
+    )
     scheduler.load()
-    scheduler.feed({})
+    asyncio.run(cb.run())
     logger.info("run end")
     scheduler.dump()
-    # pprint(scheduler.sc._output_dict)
 
     return
-
-
-if __name__ == "__main__":
-    import shutil
-
-    # shutil.rmtree("test/simple_task_set/__default", ignore_errors=True)
-    # shutil.rmtree("test/simple_task_set_with_exception/__default", ignore_errors=True)
-    # run(["test/simple_task_set_with_exception/task4.py"])
-    # shutil.copytree("test/simple_task_set_with_exception/__default", "test/simple_task_set/__default")
-    run(["test/simple_task_set/task4.py"])
-
-    # shutil.rmtree("test/generator_task_set/__default", ignore_errors=True)
-    # run(["test/generator_task_set/task4.py"])
-    # run(["test/generator_task_set/task4.py"])
-
-    # shutil.rmtree("test/loop_task/__default", ignore_errors=True)
-    # run(["test/loop_task/task4.py"])

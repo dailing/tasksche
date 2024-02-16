@@ -1,12 +1,11 @@
 """
 require:
-    data: $task3
+    a: $task2
 """
 
 
-def run(data):
+def run(a):
     with open("output.txt", "w") as f:
-        f.write(str(data))
+        f.write(str(a))
         f.write("\n")
-        # f.write(path_for('task3'))
     print("test")

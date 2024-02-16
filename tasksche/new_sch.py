@@ -11,15 +11,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from .functional import (
     ARG_TYPE,
-    task_name_to_file_path,
-    TaskSpecFmt,
-    RequirementArg,
-    process_path,
-    parse_task_specs,
-    TASK_TYPE,
-    _Counter,
-    lazy_property,
     EVENT_TYPE,
+    TASK_TYPE,
+    RequirementArg,
+    TaskSpecFmt,
+    lazy_property,
+    parse_task_specs,
+    process_path,
+    task_name_to_file_path,
 )
 from .logger import Logger
 
@@ -202,9 +201,11 @@ class Graph:
         node_map[f"pop:{task_name}"] = GraphNodeBase(
             node,
             {"-start": f"call:{task_name}"},
-            node_type=EVENT_TYPE.POP_AND_NEXT
-            if node.is_generator
-            else EVENT_TYPE.POP,
+            node_type=(
+                EVENT_TYPE.POP_AND_NEXT
+                if node.is_generator
+                else EVENT_TYPE.POP
+            ),
         )
         for k, v in node.requires.items():
             if v.arg_type == ARG_TYPE.TASK_ITER:
@@ -225,22 +226,21 @@ class Graph:
             self._build_node(task_name, nmap)
         return nmap
 
-    def _search_for_sequence(self, nodes=None, name=None):
-        if nodes is None:
-            nodes = []
-            for k in self.node_map:
-                self._search_for_sequence(nodes, k)
-            return nodes
-        if name in nodes:
-            return
-        node = self.node_map[name]
-        for k in node.depend_on.values():
-            self._search_for_sequence(nodes, k)
-        nodes.append(name)
-
     @cached_property
     def handle_sequence(self):
-        return self._search_for_sequence()
+        visist_order = []
+
+        def _dfs_search(name: str):
+            if name in visist_order:
+                return
+            node = self.node_map[name]
+            for k in node.depend_on.values():
+                _dfs_search(k)
+            visist_order.append(name)
+
+        for k in self.node_map:
+            _dfs_search(k)
+        return visist_order
 
     @cached_property
     def child_node_map(self):
@@ -284,6 +284,9 @@ class N_Scheduler:
         self.error_task_id: Set[str] = set()
         self.fixed_tasks: Set[str] = set()
 
+        self.check_for_term: Set[str] = set()
+        self.issued_for_term: Set[str] = set()
+
     def dump(self):
         finished_tasks = self.finished_tasks()
         finished_events = []
@@ -297,6 +300,73 @@ class N_Scheduler:
         self.storage.set("__finished_tasks", finished_tasks)
         self.storage.set("__task_hash", file_hash)
 
+    def reload(self):
+        graph = Graph(self.graph.root, self.graph.target_tasks)
+        # self.graph = graph
+        # remove anything changed from the current record
+        invalid_tasks = set()
+        invalid_task_raw = set()
+        for task_name in self.graph.handle_sequence:
+            raw = task_name.split(":")[-1]
+            if raw in invalid_task_raw:
+                # already defined as invalid
+                continue
+            if task_name not in graph.node_map:
+                # task deleted
+                invalid_task_raw.add(raw)
+                continue
+            if (
+                self.graph.node_map[task_name].node.code_hash
+                != graph.node_map[task_name].node.code_hash
+            ):
+                # code changed
+                invalid_task_raw.add(raw)
+                continue
+            for dep in self.graph.node_map[task_name].depend_on.values():
+                task_raw = dep.split(":")[-1]
+                if task_raw in invalid_task_raw:
+                    # dependency changed
+                    invalid_task_raw.add(raw)
+                    break
+        for i in self.graph.handle_sequence:
+            raw_name = i.split(":")[-1]
+            # logger.info(f"RELOAD {raw_name} {i}..")
+            if raw_name in invalid_task_raw:
+                # logger.info(f"reload {raw_name} invalid")
+                invalid_tasks.add(i)
+        logger.info(f"RELOAD invalid tasks: {invalid_tasks}")
+        pending_task_names = set()
+        for cmd_id in self.pending_task_id:
+            cmd = self.task_id_map[cmd_id]
+            assert cmd is not None
+            pending_task_names.add(cmd.task_name)
+        finished_tasks = self.finished_tasks()
+        logger.info(f"current finished tasks: {finished_tasks}")
+        self.event_log = [
+            e for e in self.event_log if e.task_name not in invalid_tasks
+        ]
+        self.reset_cached_lazy_property()
+        self.pending_task_id = {
+            i for i in self.pending_task_id if i in self.task_id_map
+        }
+        self.running_task_id = {
+            i for i in self.running_task_id if i in self.task_id_map
+        }
+        self.error_task_id = {
+            i for i in self.error_task_id if i in self.task_id_map
+        }
+        self.fixed_tasks = {
+            i for i in self.fixed_tasks if i not in invalid_tasks
+        }
+        self.graph = graph
+        # init new tasks
+        self.fixed_tasks = finished_tasks - invalid_tasks
+        logger.info(f"using finished tasks: {self.fixed_tasks}")
+        self.sche_init()
+
+        logger.info(f"checking for term: {self.check_for_term}")
+        self.check_for_term.update(invalid_tasks & pending_task_names)
+
     def load(self):
         if "__finished_events" not in self.storage:
             return
@@ -307,7 +377,7 @@ class N_Scheduler:
             if task_name not in finished_tasks:
                 continue
             node = self.graph.node_map[task_name]
-            if node.node.code_hash != file_hash[node.node.task_name]:
+            if node.node.code_hash != file_hash.get(node.node.task_name, None):
                 finished_tasks.remove(task_name)
                 continue
             for dep in node.depend_on.values():
@@ -429,6 +499,13 @@ class N_Scheduler:
             payload[event.task_name] = True
         return payload
 
+    @started_map.reset
+    @last_event.reset
+    @task_id_map.reset
+    @output_map.reset
+    def reset_cached_lazy_property(self):
+        pass
+
     def pend_task(
         self,
         event_type: EVENT_TYPE,
@@ -437,6 +514,7 @@ class N_Scheduler:
         depend_on: List[str],
         process_id: str = "",
     ) -> ScheEvent:
+        assert len(self.check_for_term) == 0
         event = ScheEvent(
             cmd_type=event_type,
             task_name=task_name,
@@ -539,7 +617,8 @@ class N_Scheduler:
                         output_dict[task_name].append(new_evt)
 
     def set_finish_command(self, task_id: str, generate=True):
-        assert task_id in self.pending_task_id
+        if task_id not in self.pending_task_id:
+            logger.warning(f'task "{task_id}" is not in pending tasks')
         self.pending_task_id.remove(task_id)
         self.running_task_id.remove(task_id)
         event = self.task_id_map[task_id]
@@ -569,8 +648,8 @@ class N_Scheduler:
                 if dep in self.pending_task_id:
                     break
             else:
-                yield self.task_id_map[task_id_to_check]
                 self.running_task_id.add(task_id_to_check)
+                yield self.task_id_map[task_id_to_check]
 
 
 if __name__ == "__main__":

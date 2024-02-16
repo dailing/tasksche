@@ -28,7 +28,8 @@ def run(
     else:
         storage_path = os.path.abspath(storage_path)
         storage_path = f"{storage_path}"
-    _run(tasks)
+    assert isinstance(tasks, tuple)
+    _run(list(tasks))
 
 
 cli.add_command(run)

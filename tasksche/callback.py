@@ -1,7 +1,11 @@
 import asyncio
 from collections import defaultdict
 from functools import cached_property
+from os import sync
+import pprint
+import sys
 from typing import (
+    Any,
     AsyncGenerator,
     Callable,
     Dict,
@@ -26,6 +30,7 @@ class CallBackEvent(BaseModel):
     task_id: str
     task_name: str
     task_spec: Optional[RunnerTaskSpec]
+    call_on: Optional[Any] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -33,11 +38,6 @@ class CallBackEvent(BaseModel):
     def new_inst(self, **kwargs):
         assert "previous_event" not in kwargs
         return self.model_copy(update=kwargs | dict(previous_event=self))
-
-    # @property
-    # def is_generator(self) -> bool:
-    #     assert self.task_name is not None
-    #     return self.graph.node_map[self.task_name].is_generator
 
 
 class CallBackSignal:
@@ -68,6 +68,13 @@ class CallbackBase:
     """
     Abstract Base Class for callback system.
     """
+
+    def on_init(self, event: CallBackEvent):
+        """
+        Called when a task is started. Mainly used by RUNNER to initiate the
+        task.
+        """
+        raise NotImplementedError
 
     def on_task_start(self, event: CallBackEvent):
         """
@@ -116,6 +123,13 @@ class CallbackBase:
         raise NotImplementedError
 
     def on_iter_stop(self, event: CallBackEvent):
+        """
+        Called when a task is interrupted. should kill all running tasks and
+        return
+        """
+        raise NotImplementedError
+
+    def on_file_change(self, event: CallBackEvent):
         """
         Called when a task is interrupted. should kill all running tasks and
         return
@@ -244,7 +258,68 @@ class _CallbackRunnerMeta(type):
         return super().__new__(cls, name, bases, attrs)
 
 
-class CallbackRunner(CallbackBase, metaclass=_CallbackRunnerMeta):
+class CallbackRunner:
+    def __init__(self, callbacks: List[CALLBACK_TYPE]) -> None:
+        self.event_queue: asyncio.Queue[Tuple[str, CallBackEvent]] = (
+            asyncio.Queue()
+        )
+        self.cbs = callbacks
+
+    @cached_property
+    def _cbs(self) -> Dict[str, List[Callable]]:
+        cbs = defaultdict(list)
+        for cb in self.cbs:
+            for (
+                call_back_name,
+                invalid_func,
+            ) in CALL_BACK_DICT.items():
+                if invalid_func is getattr(cb.__class__, call_back_name):
+                    continue
+                cbs[call_back_name].append(getattr(cb, call_back_name))
+        return cbs
+
+    async def handle_call(self, func: Callable, event):
+        if asyncio.iscoroutinefunction(func):
+            retval = await func(event)
+        else:
+            retval = func(event)
+
+        if retval is None:
+            return
+        elif isinstance(retval, InvokeSignal):
+            await self.event_queue.put((retval.signal, retval.event))
+        elif isinstance(retval, Generator):
+            for ret in retval:
+                assert isinstance(ret, InvokeSignal)
+                await self.event_queue.put((ret.signal, ret.event))
+        elif isinstance(retval, AsyncGenerator):
+            async for ret in retval:
+                assert isinstance(ret, InvokeSignal)
+                await self.event_queue.put((ret.signal, ret.event))
+        else:
+            logger.error(f"unknown type {type(retval)}")
+            raise NotImplementedError()
+
+    async def call(self, call_back_name: str, event: CallBackEvent):
+        for cb in self._cbs[call_back_name]:
+            assert cb is not None
+            logger.debug(f"calling {call_back_name} for {event.task_name}")
+            asyncio.create_task(self.handle_call(cb, event))
+
+    async def run(self, init_call_back=None):
+        if init_call_back is None:
+            init_call_back = CallBackEvent(
+                task_id="",
+                task_name="ROOT",
+                task_spec=None,
+            )
+        await self.event_queue.put(("on_init", init_call_back))
+        while True:
+            evt_name, event = await self.event_queue.get()
+            await self.call(evt_name, event)
+
+
+class CallbackRunner_(CallbackBase, metaclass=_CallbackRunnerMeta):
     def __init__(self, callbacks: List[CALLBACK_TYPE]) -> None:
         """
         Initializes CallbackRunner with a list of callbacks.

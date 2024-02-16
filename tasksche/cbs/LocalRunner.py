@@ -2,7 +2,6 @@ import asyncio
 import concurrent.futures
 import importlib
 import multiprocessing
-import threading
 import typing
 from collections import defaultdict
 from functools import cached_property
@@ -12,7 +11,6 @@ from typing import Dict, Optional, Any
 from ..callback import (
     CallbackBase,
     CallBackEvent,
-    InterruptSignal,
     InvokeSignal,
 )
 from ..functional import (
@@ -20,9 +18,7 @@ from ..functional import (
     EVENT_TYPE,
     ExecEnv,
     IteratorArg,
-    RunnerArgSpec,
     RunnerTaskSpec,
-    RequirementArg,
 )
 from ..logger import Logger
 from ..new_sch import TaskSpec
@@ -38,7 +34,7 @@ class RunnerHandle:
         super().__init__()
         self.spec: Optional[RunnerTaskSpec] = None
         self.process: Optional[multiprocessing.Process] = None
-        self.output_queue = multiprocessing.Queue()
+        self.output_queue: multiprocessing.Queue = multiprocessing.Queue()
         self.exception = None
 
     @cached_property
@@ -145,7 +141,7 @@ class RunnerHandle:
                 self.process.join()
             self.process = None
 
-    def pop(self, spec: RunnerTaskSpec, join=True) -> Optional[Exception]:
+    def pop(self, spec: RunnerTaskSpec, join=True):
         logger.debug(f"pop {spec.task}")
         assert spec.task_type in (EVENT_TYPE.POP, EVENT_TYPE.POP_AND_NEXT)
         # assert self.process is not None
@@ -160,8 +156,10 @@ class RunnerHandle:
 
     def push(self, spec: RunnerTaskSpec):
         logger.debug(f"push {spec.task}")
+        if self.exception is not None:
+            return self.exception
         assert spec.task_type == EVENT_TYPE.PUSH
-        assert self.process is not None
+        # assert self.process is not None
         assert len(spec.requires) == 1
         for k, v in self.load_args_from_storage(spec.requires).items():
             if isinstance(k, int):
@@ -183,7 +181,12 @@ class RunnerHandle:
         with ExecEnv(spec.root, spec.work_dir):
             mod = importlib.import_module(spec.task.replace("/", ".")[1:])
             if not hasattr(mod, "run"):
-                raise NotImplementedError("task must have 'run' function")
+                output_queue.put(
+                    NotImplementedError(
+                        f"task {spec.task} must have 'run' function"
+                    )
+                )
+                return
             try:
                 output = mod.run(*args, **kwargs)
                 if isinstance(output, typing.Generator):
