@@ -1,9 +1,7 @@
 import asyncio
+import functools
 from collections import defaultdict
 from functools import cached_property
-from os import sync
-import pprint
-import sys
 from typing import (
     Any,
     AsyncGenerator,
@@ -16,24 +14,24 @@ from typing import (
     TypeVar,
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .functional import RunnerTaskSpec
 from .logger import Logger
+from .asynctools import iter_over_async_gens
 
 logger = Logger()
 
 
 class CallBackEvent(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     # graph: Graph
     # run_id: str
     task_id: str
     task_name: str
     task_spec: Optional[RunnerTaskSpec]
     call_on: Optional[Any] = None
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def new_inst(self, **kwargs):
         assert "previous_event" not in kwargs
@@ -45,15 +43,6 @@ class CallBackSignal:
         super().__init__()
         self.signal = signal
         self.event = event
-
-
-class InterruptSignal(CallBackSignal, Exception):
-    """
-    Cancel all following callbacks in the task stack and invoke the target
-    callback
-    """
-
-    pass
 
 
 class InvokeSignal(CallBackSignal):
@@ -168,107 +157,17 @@ async def _handle_call_back_output(
     raise NotImplementedError()
 
 
-class _CallbackRunnerMeta(type):
-    """
-    Meta Class for CallbackRunner
-    this class is used to wrap the callback function in runner.
-    when a callback function is called, it will be wrapped by this class.
-    1. Lock
-    2. Iterate over all callbacks registered under the corresponding name
-    3. Call/Async-call the callback,
-    4. Check the return value
-    5. Change the event passed to the next callback in the stack
-    6. Collect events
-    7. Run events if any
-    8. Return
-
-    When using the callback runner, each callback entry that overrides the
-    BaseClass will be called in the order of registration. The callback
-    function can perform the following actions:
-    1. Return/yield a CallbackEvent instance: this changes the event passed to
-       the next callback in the stack.
-    2. Return/yield InvokeSignal: this invokes the target callback after the
-       current callback stack is finished.
-    3. Raise InterruptSignal: this cancels all following callbacks in the task
-       stack and invokes the target callback immediately.
-    Note: For the yielded InvokeSignal, the target callback will be invoked
-    concurrently.
-    """
-
-    @staticmethod
-    def wrapper(func: Callable, cb_name):
-        async def f(_instance, event: CallBackEvent, *args, **kwargs):
-            assert isinstance(
-                event, CallBackEvent
-            ), f"{type(event)} is not CallBackEvent"
-            cb_dict = getattr(_instance, "_cbs")
-            call_later = []
-            cb_instance = kwargs.pop("cb_instance", None)
-            cg: List[Tuple[str, str]] = _instance.call_graph
-            # in_node =
-            if cb_instance is not None:
-                logger.info(f"Calling for {cb_instance.__class__.__name__} ")
-            try:
-                for cb in cb_dict[cb_name]:
-                    if (
-                        cb_instance is not None
-                        and cb_instance is not cb.__self__
-                    ):
-                        continue
-                    logger.debug(
-                        f"[{cb_name:15s}]"
-                        f"[{str(cb.__self__.__class__.__name__):14s}] "
-                        f"{str(event.task_name):15s} "
-                        f"{str(event.task_id):15s} "
-                        f"{event.task_spec.process_id if event.task_spec is not None else '':15s} "
-                    )
-                    if asyncio.iscoroutinefunction(cb):
-                        retval = await cb(event, *args, **kwargs)
-                    else:
-                        retval = cb(event, *args, **kwargs)
-                    _cbs = await _handle_call_back_output(retval)
-                    call_later.extend(_cbs)
-            except InterruptSignal as e:
-                call_later.append(e)
-            coroutines_to_call = []
-            for sig in call_later:
-                func_to_call = getattr(_instance, sig.signal)
-                se = sig.event
-                cg.append(
-                    (
-                        f"{event.task_name}-{event.task_id}-{func.__name__}",
-                        f"{se.task_name}-{se.task_id}-{sig.signal}",
-                    )
-                )
-                assert asyncio.iscoroutinefunction(func_to_call)
-                _event = sig.event
-                # _event.previous_task = event.task_name
-                coroutines_to_call.append(func_to_call(_event))
-            await asyncio.gather(*coroutines_to_call)
-            return kwargs
-
-        f.__doc__ = func.__doc__
-        return f
-
-    def __new__(cls, name, bases, attrs):
-        for k, v in CALL_BACK_DICT.items():
-            if not k.startswith("on_"):
-                continue
-            attrs[k] = _CallbackRunnerMeta.wrapper(v, k)
-        return super().__new__(cls, name, bases, attrs)
-
-
 class CallbackRunner:
-    def __init__(self, callbacks: List[CALLBACK_TYPE]) -> None:
-        self.event_queue: asyncio.Queue[Tuple[str, CallBackEvent]] = (
-            asyncio.Queue()
-        )
-        self.cbs = callbacks
+    def __init__(self, callbacks: List[Optional[CALLBACK_TYPE]]) -> None:
+        # self.event_queue: asyncio.Queue[Tuple[str, CallBackEvent]] = (
+        #     asyncio.Queue()
+        # )
+        self._cbs = list(filter(lambda x: x is not None, callbacks))
 
     @cached_property
-    def _cbs(self) -> Dict[str, List[Callable]]:
+    def cbs(self) -> Dict[str, List[Callable]]:
         cbs = defaultdict(list)
-        for cb in self.cbs:
+        for cb in self._cbs:
             for (
                 call_back_name,
                 invalid_func,
@@ -278,33 +177,22 @@ class CallbackRunner:
                 cbs[call_back_name].append(getattr(cb, call_back_name))
         return cbs
 
-    async def handle_call(self, func: Callable, event):
-        if asyncio.iscoroutinefunction(func):
-            retval = await func(event)
-        else:
-            retval = func(event)
-
-        if retval is None:
-            return
-        elif isinstance(retval, InvokeSignal):
-            await self.event_queue.put((retval.signal, retval.event))
-        elif isinstance(retval, Generator):
-            for ret in retval:
-                assert isinstance(ret, InvokeSignal)
-                await self.event_queue.put((ret.signal, ret.event))
-        elif isinstance(retval, AsyncGenerator):
-            async for ret in retval:
-                assert isinstance(ret, InvokeSignal)
-                await self.event_queue.put((ret.signal, ret.event))
-        else:
-            logger.error(f"unknown type {type(retval)}")
-            raise NotImplementedError()
-
-    async def call(self, call_back_name: str, event: CallBackEvent):
-        for cb in self._cbs[call_back_name]:
-            assert cb is not None
-            logger.debug(f"calling {call_back_name} for {event.task_name}")
-            asyncio.create_task(self.handle_call(cb, event))
+    async def handle_call(self, sig: InvokeSignal):
+        funcs = []
+        assert isinstance(sig, InvokeSignal)
+        assert sig.signal in self.cbs
+        assert sig.signal is not None
+        for cb in self.cbs[sig.signal]:
+            logger.debug(
+                f"=== [{sig.signal}] [{cb.__self__.__class__.__name__}][{cb.__name__}] {sig.event}"
+            )
+            funcs.append(functools.partial(cb, sig.event))
+        gg = iter_over_async_gens(funcs)
+        new_tasks = []
+        async for signal in gg:
+            assert isinstance(signal, InvokeSignal), (type(signal), signal)
+            new_tasks.append(asyncio.create_task(self.handle_call(signal)))
+        await asyncio.gather(*new_tasks)
 
     async def run(self, init_call_back=None):
         if init_call_back is None:
@@ -313,38 +201,11 @@ class CallbackRunner:
                 task_name="ROOT",
                 task_spec=None,
             )
-        await self.event_queue.put(("on_init", init_call_back))
-        while True:
-            evt_name, event = await self.event_queue.get()
-            await self.call(evt_name, event)
-
-
-class CallbackRunner_(CallbackBase, metaclass=_CallbackRunnerMeta):
-    def __init__(self, callbacks: List[CALLBACK_TYPE]) -> None:
-        """
-        Initializes CallbackRunner with a list of callbacks.
-        :param callbacks: List of callback objects
-        """
-        self.cbs = callbacks
-        self.single_issue = False
-        self.call_graph = []
-
-    @cached_property
-    def _cbs(self) -> Dict[str, List[Callable]]:
-        cbs = defaultdict(list)
-        for cb in self.cbs:
-            for (
-                call_back_name,
-                invalid_func,
-            ) in CALL_BACK_DICT.items():
-                if invalid_func is getattr(cb.__class__, call_back_name):
-                    continue
-                cbs[call_back_name].append(getattr(cb, call_back_name))
-        return cbs
+        await self.handle_call(InvokeSignal("on_init", init_call_back))
 
 
 def parse_callbacks(callback_name: List[str]) -> List[Callable]:
-    """
+    """TODO
     Parse a list of callback names and return a list of callback functions.
 
     Args:

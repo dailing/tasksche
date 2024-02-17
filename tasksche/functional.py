@@ -44,6 +44,7 @@ class EVENT_TYPE(Enum):
     PUSH = auto()
     POP_AND_NEXT = auto()
     POP = auto()
+    TERM = auto()
     # result event
     FINISH = auto()
     GENERATOR_END = auto()

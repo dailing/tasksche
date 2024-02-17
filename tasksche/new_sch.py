@@ -36,6 +36,9 @@ class TaskSpec:
         self._task_spec = task_spec
         self.task_name = task_name
         self.task_root = task_root
+        self.code_hash = hashlib.md5(
+            open(self.code_file, "rb").read()
+        ).hexdigest()
 
     def _parse_arg_str(self, arg) -> RequirementArg:
         if isinstance(arg, str) and arg.startswith("$"):
@@ -121,10 +124,10 @@ class TaskSpec:
     def code_file(self) -> str:
         return task_name_to_file_path(self.task_name, self.task_root)
 
-    @cached_property
-    def code_hash(self) -> str:
-        with open(self.code_file, "rb") as f:
-            return hashlib.md5(f.read()).hexdigest()
+    # @cached_property
+    # def code_hash(self) -> str:
+    #     with open(self.code_file, "rb") as f:
+    #         return hashlib.md5(f.read()).hexdigest()
 
     def __repr__(self):
         return f"<TaskSpec: {self.task_name} <<-- {self.depend_on}>"
@@ -277,7 +280,7 @@ class Storage:
 class N_Scheduler:
     def __init__(self, graph: Graph):
         self.graph = graph
-        self.storage = Storage(os.path.join(graph.root, "__default"))
+        self.storage = Storage(os.path.abspath("__default"))
         self.event_log: List[ScheEvent] = []
         self.pending_task_id: Set[str] = set()
         self.running_task_id: Set[str] = set()
@@ -286,6 +289,7 @@ class N_Scheduler:
 
         self.check_for_term: Set[str] = set()
         self.issued_for_term: Set[str] = set()
+        self.term_task_id_map: Dict[str, ScheEvent] = {}
 
     def dump(self):
         finished_tasks = self.finished_tasks()
@@ -334,12 +338,18 @@ class N_Scheduler:
             if raw_name in invalid_task_raw:
                 # logger.info(f"reload {raw_name} invalid")
                 invalid_tasks.add(i)
+        if len(invalid_tasks) == 0:
+            logger.info("check finished, no change")
+            return
         logger.info(f"RELOAD invalid tasks: {invalid_tasks}")
         pending_task_names = set()
+        running_task_names = set()
         for cmd_id in self.pending_task_id:
             cmd = self.task_id_map[cmd_id]
             assert cmd is not None
             pending_task_names.add(cmd.task_name)
+            if cmd_id in self.running_task_id:
+                running_task_names.add(cmd.task_name)
         finished_tasks = self.finished_tasks()
         logger.info(f"current finished tasks: {finished_tasks}")
         self.event_log = [
@@ -361,11 +371,14 @@ class N_Scheduler:
         self.graph = graph
         # init new tasks
         self.fixed_tasks = finished_tasks - invalid_tasks
-        logger.info(f"using finished tasks: {self.fixed_tasks}")
+        logger.info(
+            f"using finished tasks: {self.fixed_tasks} {invalid_tasks}"
+        )
         self.sche_init()
 
+        self.check_for_term.update(invalid_tasks)
+
         logger.info(f"checking for term: {self.check_for_term}")
-        self.check_for_term.update(invalid_tasks & pending_task_names)
 
     def load(self):
         if "__finished_events" not in self.storage:
@@ -536,8 +549,6 @@ class N_Scheduler:
     def sche_init(self):
         """
         generate initial starter tasks
-        TODO: handle if laoding finished tasks by initial stater from the
-            first output
         """
         output_dict = defaultdict(list)
         for event in self.event_log:
@@ -617,6 +628,16 @@ class N_Scheduler:
                         output_dict[task_name].append(new_evt)
 
     def set_finish_command(self, task_id: str, generate=True):
+        if task_id in self.term_task_id_map:
+            evt = self.term_task_id_map[task_id]
+            assert evt.task_name in self.issued_for_term, (
+                evt.task_name,
+                self.issued_for_term,
+            )
+            assert evt.task_name in self.check_for_term
+            self.issued_for_term.remove(evt.task_name)
+            self.check_for_term.remove(evt.task_name)
+            return
         if task_id not in self.pending_task_id:
             logger.warning(f'task "{task_id}" is not in pending tasks')
         self.pending_task_id.remove(task_id)
@@ -640,6 +661,17 @@ class N_Scheduler:
         self.set_finish_command(task_id, generate=False)
 
     def get_issue_tasks(self) -> Generator[ScheEvent, None, None]:
+        for t in self.check_for_term - self.issued_for_term:
+            evt = ScheEvent(
+                cmd_type=EVENT_TYPE.TERM,
+                task_name=t,
+                args={},
+                output=None,
+                process_id=self.graph.node_map[t].node.task_name,
+            )
+            self.term_task_id_map[evt.command_id] = evt
+            self.issued_for_term.add(t)
+            yield evt
         for task_id_to_check in list(
             self.pending_task_id - self.running_task_id
         ):

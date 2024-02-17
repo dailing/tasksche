@@ -9,3 +9,4 @@ def run(a):
         f.write(str(a))
         f.write("\n")
     print("test")
+    return a

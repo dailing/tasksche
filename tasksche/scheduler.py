@@ -55,8 +55,8 @@ class Scheduler(CallbackBase):
             task_spec=None,
         )
         self.sc.sche_init()
-        self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
-        self.sc.graph.to_markdown(os.path.join(self.graph.root, "graph.md"))
+        # self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
+        # self.sc.graph.to_markdown(os.path.join(self.graph.root, "graph.md"))
         yield InvokeSignal("on_task_finish", event)
 
     def _transfer_arg_all(self, task: ScheEvent):
@@ -74,8 +74,7 @@ class Scheduler(CallbackBase):
 
     def _issue_new(self):
         pending_tasks = list(self.sc.get_issue_tasks())
-        self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
-        # pprint.pprint(pending_tasks)
+        # self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
         for t in pending_tasks:
             node = self.graph.node_map[t.task_name]
             work_dir = os.path.join(
@@ -100,9 +99,14 @@ class Scheduler(CallbackBase):
 
     def on_task_finish(self, event: CallBackEvent):
         if event.task_spec is not None:
+            logger.info(
+                f"{event.task_name} {event.task_id} {event.task_spec.process_id}"
+            )
             self.sc.set_finish_command(event.task_id)
         logger.info(f"running tasks: {self.sc.running_task_id}")
-        yield from self._issue_new()
+        new_tasks = list(self._issue_new())
+        logger.info(f"new tasks: {new_tasks}")
+        yield from new_tasks
 
     def on_iter_stop(self, event: CallBackEvent):
         self.sc.set_finish_command(event.task_id, generate=False)
@@ -119,15 +123,16 @@ class Scheduler(CallbackBase):
         # raise NotImplementedError
 
     def on_file_change(self, event: CallBackEvent):
-        logger.info(f"file change: {event.task_name}")
-        logger.info(f"running tasks: {self.sc.running_task_id}")
         self.sc.reload()
-        logger.info(f"running tasks: {self.sc.running_task_id}")
+        for cmds in self._issue_new():
+            logger.info(f"issuing: {cmds.signal} {cmds.event}")
+            yield cmds
 
 
 def run(
     tasks: List[str],
     storage_path: Optional[str] = None,
+    watch_root: bool = False,
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
     root = search_for_root(tasks[0])
@@ -135,7 +140,7 @@ def run(
         logger.error(f"ROOT NOT FOUND {tasks[0]}")
         return
     if storage_path is None:
-        storage_path = f"{root}/__default"
+        storage_path = os.path.abspath("./__default")
     assert isinstance(root, str)
     for task in tasks:
         assert task.endswith(".py")
@@ -148,7 +153,7 @@ def run(
     cb = CallbackRunner(
         [
             LocalRunner(),
-            FileWatcher(root=root),
+            FileWatcher(root=root) if watch_root else None,
             scheduler,
         ]
     )

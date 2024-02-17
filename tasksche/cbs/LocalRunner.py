@@ -246,6 +246,14 @@ class LocalRunner(CallbackBase):
             handler = self.processes[event.task_spec.process_id]
             handler.push(spec)
             return InvokeSignal("on_task_finish", event)
+        elif event.task_spec.task_type == EVENT_TYPE.TERM:
+            if event.task_spec.process_id not in self.processes:
+                logger.debug(f"process {event.task_spec.process_id} not found")
+                return InvokeSignal("on_task_finish", event)
+            handler = self.processes[event.task_spec.process_id]
+            handler.term()
+            del self.processes[event.task_spec.process_id]
+            return InvokeSignal("on_task_finish", event)
         else:
             raise NotImplementedError
 
