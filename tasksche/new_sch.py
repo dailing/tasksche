@@ -278,9 +278,9 @@ class Storage:
 
 
 class N_Scheduler:
-    def __init__(self, graph: Graph):
+    def __init__(self, graph: Graph, storage: Storage):
         self.graph = graph
-        self.storage = Storage(os.path.abspath("__default"))
+        self.storage = storage
         self.event_log: List[ScheEvent] = []
         self.pending_task_id: Set[str] = set()
         self.running_task_id: Set[str] = set()
@@ -682,34 +682,3 @@ class N_Scheduler:
             else:
                 self.running_task_id.add(task_id_to_check)
                 yield self.task_id_map[task_id_to_check]
-
-
-if __name__ == "__main__":
-    from pprint import pprint
-
-    print("food")
-    sche = N_Scheduler(
-        # Graph("/home/d/Sync/tasksche/test/simple_task_set", ["/task4"])
-        # Graph("/home/d/Sync/tasksche/test/generator_task_set", ["/task4"])
-        Graph("test/loop_task", ["/task4"])
-    )
-    pprint(sche.graph.node_map)
-    # print(sche.graph.handle_sequence)
-    sche.sche_init()
-    # pprint(sche.event_log)
-    print(list(sche.get_issue_tasks()))
-    print("-----------------------")
-    sche.set_finish_command("command__003")
-    # pprint(sche.event_log)
-    pprint(list(sche.get_issue_tasks()))
-    sche.set_finish_command("command__004")
-    # sche.event_log_to_md("event_log.md")
-
-    # print("-----------------------")
-    # sche.set_finish_command("command__003")
-    # pprint(sche.event_log)
-    # pprint(list(sche.get_issue_tasks()))
-    # print("-----------------------")
-    # sche.set_finish_command("command__004")
-    # pprint(sche.event_log)
-    # pprint(list(sche.get_issue_tasks()))

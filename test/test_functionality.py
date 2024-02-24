@@ -17,11 +17,11 @@ class TestFunctionality:
 
     def test_simple_taskset(self):
         root = f"{self.testroot}/simple_task_set"
-        storage = f"__default"
+        storage = f"__work_dir"
         assert os.path.exists(root), root
         shutil.rmtree(storage, ignore_errors=True)
         assert not os.path.exists(storage)
-        run([f"{root}/task4.py"])
+        run([f"{root}/task4.py"], storage_path=storage, work_dir=storage)
         assert os.path.exists(storage)
         assert os.path.exists(f"{storage}/task4/output.txt")
         assert os.path.exists(f"{storage}/task4/stdout.txt")
@@ -31,11 +31,11 @@ class TestFunctionality:
 
     def test_loop_task(self):
         root = f"{self.testroot}/loop_task"
-        storage = f"__default"
+        storage = f"__work_dir"
         assert os.path.exists(root), root
         shutil.rmtree(storage, ignore_errors=True)
         assert not os.path.exists(storage)
-        run([f"{root}/task4.py"])
+        run([f"{root}/task4.py"], storage_path=storage, work_dir=storage)
         assert os.path.exists(storage)
         assert os.path.exists(f"{storage}/task4/result.txt")
         assert os.path.exists(f"{storage}/task4/stdout.txt")
@@ -46,21 +46,21 @@ class TestFunctionality:
         # todo check task 1 and 2 are not rerun
         root = f"{self.testroot}/simple_task_set_with_exception"
         root2 = f"{self.testroot}/simple_task_set"
-        storage = f"__default"
-        storage2 = f"__default"
+        storage = f"__work_dir"
+        storage2 = f"__work_dir"
         assert os.path.exists(root), root
         assert os.path.exists(root2), root2
         shutil.rmtree(storage, ignore_errors=True)
         # shutil.rmtree(storage2, ignore_errors=True)
         assert not os.path.exists(storage)
         # assert not os.path.exists(storage2)
-        run([f"{root}/task4.py"])
+        run([f"{root}/task4.py"], storage_path=storage, work_dir=storage)
         assert not os.path.exists(f"{storage}/task4")
         # shutil.copytree(
         #     storage,
         #     storage2,
         # )
-        run([f"{root2}/task4.py"])
+        run([f"{root2}/task4.py"], storage_path=storage, work_dir=storage)
         assert os.path.exists(f"{storage2}/task4/output.txt")
         assert os.path.exists(f"{storage2}/task4/stdout.txt")
         assert open(f"{storage2}/task4/output.txt").read() == "2141\n"
@@ -69,7 +69,7 @@ class TestFunctionality:
 
     def test_online_reload(self):
         root = f"{self.testroot}/simple_test_online_reload"
-        storage = f"__default"
+        storage = f"__work_dir"
         file_cnt = open(f"{root}/task2.py", "r").read()
         with open(f"{root}/task2.py", "w") as f:
             f.write(file_cnt.replace("    infinite: 0", "    infinite: 1"))
@@ -77,7 +77,13 @@ class TestFunctionality:
         assert os.path.exists(root), root
         shutil.rmtree(storage, ignore_errors=True)
         assert not os.path.exists(storage)
-        target = functools.partial(run, [f"{root}/task3.py"], watch_root=True)
+        target = functools.partial(
+            run,
+            [f"{root}/task3.py"],
+            watch_root=True,
+            storage_path=storage,
+            work_dir=storage,
+        )
         process = multiprocessing.Process(target=target)
         process.start()
         time.sleep(1)

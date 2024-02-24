@@ -1,20 +1,17 @@
 import asyncio
 import os
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from .callback import (
-    CALLBACK_TYPE,
     CallbackBase,
     CallBackEvent,
     CallbackRunner,
     InvokeSignal,
 )
-from .cbs.LocalRunner import LocalRunner
 from .cbs.FileWatcher import FileWatcher
-
+from .cbs.LocalRunner import LocalRunner
 from .functional import (
     ARG_TYPE,
-    EVENT_TYPE,
     RunnerArgSpec,
     RunnerTaskSpec,
     search_for_root,
@@ -32,14 +29,14 @@ class Scheduler(CallbackBase):
         self,
         graph: Graph,
         result_storage: str,
-        # cbs: List[CALLBACK_TYPE],
+        work_dir_base: str,
     ) -> None:
         self.graph = graph
-        # self.cb = CallbackRunner(cbs + [self])
         self.runner = LocalRunner()
         self.result_storage_path = result_storage
         self.result_storage = storage_factory(result_storage)
-        self.sc = N_Scheduler(graph)
+        self.sc = N_Scheduler(graph, self.result_storage)
+        self.work_dir_base = work_dir_base
 
     def dump(self):
         # raise NotImplementedError
@@ -78,7 +75,7 @@ class Scheduler(CallbackBase):
         for t in pending_tasks:
             node = self.graph.node_map[t.task_name]
             work_dir = os.path.join(
-                self.result_storage.path, node.node.task_name[1:]
+                self.work_dir_base, node.node.task_name[1:]
             )
             event = CallBackEvent(
                 task_id=t.command_id,
@@ -132,9 +129,13 @@ class Scheduler(CallbackBase):
 def run(
     tasks: List[str],
     storage_path: Optional[str] = None,
+    work_dir: Optional[str] = None,
     watch_root: bool = False,
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
+    if work_dir is None:
+        work_dir = "__work_dir"
+    work_dir = os.path.abspath(work_dir)
     root = search_for_root(tasks[0])
     if root is None:
         logger.error(f"ROOT NOT FOUND {tasks[0]}")
@@ -149,6 +150,7 @@ def run(
     scheduler = Scheduler(
         Graph(root, task_names),
         storage_path,
+        work_dir,
     )
     cb = CallbackRunner(
         [
