@@ -12,17 +12,7 @@ class FileWatcher(CallbackBase):
     def __init__(self, root: str):
         super().__init__()
         self.stop_event = asyncio.Event()
-        # self.first_call = True
-        # self.event_queue = asyncio.Queue()
-        # self.task = None
-        # self.watching = False
         self.root = root
-
-    # async def _func(self, root):
-    #     logger.debug(f"watching {root} ...")
-    #     async for event in awatch(root, stop_event=self.stop_event):
-    #         files = set([x[1] for x in event])
-    #         await self.event_queue.put((files, "None"))
 
     async def on_init(self, _):
         logger.info(f"start watching {self.root}")

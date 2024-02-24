@@ -1,6 +1,5 @@
 import hashlib
 import os.path
-import pickle
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -21,6 +20,7 @@ from .functional import (
     task_name_to_file_path,
 )
 from .logger import Logger
+from .storage.storage import Storage
 
 logger = Logger()
 
@@ -64,31 +64,11 @@ class TaskSpec:
         return arg_dict
 
     @cached_property
-    def args(self) -> List[RequirementArg]:
-        max_length = (
-            max([k for k in self.requires.keys() if isinstance(k, int)] + [-1])
-            + 1
-        )
-        return [self.requires[k] for k in range(max_length)]
-
-    @cached_property
-    def kwargs(self):
-        return {k: v for k, v in self.requires.items() if isinstance(k, str)}
-
-    @cached_property
     def iter_args(self) -> Dict[int | str, RequirementArg]:
         return {
             k: v
             for k, v in self.requires.items()
             if v.arg_type == ARG_TYPE.TASK_ITER
-        }
-
-    @cached_property
-    def call_args(self) -> Dict[int | str, RequirementArg]:
-        return {
-            k: v
-            for k, v in self.requires.items()
-            if v.arg_type == ARG_TYPE.TASK_OUTPUT
         }
 
     @cached_property
@@ -117,17 +97,8 @@ class TaskSpec:
         ]
 
     @cached_property
-    def is_persistent(self):
-        return self.is_generator or len(self.iter_args) > 0
-
-    @cached_property
     def code_file(self) -> str:
         return task_name_to_file_path(self.task_name, self.task_root)
-
-    # @cached_property
-    # def code_hash(self) -> str:
-    #     with open(self.code_file, "rb") as f:
-    #         return hashlib.md5(f.read()).hexdigest()
 
     def __repr__(self):
         return f"<TaskSpec: {self.task_name} <<-- {self.depend_on}>"
@@ -138,10 +109,6 @@ class GraphNodeBase:
     node: TaskSpec
     depend_on: Dict[str | int, str]
     node_type: EVENT_TYPE
-
-
-# _command_id_cnt = _Counter(prefix="command_")
-# _output_id_cnt = _Counter(prefix="output_")
 
 
 class ScheEvent(BaseModel):
@@ -244,37 +211,6 @@ class Graph:
         for k in self.node_map:
             _dfs_search(k)
         return visist_order
-
-    @cached_property
-    def child_node_map(self):
-        child_nodes = defaultdict(list)
-        for child_name, node in self.node_map.items():
-            for key, parent_node in node.depend_on.items():
-                if isinstance(key, str) and key.startswith("-"):
-                    continue
-                child_nodes[parent_node].append(child_name)
-        return child_nodes
-
-
-class Storage:
-    def __init__(self, storage_path):
-        self.path = storage_path
-        if not os.path.exists(self.path):
-            os.makedirs(self.path, exist_ok=True)
-        assert os.path.exists(self.path)
-
-    def set(self, key, value):
-        assert isinstance(key, str)
-        with open(os.path.join(self.path, key), "wb") as f:
-            pickle.dump(value, f)
-
-    def get(self, key):
-        assert isinstance(key, str)
-        with open(os.path.join(self.path, key), "rb") as f:
-            return pickle.load(f)
-
-    def __contains__(self, key):
-        return os.path.exists(os.path.join(self.path, key))
 
 
 class N_Scheduler:

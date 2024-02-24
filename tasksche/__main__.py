@@ -8,7 +8,6 @@ from typing import List, Optional
 import click
 
 from .functional import search_for_root
-
 from .scheduler import run as _run
 
 

@@ -256,10 +256,3 @@ class LocalRunner(CallbackBase):
             return InvokeSignal("on_task_finish", event)
         else:
             raise NotImplementedError
-
-    def on_run_finish(self, event: CallBackEvent):
-        for k, v in self.executor.items():
-            v.task_queue.put(None)
-        for k, v in self.executor.items():
-            if v.process is not None:
-                v.process.join()

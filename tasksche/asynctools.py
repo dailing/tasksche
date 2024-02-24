@@ -1,5 +1,6 @@
 import asyncio
 from typing import Callable, AsyncGenerator, Generator, List, Coroutine
+
 from .logger import Logger
 
 logger = Logger()

@@ -11,13 +11,11 @@ from .callback import (
 from .cbs.FileWatcher import FileWatcher
 from .cbs.LocalRunner import LocalRunner
 from .functional import (
-    ARG_TYPE,
-    RunnerArgSpec,
     RunnerTaskSpec,
     search_for_root,
 )
 from .logger import Logger
-from .new_sch import Graph, ScheEvent
+from .new_sch import Graph
 from .new_sch import N_Scheduler
 from .storage.storage import storage_factory
 
@@ -39,7 +37,6 @@ class Scheduler(CallbackBase):
         self.work_dir_base = work_dir_base
 
     def dump(self):
-        # raise NotImplementedError
         self.sc.dump()
 
     def load(self):
@@ -52,22 +49,7 @@ class Scheduler(CallbackBase):
             task_spec=None,
         )
         self.sc.sche_init()
-        # self.sc.event_log_to_md(os.path.join(self.graph.root, "event_log.md"))
-        # self.sc.graph.to_markdown(os.path.join(self.graph.root, "graph.md"))
         yield InvokeSignal("on_task_finish", event)
-
-    def _transfer_arg_all(self, task: ScheEvent):
-        reqs = {}
-        for k, arg in task.args.items():
-            path = arg
-            if arg.arg_type == ARG_TYPE.TASK_OUTPUT and path is None:
-                continue
-            reqs[k] = RunnerArgSpec(
-                arg_type=arg.arg_type,
-                value=arg.value,
-                storage_path=path,
-            )
-        return reqs
 
     def _issue_new(self):
         pending_tasks = list(self.sc.get_issue_tasks())
@@ -114,10 +96,8 @@ class Scheduler(CallbackBase):
         logger.error(
             f"{event.task_name} {event.task_id}",
         )
-        # TODO add error handling, disable infected tasks
         self.sc.set_error_command(event.task_id)
         yield from self._issue_new()
-        # raise NotImplementedError
 
     def on_file_change(self, event: CallBackEvent):
         self.sc.reload()
