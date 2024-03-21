@@ -114,11 +114,13 @@ class GraphNodeBase:
 class ScheEvent(BaseModel):
     cmd_type: EVENT_TYPE
     task_name: str
-    args: Dict[str | int, str]  # kwards-> output_id
+    args: Dict[str | int, str]  # kwargs-> output_id
     output: Optional[str] = Field(default_factory=lambda: uuid.uuid4().hex)
     command_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     exec_after: List[str] = Field(default_factory=list)
     process_id: str
+    # TODO add dependent hash to each event to rebuild the graph
+    file_hash: str = Field(default=None)
 
     @model_validator(mode="after")
     def _check_fields_for_finish_event(self):
