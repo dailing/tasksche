@@ -42,7 +42,7 @@ class HttpStorage(Storage):
 
     def __contains__(self, key):
         url = f"{self._path}/{key}"
-        response = requests.get(url)
+        response = requests.head(url)
         return response.status_code == 200
 
 

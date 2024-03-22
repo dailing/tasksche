@@ -26,13 +26,13 @@ class Scheduler(CallbackBase):
     def __init__(
         self,
         graph: Graph,
-        result_storage: str,
+        result_storage_path: str,
         work_dir_base: str,
     ) -> None:
         self.graph = graph
         self.runner = LocalRunner()
-        self.result_storage_path = result_storage
-        self.result_storage = storage_factory(result_storage)
+        self.result_storage_path = result_storage_path
+        self.result_storage = storage_factory(result_storage_path)
         self.sc = N_Scheduler(graph, self.result_storage)
         self.work_dir_base = work_dir_base
 
@@ -79,7 +79,8 @@ class Scheduler(CallbackBase):
     def on_task_finish(self, event: CallBackEvent):
         if event.task_spec is not None:
             logger.info(
-                f"{event.task_name} {event.task_id} {event.task_spec.process_id}"
+                f"{event.task_name} {event.task_id} "
+                f"{event.task_spec.process_id}"
             )
             self.sc.set_finish_command(event.task_id)
         logger.info(f"running tasks: {self.sc.running_task_id}")
@@ -108,20 +109,18 @@ class Scheduler(CallbackBase):
 
 def run(
     tasks: List[str],
-    storage_path: Optional[str] = None,
-    work_dir: Optional[str] = None,
+    storage_path: str,
+    work_dir: str,
     watch_root: bool = False,
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
-    if work_dir is None:
-        work_dir = "__work_dir"
-    work_dir = os.path.abspath(work_dir)
+    assert os.path.exists(work_dir)
+    assert os.path.isdir(work_dir)
+    assert work_dir.startswith("/")
     root = search_for_root(tasks[0])
     if root is None:
         logger.error(f"ROOT NOT FOUND {tasks[0]}")
         return
-    if storage_path is None:
-        storage_path = os.path.abspath("./__default")
     assert isinstance(root, str)
     for task in tasks:
         assert task.endswith(".py")
@@ -132,13 +131,12 @@ def run(
         storage_path,
         work_dir,
     )
-    cb = CallbackRunner(
-        [
-            LocalRunner(),
-            FileWatcher(root=root) if watch_root else None,
-            scheduler,
-        ]
-    )
+    cb_caller: List[CallbackBase] = []
+    cb_caller.append(LocalRunner())
+    if watch_root:
+        cb_caller.append(FileWatcher(root=root))
+    cb_caller.append(scheduler)
+    cb = CallbackRunner(cb_caller)
     scheduler.load()
     asyncio.run(cb.run())
     logger.info("run end")

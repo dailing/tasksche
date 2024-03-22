@@ -158,11 +158,11 @@ async def _handle_call_back_output(
 
 
 class CallbackRunner:
-    def __init__(self, callbacks: List[Optional[CALLBACK_TYPE]]) -> None:
+    def __init__(self, callbacks: List[CallbackBase]) -> None:
         # self.event_queue: asyncio.Queue[Tuple[str, CallBackEvent]] = (
         #     asyncio.Queue()
         # )
-        self._cbs = list(filter(lambda x: x is not None, callbacks))
+        self._cbs = callbacks
 
     @cached_property
     def cbs(self) -> Dict[str, List[Callable]]:

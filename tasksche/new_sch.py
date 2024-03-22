@@ -230,6 +230,7 @@ class N_Scheduler:
         self.term_task_id_map: Dict[str, ScheEvent] = {}
 
     def dump(self):
+        logger.info("dumping storage")
         finished_tasks = self.finished_tasks()
         finished_events = []
         file_hash = {}
@@ -330,6 +331,7 @@ class N_Scheduler:
             node = self.graph.node_map[task_name]
             if node.node.code_hash != file_hash.get(node.node.task_name, None):
                 finished_tasks.remove(task_name)
+                logger.info(f"code changed {task_name}")
                 continue
             for dep in node.depend_on.values():
                 if dep not in finished_tasks:
