@@ -261,26 +261,6 @@ class ExecEnv:
             sys.path.remove(self.pythonpath)
 
 
-class IteratorArg:
-    def __init__(
-        self, iter_items: Optional[multiprocessing.Queue] = None
-    ) -> None:
-        if iter_items is None:
-            iter_items = multiprocessing.Queue()
-        self.iter_items = iter_items
-
-    def put_payload(self, payload: Any):
-        self.iter_items.put(payload)
-
-    def __iter__(self):
-        while True:
-            output = self.iter_items.get()
-            if isinstance(output, StopIteration):
-                return output.value
-            else:
-                yield output
-
-
 def int_iterator(t: Dict[str | int, Any]):
     int_keys = sorted([k for k in t.keys() if isinstance(k, int)])
     if len(int_keys) == 0:

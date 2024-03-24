@@ -228,20 +228,21 @@ class N_Scheduler:
         self.check_for_term: Set[str] = set()
         self.issued_for_term: Set[str] = set()
         self.term_task_id_map: Dict[str, ScheEvent] = {}
+        self.old_file_hash = {}
 
     def dump(self):
         logger.info("dumping storage")
         finished_tasks = self.finished_tasks()
         finished_events = []
-        file_hash = {}
         for event in self.event_log:
             if event.task_name in finished_tasks:
                 finished_events.append(event)
-            node = self.graph.node_map[event.task_name]
-            file_hash[node.node.task_name] = node.node.code_hash
+            if event.task_name in self.graph.node_map:
+                node = self.graph.node_map[event.task_name]
+                self.old_file_hash[node.node.task_name] = node.node.code_hash
         self.storage.set("__finished_events", finished_events)
         self.storage.set("__finished_tasks", finished_tasks)
-        self.storage.set("__task_hash", file_hash)
+        self.storage.set("__task_hash", self.old_file_hash)
 
     def reload(self):
         graph = Graph(self.graph.root, self.graph.target_tasks)
@@ -320,11 +321,13 @@ class N_Scheduler:
         logger.info(f"checking for term: {self.check_for_term}")
 
     def load(self):
+        logger.info("loading storage")
         if "__finished_events" not in self.storage:
             return
         finished_events = self.storage.get("__finished_events")
         finished_tasks = self.storage.get("__finished_tasks")
         file_hash = self.storage.get("__task_hash")
+        self.old_file_hash = file_hash
         for task_name in self.graph.handle_sequence:
             if task_name not in finished_tasks:
                 continue

@@ -114,7 +114,7 @@ def run(
     watch_root: bool = False,
 ) -> None:
     tasks = [os.path.abspath(task) for task in tasks]
-    assert os.path.exists(work_dir)
+    assert os.path.exists(work_dir), work_dir
     assert os.path.isdir(work_dir)
     assert work_dir.startswith("/")
     root = search_for_root(tasks[0])

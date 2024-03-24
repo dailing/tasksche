@@ -1,5 +1,7 @@
 import os
 import pickle
+from socket import timeout
+from venv import logger
 import requests
 
 
@@ -36,7 +38,11 @@ class HttpStorage(Storage):
 
     def get(self, key):
         url = f"{self._path}/{key}"
-        response = requests.get(url)
+        try:
+            response = requests.get(url, timeout=5)
+        except requests.Timeout:
+            logger.warning(f"Failed to get {key} from {self._path}")
+            return None
         response.raise_for_status()
         return pickle.loads(response.content)
 
